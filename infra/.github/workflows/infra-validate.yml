@@ -1,0 +1,34 @@
+name: Infra Validate
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate-k8s:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kubeval
+        run: |
+          wget https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz
+          tar xf kubeval-linux-amd64.tar.gz
+          sudo mv kubeval /usr/local/bin/
+      - name: Validate base manifests
+        run: kubeval --strict k8s/base/*.yaml --ignore-missing-schemas
+      - name: Validate kustomize (dev)
+        run: |
+          kubectl kustomize k8s/overlays/dev | kubeval --strict --ignore-missing-schemas
+      - name: Validate kustomize (prod)
+        run: |
+          kubectl kustomize k8s/overlays/prod | kubeval --strict --ignore-missing-schemas
+
+  validate-compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate docker-compose
+        run: docker compose -f docker/docker-compose.yml config -q
+      - name: Validate test compose
+        run: docker compose -f docker/docker-compose.test.yml config -q

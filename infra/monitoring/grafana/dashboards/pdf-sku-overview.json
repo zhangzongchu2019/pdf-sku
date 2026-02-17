@@ -1,0 +1,95 @@
+{
+  "dashboard": {
+    "title": "PDF-SKU System Overview",
+    "uid": "pdf-sku-overview",
+    "timezone": "browser",
+    "refresh": "30s",
+    "panels": [
+      {
+        "title": "请求速率 (RPS)",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+        "targets": [{ "expr": "sum(rate(http_requests_total{job='pdf-sku-server'}[5m]))" }]
+      },
+      {
+        "title": "错误率",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+        "targets": [{ "expr": "sum(rate(http_requests_total{job='pdf-sku-server',status=~'5..'}[5m])) / sum(rate(http_requests_total{job='pdf-sku-server'}[5m]))" }],
+        "fieldConfig": { "defaults": { "unit": "percentunit", "thresholds": { "steps": [{ "value": 0, "color": "green" }, { "value": 0.01, "color": "yellow" }, { "value": 0.05, "color": "red" }] } } }
+      },
+      {
+        "title": "活跃 Job 数",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 4, "x": 0, "y": 8 },
+        "targets": [{ "expr": "pdf_sku_jobs_processing" }]
+      },
+      {
+        "title": "今日完成 Job",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 4, "x": 4, "y": 8 },
+        "targets": [{ "expr": "increase(pdf_sku_jobs_completed_total[24h])" }]
+      },
+      {
+        "title": "标注队列深度",
+        "type": "gauge",
+        "gridPos": { "h": 4, "w": 4, "x": 8, "y": 8 },
+        "targets": [{ "expr": "pdf_sku_task_queue_depth" }],
+        "fieldConfig": { "defaults": { "thresholds": { "steps": [{ "value": 0, "color": "green" }, { "value": 50, "color": "yellow" }, { "value": 100, "color": "red" }] } } }
+      },
+      {
+        "title": "LLM 调用延迟 (P95)",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+        "targets": [
+          { "expr": "histogram_quantile(0.95, rate(pdf_sku_llm_latency_seconds_bucket[5m]))", "legendFormat": "P95" },
+          { "expr": "histogram_quantile(0.50, rate(pdf_sku_llm_latency_seconds_bucket[5m]))", "legendFormat": "P50" }
+        ],
+        "fieldConfig": { "defaults": { "unit": "s" } }
+      },
+      {
+        "title": "LLM 熔断器状态",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 4, "x": 12, "y": 8 },
+        "targets": [{ "expr": "pdf_sku_llm_circuit_state" }],
+        "fieldConfig": { "defaults": { "mappings": [{ "type": "value", "options": { "0": { "text": "CLOSED ✅" }, "1": { "text": "OPEN 🔴" }, "2": { "text": "HALF-OPEN ⚠️" } } }] } }
+      },
+      {
+        "title": "LLM 预算消耗 (USD)",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+        "targets": [{ "expr": "pdf_sku_llm_budget_consumed_usd" }],
+        "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+      },
+      {
+        "title": "页面处理耗时分布",
+        "type": "histogram",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+        "targets": [{ "expr": "rate(pdf_sku_page_duration_seconds_bucket[10m])" }]
+      },
+      {
+        "title": "导入成功率",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+        "targets": [{ "expr": "rate(pdf_sku_import_success_total[10m]) / rate(pdf_sku_import_total[10m])" }],
+        "fieldConfig": { "defaults": { "unit": "percentunit" } }
+      },
+      {
+        "title": "PostgreSQL 连接数",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+        "targets": [
+          { "expr": "pg_stat_activity_count", "legendFormat": "Active" },
+          { "expr": "pg_settings_max_connections", "legendFormat": "Max" }
+        ]
+      },
+      {
+        "title": "Redis 内存",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+        "targets": [{ "expr": "redis_memory_used_bytes" }],
+        "fieldConfig": { "defaults": { "unit": "bytes" } }
+      }
+    ]
+  }
+}

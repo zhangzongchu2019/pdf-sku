@@ -1,0 +1,11 @@
+# CI 测试环境 (仅基础设施, 不含应用)
+version: "3.9"
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment: { POSTGRES_USER: pdfsku, POSTGRES_PASSWORD: pdfsku, POSTGRES_DB: pdfsku_test }
+    ports: ["5432:5432"]
+    tmpfs: /var/lib/postgresql/data  # 内存模式加速
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]

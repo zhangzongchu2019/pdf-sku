@@ -1,0 +1,1953 @@
+openapi: 3.0.3
+info:
+  title: PDF-SKU Extraction System API
+  description: |
+    PDF 自动分类与 SKU 提取系统 — 完整 API 契约
+
+    **架构**: 模块化单体（Modular Monolith）  
+    **认证**: Bearer Token (JWT)  
+    **对齐文档**: TA V1.6 §5 · UI/UX V1.3 §8 · 接口契约总表 V1.1 · BA V1.1 · 后端详设 V1.1 · LLM Adapter V1.2 · 前端详设 V1.0
+
+    ## 状态枚举冻结声明
+    ⚠ Job/Page/SKU 状态枚举为冻结版本 V2.0。变更需前后端同步发布，禁止单端修改。
+
+    ## V2.0 合并说明
+    以 V1.2（对齐模块设计）为主体，精选吸收 V1.7 的 15 项增强：
+    - [V1.7→] JobDetail 双轨状态 user_status + action_hint + 4 时间戳
+    - [V1.7→] TaskDetail 增加 locked_by/locked_at/rework_count/timeout_at
+    - [V1.7→] ImageBinding 丰富字段 (binding_method/is_duplicate/image_hash)
+    - [V1.7→] POST /annotations 独立标注端点 (8 种 type)
+    - [V1.7→] GET /metrics · GET /ops/dashboard/events · POST /ops/tasks/batch-skip
+    - [V1.7→] /ops/custom-attr-upgrades (GET + POST)
+    - [V1.7→] GET /jobs 增加 created_after/created_before
+    - [V1.7→] OPTIONS /uploads (tus CORS)
+    - [V1.7→] Evaluation 增加 route_reason/sampling/prompt_version
+    - [V1.7→] PrescanResult 增加 raw_metrics
+    - [V1.7→] Tag 细分 (12 tag) + PaginationMeta 独立 schema
+
+    **未吸收 V1.7 项**（与模块设计不兼容）：
+    - TaskCompleteRequest skus 模型 → 保留 V1.2 的 groups 元素-分组模型
+    - CreateJobRequest 移除 merchant_id → 保留显式传入
+    - ErrorResponse 去掉 severity → 保留
+  version: 2.0.0
+  contact:
+    name: SZWEGO R&D
+
+servers:
+  - url: /api/v1
+    description: 生产环境
+
+# ====================================================================
+# Security
+# ====================================================================
+security:
+  - BearerAuth: []
+
+# ====================================================================
+# Tags (V1.7 细分 12 tag)
+# ====================================================================
+tags:
+  - name: Upload
+    description: tus 断点续传上传
+  - name: Jobs
+    description: PDF 处理作业管理
+  - name: Tasks
+    description: 人工标注任务
+  - name: Annotations
+    description: 标注记录管理（独立于任务提交）
+  - name: Config
+    description: 阈值配置管理
+  - name: Ops-Dashboard
+    description: 运营看板
+  - name: Ops-Annotators
+    description: 标注员管理
+  - name: Ops-Batch
+    description: 批量操作
+  - name: Ops-Eval
+    description: 离线评测
+  - name: Ops-Config
+    description: 配置审计与回滚
+  - name: Merchants
+    description: 商家维度统计
+  - name: Monitoring
+    description: 健康检查与监控
+
+# ====================================================================
+# Paths
+# ====================================================================
+paths:
+
+  # ======================== Upload (tus) ========================
+
+  /uploads:
+    options:
+      tags: [Upload]
+      summary: tus 能力协商（CORS + 扩展声明）
+      security: []
+      description: |
+        返回 tus 服务端支持的版本、扩展和最大上传大小。
+        tus-js-client 在跨域场景会自动发起此请求。
+      responses:
+        '204':
+          description: 能力协商成功
+          headers:
+            Tus-Resumable:
+              schema: { type: string, example: '1.0.0' }
+            Tus-Version:
+              schema: { type: string, example: '1.0.0' }
+            Tus-Extension:
+              schema: { type: string, example: 'creation,termination' }
+            Tus-Max-Size:
+              schema: { type: integer, example: 17179869184 }
+    post:
+      tags: [Upload]
+      summary: 创建上传（tus creation 语义）
+      description: 初始化断点续传上传会话。不含 request body，所有元数据通过 header 传递。
+      parameters:
+        - in: header
+          name: Upload-Length
+          required: true
+          schema: { type: integer, format: int64 }
+          description: 文件总字节数
+        - in: header
+          name: Upload-Metadata
+          required: true
+          schema: { type: string }
+          description: |
+            Base64 编码的 key-value 对，逗号分隔。
+            必须字段：
+            - `filename <base64>` — 原始文件名
+            - `filetype <base64>` — MIME 类型（application/pdf）
+            - `filehash <base64>` — SHA256 十六进制
+            - `profile_id <base64>` — 配置 profile ID
+
+            示例：`filename dGVzdC5wZGY=,filetype YXBwbGljYXRpb24vcGRm,filehash YWJj...,profile_id ZGVmYXVsdA==`
+      responses:
+        '201':
+          description: 上传会话已创建
+          headers:
+            Location:
+              schema: { type: string }
+              description: 上传 URL（含 upload_id）
+
+  /uploads/{upload_id}:
+    parameters:
+      - $ref: '#/components/parameters/UploadId'
+    patch:
+      tags: [Upload]
+      summary: 上传分片（tus 协议）
+      parameters:
+        - in: header
+          name: Upload-Offset
+          required: true
+          schema: { type: integer, format: int64 }
+        - in: header
+          name: Content-Type
+          required: true
+          schema: { type: string, enum: ['application/offset+octet-stream'] }
+      requestBody:
+        content:
+          application/offset+octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '204':
+          description: 分片已接收
+          headers:
+            Upload-Offset:
+              schema: { type: integer, format: int64 }
+    head:
+      tags: [Upload]
+      summary: 查询上传偏移（tus 断点续传）
+      responses:
+        '200':
+          headers:
+            Upload-Offset:
+              schema: { type: integer, format: int64 }
+    delete:
+      tags: [Upload]
+      summary: 取消上传（tus termination）
+      responses:
+        '204':
+          description: 上传已取消
+
+  # ======================== Jobs ========================
+
+  /jobs:
+    post:
+      tags: [Jobs]
+      summary: 创建处理 Job
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [upload_id, profile_id]
+              properties:
+                upload_id: { type: string, description: tus 上传完成后的 upload_id }
+                profile_id: { type: string, description: 配置 profile ID }
+                category: { type: string, nullable: true }
+                merchant_id: { type: string, description: 商家 ID（后端 V1.1 JobCreator 显式接收） }
+      responses:
+        '201':
+          description: Job 已创建
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Job'
+                  - type: object
+                    properties:
+                      frozen_config_version: { type: string, description: 冻结的配置版本号 }
+        '409':
+          description: 文件 hash 重复
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+    get:
+      tags: [Jobs]
+      summary: 查询 Job 列表
+      parameters:
+        - in: query
+          name: status
+          schema: { type: string }
+          description: 状态筛选（逗号分隔多值，支持 internal_status 和 user_status）
+        - in: query
+          name: merchant_id
+          schema: { type: string }
+        - in: query
+          name: created_after
+          schema: { type: string, format: date-time }
+          description: 创建时间下限
+        - in: query
+          name: created_before
+          schema: { type: string, format: date-time }
+          description: 创建时间上限
+        - in: query
+          name: sort
+          schema: { type: string, default: '-created_at' }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: 分页 Job 列表
+          headers:
+            X-Total-Count:
+              schema: { type: integer }
+              description: 总记录数
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Job' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+
+  /jobs/{job_id}:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [Jobs]
+      summary: 查询 Job 详情
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobDetail' }
+
+  /jobs/{job_id}/pages:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [Jobs]
+      summary: 页面列表
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pages:
+                    type: array
+                    items: { $ref: '#/components/schemas/PageInfo' }
+
+  /jobs/{job_id}/pages/{page_no}/screenshot:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+      - in: path
+        name: page_no
+        required: true
+        schema: { type: integer }
+    get:
+      tags: [Jobs]
+      summary: 页面截图
+      parameters:
+        - in: query
+          name: w
+          schema: { type: integer }
+          description: 缩略图宽度（不传则原图）
+      responses:
+        '200':
+          content:
+            image/png:
+              schema: { type: string, format: binary }
+
+  /jobs/{job_id}/skus:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [Jobs]
+      summary: SKU 列表
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  skus:
+                    type: array
+                    items: { $ref: '#/components/schemas/SKU' }
+
+  /jobs/{job_id}/result:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [Jobs]
+      summary: 下载最终输出 JSON
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { type: object }
+        '404':
+          description: 结果未就绪
+
+  /jobs/{job_id}/progress:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [Jobs]
+      summary: 处理进度
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_pages: { type: integer }
+                  completed_pages: { type: integer }
+                  failed_pages: { type: integer }
+                  human_pages: { type: integer }
+                  percent: { type: number, format: float }
+                  eta_seconds: { type: integer, nullable: true }
+
+  /jobs/{job_id}/events:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [Jobs]
+      summary: SSE 实时进度推送
+      description: |
+        Server-Sent Events 流。每条消息格式：
+        ```
+        event: <event_type>
+        data: <JSON>
+        retry: 5000
+        ```
+
+        契约化事件列表：
+
+        | 事件 type | payload schema | 说明 |
+        |-----------|---------------|------|
+        | `heartbeat` | `{ts}` | 每 30s 服务端主动发送 |
+        | `page_completed` | SSEPageCompleted | 单页完成 |
+        | `pages_batch_update` | `{pages: [{page_no, status}]}` | 批量状态（≤50页/事件） |
+        | `job_completed` | SSEJobCompleted | Job 处理完成 |
+        | `job_failed` | SSEJobFailed | Job 处理失败 |
+        | `human_needed` | SSEHumanNeeded | 需要人工介入 |
+        | `sla_escalated` | SSESlaEscalated | SLA 升级 |
+        | `sla_auto_resolve` | SSESlaEscalated | SLA 自动处置 |
+        | `sla_auto_accepted` | SSESlaEscalated | SLA 超时自动接受 |
+
+        服务端设置 `retry: 5000`（ms），客户端断线后自动重连。
+      responses:
+        '200':
+          description: SSE 事件流
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/SSEEvent'
+
+  /jobs/{job_id}/evaluation:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [Jobs]
+      summary: 评估报告（可解释性）
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Evaluation' }
+
+  /jobs/{job_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    post:
+      tags: [Jobs]
+      summary: 取消 Job
+      responses:
+        '200':
+          description: 已取消
+
+  /jobs/{job_id}/requeue:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    post:
+      tags: [Ops-Batch]
+      summary: 孤儿任务重提（仅运维）
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '409':
+          description: 任务不在可恢复状态
+
+  /jobs/{job_id}/sync:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    post:
+      tags: [Ops-Batch]
+      summary: 强制触发 Job 级下游状态同步
+      description: |
+        当对账发现 IMPORTED_ASSUMED 状态的 SKU 异常时，
+        运维可强制触发一次全量下游状态同步。
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  synced_skus: { type: integer }
+                  confirmed: { type: integer }
+                  failed: { type: integer }
+        '404':
+          description: Job 未找到或无可同步 SKU
+
+  /jobs/{job_id}/cross-page-skus:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [Jobs]
+      summary: 跨页 SKU 列表
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cross_page_skus:
+                    type: array
+                    items: { $ref: '#/components/schemas/CrossPageSKU' }
+
+  /jobs/{job_id}/cross-page-skus/{xsku_id}/link:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+      - in: path
+        name: xsku_id
+        required: true
+        schema: { type: string }
+    post:
+      tags: [Jobs]
+      summary: 跨页回溯关联
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source_task_id, source_group_id]
+              properties:
+                source_task_id: { type: string, format: uuid }
+                source_group_id: { type: string }
+      responses:
+        '200':
+          description: 关联成功
+
+  # ======================== Tasks ========================
+
+  /tasks:
+    get:
+      tags: [Tasks]
+      summary: 待标注任务列表
+      parameters:
+        - in: query
+          name: group_by
+          schema: { type: string, enum: [file] }
+          description: 按文件聚合
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  files:
+                    type: array
+                    items: { $ref: '#/components/schemas/TaskFileGroup' }
+
+  /tasks/next:
+    post:
+      tags: [Tasks]
+      summary: 自动领取下一个优先级最高的任务
+      description: |
+        服务端按 SLA 优先级排序，选择队列头部任务自动 lock。
+        等价于 GET /tasks 取第一条 + POST /tasks/{id}/lock 的原子操作。
+        如无可用任务返回 204。
+      responses:
+        '200':
+          description: 已领取
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskDetail' }
+        '204':
+          description: 暂无待领取任务
+        '409':
+          description: 并发冲突（其他标注员抢先领取），客户端应重试
+
+  /tasks/{task_id}:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    get:
+      tags: [Tasks]
+      summary: 任务详情（含 AI 元素 + 歧义绑定）
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskDetail' }
+
+  /tasks/{task_id}/lock:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      tags: [Tasks]
+      summary: 领取任务（加锁）
+      responses:
+        '200':
+          description: 锁成功
+        '409':
+          description: 已被其他标注员锁定
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  locked_by: { type: string, description: 锁定者姓名 }
+
+  /tasks/{task_id}/heartbeat:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      tags: [Tasks]
+      summary: 锁续期心跳（每 30s）
+      responses:
+        '200':
+          description: 续期成功
+        '409':
+          description: 锁已过期
+
+  /tasks/{task_id}/release:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      tags: [Tasks]
+      summary: 释放锁
+      responses:
+        '200':
+          description: 已释放
+
+  /tasks/{task_id}/complete:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      tags: [Tasks]
+      summary: 提交标注并完成任务（原子操作）
+      description: |
+        请求体包含完整标注数据，使用元素-分组（element-group）模型。
+        对齐 UI/UX §6.5 套索→分组→填属性→提交流程。
+        对齐后端 V1.1 Collaboration 模块 task_complete handler。
+        对齐前端 V1.0 annotationStore.buildSubmitPayload()。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskCompletePayload' }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  extracted_sku_count: { type: integer }
+                  imported_count: { type: integer }
+        '400':
+          description: 标注数据校验失败
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidationError' }
+        '409':
+          description: 锁已过期或任务已被重新分配
+
+  /tasks/{task_id}/skip:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      tags: [Tasks]
+      summary: 跳过任务
+      responses:
+        '200':
+          description: 已跳过
+
+  /tasks/{task_id}/retry:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      tags: [Tasks]
+      summary: AI 重处理
+      responses:
+        '200':
+          description: 已提交重处理
+
+  /tasks/{task_id}/revert:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      tags: [Tasks]
+      summary: 撤销已完成任务（组长权限）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string }
+      responses:
+        '200':
+          description: 已撤销
+        '409':
+          description: 任务不可撤销
+
+  # ======================== Annotations (V1.7→) ========================
+
+  /annotations:
+    post:
+      tags: [Annotations]
+      summary: 提交标注记录（独立于任务提交）
+      description: |
+        8 种标注类型（BA §4.8）：PAGE_TYPE_CORRECTION、TEXT_ROLE_CORRECTION、
+        IMAGE_ROLE_CORRECTION、SKU_ATTRIBUTE_CORRECTION、BINDING_CORRECTION、
+        CUSTOM_ATTR_CONFIRM、NEW_TYPE_REPORT、LAYOUT_CORRECTION。
+
+        此端点记录标注员的修正行为，供 Feedback 模块收集用于模型优化。
+        与 /tasks/{id}/complete 不同：complete 是提交最终结果，此处是记录过程中的修正。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateAnnotationRequest' }
+      responses:
+        '201':
+          description: 标注记录已保存
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  annotation_id: { type: string, format: uuid }
+
+  /annotations/suggest:
+    get:
+      tags: [Annotations]
+      summary: SKU 属性补全推荐
+      parameters:
+        - in: query
+          name: merchant_id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: field
+          required: true
+          schema: { type: string, enum: [model, name, size, material, color, price] }
+        - in: query
+          name: prefix
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: string }
+                maxItems: 5
+
+  /skus/{sku_id}/reconcile:
+    parameters:
+      - in: path
+        name: sku_id
+        required: true
+        schema: { type: string }
+    post:
+      tags: [Jobs]
+      summary: 手动触发 SKU 对账
+      responses:
+        '200':
+          description: 已触发
+
+  # ======================== Config ========================
+
+  /config/profiles:
+    get:
+      tags: [Config]
+      summary: 配置列表
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ThresholdProfile' }
+
+  /config/profiles/{profile_id}:
+    parameters:
+      - in: path
+        name: profile_id
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Config]
+      summary: 查看指定配置
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ThresholdProfile'
+                  - type: object
+                    properties:
+                      expected_version: { type: string, description: 乐观锁版本号 }
+    put:
+      tags: [Config]
+      summary: 更新配置（乐观锁）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/ThresholdProfile'
+                - type: object
+                  required: [expected_version]
+                  properties:
+                    expected_version: { type: string }
+      responses:
+        '200':
+          description: 保存成功
+        '409':
+          description: 版本冲突
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /config/profiles/{profile_id}/impact-preview:
+    parameters:
+      - in: path
+        name: profile_id
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Config]
+      summary: 阈值影响预估
+      parameters:
+        - in: query
+          name: threshold_a
+          schema: { type: number, format: float }
+        - in: query
+          name: threshold_b
+          schema: { type: number, format: float }
+        - in: query
+          name: threshold_pv
+          schema: { type: number, format: float }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sample_period_days: { type: integer }
+                  sample_job_count: { type: integer }
+                  current_auto_rate: { type: number }
+                  predicted_auto_rate: { type: number }
+                  current_human_daily: { type: integer }
+                  predicted_human_daily: { type: integer }
+                  capacity_warning: { type: boolean }
+
+  /config/reload:
+    post:
+      tags: [Config]
+      summary: 刷新配置缓存
+      responses:
+        '200':
+          description: 已刷新
+
+  /config/keywords:
+    get:
+      tags: [Config]
+      summary: 关键词库列表
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: array
+                  items: { type: string }
+
+  /config/keywords/{category}:
+    parameters:
+      - in: path
+        name: category
+        required: true
+        schema: { type: string }
+    put:
+      tags: [Config]
+      summary: 更新关键词（热更新）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                keywords: { type: array, items: { type: string } }
+      responses:
+        '200':
+          description: 已更新
+
+  # ======================== Ops-Dashboard ========================
+
+  /ops/dashboard:
+    get:
+      tags: [Ops-Dashboard]
+      summary: 看板指标
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DashboardMetrics' }
+
+  /ops/dashboard/events:
+    get:
+      tags: [Ops-Dashboard]
+      summary: Dashboard SSE 实时推送
+      description: 每 30s 推送一次或有状态变更时即时推送。
+      responses:
+        '200':
+          description: SSE 事件流
+          content:
+            text/event-stream:
+              schema:
+                type: object
+                properties:
+                  event: { type: string, enum: [dashboard_update, job_status_changed] }
+                  data: { type: object }
+
+  # ======================== Ops-Batch ========================
+
+  /ops/jobs/batch-retry:
+    post:
+      tags: [Ops-Batch]
+      summary: 批量重试
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                job_ids: { type: array, items: { type: string, format: uuid } }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success_count: { type: integer }
+                  failed_items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        job_id: { type: string, format: uuid }
+                        reason: { type: string }
+                        code: { type: string }
+
+  /ops/jobs/batch-cancel:
+    post:
+      tags: [Ops-Batch]
+      summary: 批量取消
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                job_ids: { type: array, items: { type: string, format: uuid } }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success_count: { type: integer }
+
+  /ops/tasks/batch-reassign:
+    post:
+      tags: [Ops-Batch]
+      summary: 批量重分配标注任务
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                task_ids: { type: array, items: { type: string, format: uuid } }
+                target_annotator_id: { type: string }
+      responses:
+        '200':
+          description: 已重分配
+
+  /ops/tasks/batch-skip:
+    post:
+      tags: [Ops-Batch]
+      summary: 批量跳过任务
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task_ids]
+              properties:
+                task_ids: { type: array, items: { type: string, format: uuid } }
+                reason: { type: string }
+      responses:
+        '200':
+          description: 操作完成
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success_count: { type: integer }
+                  failed_count: { type: integer }
+
+  # ======================== Ops-Config ========================
+
+  /ops/config/audit-log:
+    get:
+      tags: [Ops-Config]
+      summary: 配置审计日志
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/AuditLogEntry' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+
+  /ops/config/rollback/{profile_id}:
+    parameters:
+      - in: path
+        name: profile_id
+        required: true
+        schema: { type: string }
+    post:
+      tags: [Ops-Config]
+      summary: 配置回滚
+      responses:
+        '200':
+          description: 已回滚
+
+  /ops/custom-attr-upgrades:
+    get:
+      tags: [Ops-Config]
+      summary: 查询自定义属性升级记录
+      description: |
+        BRD BR-21：Feedback 模块产出的属性升级建议，
+        通过运维接口暴露，便于运营审核和批量应用。
+      parameters:
+        - in: query
+          name: status
+          schema: { type: string, enum: [pending, approved, rejected, applied] }
+        - in: query
+          name: merchant_id
+          schema: { type: string }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  upgrades:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        upgrade_id: { type: string }
+                        attr_name: { type: string }
+                        suggested_type: { type: string }
+                        source_feedback_count: { type: integer }
+                        status: { type: string, enum: [pending, approved, rejected, applied] }
+                        created_at: { type: string, format: date-time }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+    post:
+      tags: [Ops-Config]
+      summary: 审核自定义属性升级
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [upgrade_id, action]
+              properties:
+                upgrade_id: { type: string }
+                action: { type: string, enum: [approve, reject] }
+                comment: { type: string }
+      responses:
+        '200':
+          description: 审核结果已记录
+
+  # ======================== Ops-Annotators ========================
+
+  /ops/annotators:
+    get:
+      tags: [Ops-Annotators]
+      summary: 标注员列表
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AnnotatorSummary' }
+
+  /ops/annotators/{annotator_id}/stats:
+    parameters:
+      - in: path
+        name: annotator_id
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Ops-Annotators]
+      summary: 标注员详细统计
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AnnotatorDetail' }
+
+  /annotators/me/outcome-stats:
+    get:
+      tags: [Ops-Annotators]
+      summary: 标注员个人成果统计
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  today_skus: { type: integer }
+                  imported: { type: integer }
+                  pending: { type: integer }
+                  rejected: { type: integer }
+                  import_success_rate: { type: number, format: float }
+                  team_avg_rate: { type: number, format: float }
+
+  # ======================== Ops-Eval ========================
+
+  /ops/eval/reports:
+    get:
+      tags: [Ops-Eval]
+      summary: 评测报告列表
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/EvalReportSummary' }
+
+  /ops/eval/reports/{report_id}:
+    parameters:
+      - in: path
+        name: report_id
+        required: true
+        schema: { type: integer }
+    get:
+      tags: [Ops-Eval]
+      summary: 评测报告详情
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EvalReport' }
+
+  /ops/eval/run:
+    post:
+      tags: [Ops-Eval]
+      summary: 触发离线评测
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                golden_set_id: { type: string }
+                config_version: { type: string }
+      responses:
+        '202':
+          description: 评测已提交
+
+  # ======================== Merchants ========================
+
+  /merchants/{merchant_id}/stats:
+    parameters:
+      - in: path
+        name: merchant_id
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Merchants]
+      summary: 商家统计
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_jobs: { type: integer }
+                  total_skus: { type: integer }
+                  avg_auto_rate: { type: number }
+                  recent_jobs:
+                    type: array
+                    items: { $ref: '#/components/schemas/Job' }
+
+  # ======================== Monitoring ========================
+
+  /health:
+    get:
+      tags: [Monitoring]
+      summary: 系统健康检查
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+
+  /metrics:
+    get:
+      tags: [Monitoring]
+      summary: Prometheus 指标
+      security: []
+      description: 对齐 TA §6.1 全部 40+ 自定义指标。
+      responses:
+        '200':
+          description: Prometheus text/plain 指标
+          content:
+            text/plain:
+              schema: { type: string }
+
+# ====================================================================
+# Components
+# ====================================================================
+components:
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT Token 由登录接口签发，有效期 24h。
+        Header: `Authorization: Bearer <token>`
+        Payload: { user_id, role, annotator_id?, merchant_id?, exp }
+
+  parameters:
+    JobId:
+      in: path
+      name: job_id
+      required: true
+      schema: { type: string, format: uuid }
+    TaskId:
+      in: path
+      name: task_id
+      required: true
+      schema: { type: string, format: uuid }
+    UploadId:
+      in: path
+      name: upload_id
+      required: true
+      schema: { type: string }
+    Page:
+      in: query
+      name: page
+      schema: { type: integer, default: 1, minimum: 1 }
+    PageSize:
+      in: query
+      name: size
+      schema:
+        type: integer
+        default: 20
+        minimum: 1
+        maximum: 100
+      description: 每页条数，全局最大 100。响应头含 X-Total-Count。
+
+  schemas:
+
+    # ======== Pagination (V1.7→) ========
+    PaginationMeta:
+      type: object
+      properties:
+        page: { type: integer }
+        size: { type: integer }
+        total: { type: integer }
+        total_pages: { type: integer }
+
+    # ======== Job ========
+    Job:
+      type: object
+      properties:
+        job_id: { type: string, format: uuid }
+        source_file: { type: string }
+        file_hash: { type: string }
+        merchant_id: { type: string }
+        category: { type: string, nullable: true }
+        status:
+          type: string
+          description: |
+            Job 内部状态枚举（冻结版本 V2.0）。
+            ⚠ 变更需前后端同步发布。
+          enum:
+            - UPLOADED
+            - EVALUATING
+            - EVAL_FAILED
+            - EVALUATED
+            - PROCESSING
+            - PARTIAL_FAILED
+            - PARTIAL_IMPORTED
+            - DEGRADED_HUMAN
+            - FULL_IMPORTED
+            - REJECTED
+            - ORPHANED
+            - CANCELLED
+        user_status:
+          type: string
+          description: |
+            面向前端的简化状态（V1.7→）。
+            内部 12 状态 → 用户 5 状态映射：
+            - processing: UPLOADED/EVALUATING/EVALUATED/PROCESSING
+            - partial_success: PARTIAL_IMPORTED/PARTIAL_FAILED
+            - completed: FULL_IMPORTED
+            - needs_manual: DEGRADED_HUMAN
+            - failed: EVAL_FAILED/REJECTED/CANCELLED
+          enum: [processing, partial_success, completed, needs_manual, failed]
+        action_hint:
+          type: string
+          nullable: true
+          description: |
+            前端操作提示（V1.7→）。如 "等待处理中"、"请检查标注队列"、"可下载结果"。
+        route:
+          type: string
+          enum: [AUTO, HYBRID, HUMAN_ALL]
+          nullable: true
+        degrade_reason:
+          type: string
+          nullable: true
+          description: |
+            降级原因。route=AUTO 时必须为 null（不变量）。
+            可能的值: eval_failed, prescan_reject, low_confidence,
+            budget_exhausted, circuit_open, null
+        total_pages: { type: integer }
+        total_skus: { type: integer }
+        total_images: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    JobDetail:
+      allOf:
+        - $ref: '#/components/schemas/Job'
+        - type: object
+          properties:
+            frozen_config_version: { type: string }
+            worker_id: { type: string }
+            completion_source:
+              type: string
+              enum: [AI_ONLY, HUMAN_ONLY, HYBRID, DEGRADED_HUMAN]
+              nullable: true
+              description: 完成来源（V1.7→）
+            # 时间线（V1.7→）
+            uploaded_at: { type: string, format: date-time }
+            eval_started_at: { type: string, format: date-time, nullable: true }
+            eval_completed_at: { type: string, format: date-time, nullable: true }
+            process_started_at: { type: string, format: date-time, nullable: true }
+            process_completed_at: { type: string, format: date-time, nullable: true }
+            # 页面分类汇总
+            blank_pages: { type: array, items: { type: integer } }
+            ai_pages: { type: array, items: { type: integer } }
+            human_pages: { type: array, items: { type: integer } }
+            failed_pages: { type: array, items: { type: integer } }
+            # Token 消耗
+            token_consumption:
+              type: object
+              properties:
+                eval_tokens: { type: integer }
+                process_tokens: { type: integer }
+                total_api_calls: { type: integer }
+            error_message: { type: string, nullable: true }
+
+    # ======== Page ========
+    PageInfo:
+      type: object
+      properties:
+        page_no: { type: integer }
+        status:
+          type: string
+          description: |
+            页面状态枚举（冻结版本 V2.0）。
+            ⚠ 变更需前后端同步发布。
+          enum:
+            - PENDING
+            - BLANK
+            - AI_QUEUED
+            - AI_PROCESSING
+            - AI_COMPLETED
+            - AI_FAILED
+            - HUMAN_QUEUED
+            - HUMAN_PROCESSING
+            - HUMAN_COMPLETED
+            - IMPORTED_CONFIRMED
+            - IMPORTED_ASSUMED
+            - IMPORT_FAILED
+            - SKIPPED
+            - DEAD_LETTER
+        page_type: { type: string, enum: [A, B, C, D], nullable: true }
+        layout_type: { type: string, enum: [L1, L2, L3, L4], nullable: true }
+        confidence: { type: number, format: float, nullable: true }
+        task_id: { type: string, format: uuid, nullable: true }
+        parser_backend: { type: string }
+
+    # ======== SKU ========
+    SKU:
+      type: object
+      properties:
+        sku_id: { type: string }
+        page_number: { type: integer }
+        validity: { type: string, enum: [valid, invalid] }
+        attributes: { type: object }
+        custom_attributes:
+          type: array
+          items:
+            type: object
+            properties:
+              key: { type: string }
+              value: { type: string }
+        attribute_source:
+          type: string
+          enum: [AI_EXTRACTED, HUMAN_CORRECTED, CROSS_PAGE_MERGED, PROMOTED]
+        import_status: { type: string }
+        import_confirmation:
+          type: string
+          enum: [confirmed, assumed, failed, pending]
+          description: |
+            导入确认状态（对齐 BA §4.4a）：
+            - confirmed: 下游 API 确认成功
+            - assumed: SLA 超时自动接受，未经下游确认
+            - failed: 下游拒绝
+            - pending: 尚未触发导入
+        images:
+          type: array
+          items: { $ref: '#/components/schemas/SKUImage' }
+        status:
+          type: string
+          enum: [EXTRACTED, VALIDATED, CONFIRMED, BOUND, EXPORTED, SUPERSEDED, PARTIAL, INVALID]
+
+    SKUImage:
+      type: object
+      description: SKU 关联图片，合并 V1.2 质量门控 + V1.7 ImageBinding 丰富字段
+      properties:
+        image_uri: { type: string }
+        image_id: { type: string, description: 图片唯一标识 }
+        role:
+          type: string
+          enum: [PRODUCT_MAIN, DETAIL, SCENE, LOGO, DECORATION, SIZE_CHART]
+          nullable: true
+        binding_method:
+          type: string
+          enum: [spatial_proximity, grid_alignment, id_matching, page_inheritance]
+          description: 绑定算法（V1.7→）
+        bound_confidence: { type: number, format: float }
+        is_ambiguous: { type: boolean, description: top1-top2 差 < 0.2 }
+        is_duplicate:
+          type: boolean
+          default: false
+          description: 是否为跨页/跨 SKU 重复图片（V1.7→）
+        image_hash:
+          type: string
+          nullable: true
+          description: 图片感知哈希 pHash（V1.7→）
+        rank: { type: integer }
+        extracted_path: { type: string, description: MinIO/OSS 路径 }
+        resolution:
+          type: array
+          items: { type: integer }
+          maxItems: 2
+          description: "[width, height] 像素"
+        search_eligible:
+          type: boolean
+          description: "图片搜索资格（对齐 INV-03：short_edge ≥ 640px）"
+        quality_grade:
+          type: string
+          enum: [HIGH, LOW_QUALITY, UNASSESSED]
+        short_edge_px: { type: integer }
+
+    # ======== Task ========
+    TaskFileGroup:
+      type: object
+      properties:
+        job_id: { type: string, format: uuid }
+        source_file: { type: string }
+        merchant_id: { type: string }
+        pending_count: { type: integer }
+        total_count: { type: integer }
+
+    TaskDetail:
+      type: object
+      description: 合并 V1.2 业务字段 + V1.7 锁状态可观测字段
+      properties:
+        task_id: { type: string, format: uuid }
+        job_id: { type: string, format: uuid }
+        page_number: { type: integer }
+        task_type: { type: string }
+        status: { type: string }
+        priority: { type: string, enum: [NORMAL, HIGH, URGENT, CRITICAL, AUTO_RESOLVE] }
+        sla_deadline: { type: string, format: date-time, nullable: true }
+        sla_level: { type: string, enum: [NORMAL, HIGH, CRITICAL, AUTO_RESOLVE] }
+        # V1.7→ 锁状态可观测
+        locked_by: { type: string, nullable: true, description: 当前锁定者 (V1.7→) }
+        locked_at: { type: string, format: date-time, nullable: true }
+        timeout_at: { type: string, format: date-time, nullable: true, description: 锁过期时间 }
+        assigned_to: { type: string, nullable: true }
+        assigned_at: { type: string, format: date-time, nullable: true }
+        rework_count: { type: integer, default: 0, description: 返工次数 (V1.7→) }
+        created_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time, nullable: true }
+        # 业务上下文
+        context:
+          type: object
+          properties:
+            page_type: { type: string }
+            layout_type: { type: string }
+            screenshot_url: { type: string }
+            ai_result: { type: object }
+            cross_page_table: { type: object, nullable: true }
+        elements:
+          type: array
+          items: { $ref: '#/components/schemas/AnnotationElement' }
+        ambiguous_bindings:
+          type: array
+          items: { $ref: '#/components/schemas/AmbiguousBinding' }
+
+    AnnotationElement:
+      type: object
+      properties:
+        element_id: { type: string }
+        type: { type: string, enum: [image, text] }
+        bbox:
+          type: object
+          properties:
+            x: { type: number, minimum: 0, maximum: 1 }
+            y: { type: number, minimum: 0, maximum: 1 }
+            w: { type: number, minimum: 0, maximum: 1 }
+            h: { type: number, minimum: 0, maximum: 1 }
+        ai_role: { type: string }
+        confidence: { type: number, format: float }
+
+    AmbiguousBinding:
+      type: object
+      description: 歧义绑定（top1-top2 < 0.2），对齐 TA ADR-14
+      properties:
+        element_id: { type: string }
+        candidates:
+          type: array
+          items:
+            type: object
+            properties:
+              image_uri: { type: string }
+              confidence: { type: number }
+              rank: { type: integer }
+        resolved: { type: boolean }
+        selected_rank: { type: integer, nullable: true }
+
+    # ======== Task Submit (V1.2 元素-分组模型，对齐前端/后端详设) ========
+    TaskCompletePayload:
+      type: object
+      description: |
+        标注提交 payload — 元素-分组（element-group）模型。
+        对齐: UI/UX §6.5 · 前端 V1.0 annotationStore · 后端 V1.1 Collaboration
+      required: [task_id, page_type, groups]
+      properties:
+        task_id: { type: string, format: uuid }
+        page_type: { type: string, enum: [A, B, C, D] }
+        layout_type: { type: string, enum: [L1, L2, L3, L4] }
+        groups:
+          type: array
+          items:
+            type: object
+            required: [group_id, sku_type, elements]
+            properties:
+              group_id: { type: string }
+              label: { type: string }
+              sku_type: { type: string, enum: [complete, partial, invalid] }
+              elements:
+                type: array
+                items: { $ref: '#/components/schemas/AnnotationElement' }
+              sku_attributes:
+                type: object
+                properties:
+                  model: { type: string }
+                  name: { type: string }
+                  size: { type: string }
+                  material: { type: string }
+                  color: { type: string }
+                  price: { type: string }
+              custom_attributes:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    key: { type: string }
+                    value: { type: string }
+              partial_contains:
+                type: array
+                items: { type: string }
+              cross_page_sku_id: { type: string, nullable: true }
+              invalid_reason: { type: string, nullable: true }
+        ungrouped_elements:
+          type: array
+          items: { type: string }
+        binding_confirmations:
+          type: array
+          description: 歧义绑定确认结果
+          items:
+            type: object
+            properties:
+              element_id: { type: string }
+              selected_rank: { type: integer }
+        feedback:
+          type: object
+          properties:
+            page_type_modified: { type: boolean }
+            layout_type_modified: { type: boolean }
+            new_image_role_observed: { type: boolean }
+            new_text_role_observed: { type: boolean }
+            notes: { type: string }
+
+    CrossPageSKU:
+      type: object
+      properties:
+        xsku_id: { type: string }
+        fragments:
+          type: array
+          items:
+            type: object
+            properties:
+              page_number: { type: integer }
+              task_id: { type: string, format: uuid }
+              group_id: { type: string }
+              partial_contains: { type: array, items: { type: string } }
+        status: { type: string, enum: [pending, merged] }
+
+    # ======== Annotation Request (V1.7→) ========
+    CreateAnnotationRequest:
+      type: object
+      description: |
+        8 种标注类型（BA §4.8），独立于 TaskCompletePayload。
+        记录标注过程中的修正行为，供 Feedback 模块收集。
+      required: [job_id, page_number, type, payload]
+      properties:
+        task_id: { type: string, format: uuid, nullable: true }
+        job_id: { type: string, format: uuid }
+        page_number: { type: integer }
+        type:
+          type: string
+          enum:
+            - PAGE_TYPE_CORRECTION
+            - TEXT_ROLE_CORRECTION
+            - IMAGE_ROLE_CORRECTION
+            - SKU_ATTRIBUTE_CORRECTION
+            - BINDING_CORRECTION
+            - CUSTOM_ATTR_CONFIRM
+            - NEW_TYPE_REPORT
+            - LAYOUT_CORRECTION
+        payload:
+          type: object
+          additionalProperties: true
+          description: 按 type 区分的结构化内容（BA §4.8 Payload Schema）
+
+    # ======== SSE Events ========
+    SSEEvent:
+      type: object
+      description: SSE 事件信封
+      required: [event, data, timestamp]
+      properties:
+        event:
+          type: string
+          enum:
+            - heartbeat
+            - page_completed
+            - pages_batch_update
+            - job_completed
+            - job_failed
+            - human_needed
+            - sla_escalated
+            - sla_auto_resolve
+            - sla_auto_accepted
+        data:
+          oneOf:
+            - $ref: '#/components/schemas/SSEPageCompleted'
+            - $ref: '#/components/schemas/SSEJobCompleted'
+            - $ref: '#/components/schemas/SSEJobFailed'
+            - $ref: '#/components/schemas/SSEHumanNeeded'
+            - $ref: '#/components/schemas/SSESlaEscalated'
+        timestamp: { type: string, format: date-time }
+        retry: { type: integer, default: 5000, description: 重连间隔 (ms) }
+
+    SSEPageCompleted:
+      type: object
+      properties:
+        page_no: { type: integer }
+        status: { type: string }
+        confidence: { type: number, nullable: true }
+        sku_count: { type: integer }
+
+    SSEJobCompleted:
+      type: object
+      properties:
+        job_id: { type: string, format: uuid }
+        status: { type: string }
+        total_skus: { type: integer }
+        total_images: { type: integer }
+        duration_sec: { type: number }
+
+    SSEJobFailed:
+      type: object
+      properties:
+        job_id: { type: string, format: uuid }
+        error_code: { type: string }
+        error_message: { type: string }
+
+    SSEHumanNeeded:
+      type: object
+      properties:
+        job_id: { type: string, format: uuid }
+        task_count: { type: integer }
+        priority: { type: string }
+
+    SSESlaEscalated:
+      type: object
+      properties:
+        task_id: { type: string, format: uuid }
+        sla_level: { type: string, enum: [HIGH, CRITICAL, AUTO_RESOLVE] }
+        deadline: { type: string, format: date-time }
+
+    # ======== Evaluation ========
+    Evaluation:
+      type: object
+      description: 合并 V1.2 核心字段 + V1.7 可解释性增强
+      properties:
+        file_hash: { type: string }
+        config_version: { type: string }
+        doc_confidence: { type: number, format: float }
+        route: { type: string, enum: [AUTO, HYBRID, HUMAN_ALL] }
+        route_reason:
+          type: string
+          nullable: true
+          description: 路由决策原因说明（V1.7→）
+        degrade_reason: { type: string, nullable: true }
+        dimension_scores: { type: object }
+        weights_snapshot: { type: object }
+        thresholds_used:
+          type: object
+          nullable: true
+          description: 评估时使用的阈值快照（V1.7→）
+        page_evaluations:
+          type: object
+          additionalProperties: { type: number }
+        model_used: { type: string }
+        prompt_version:
+          type: string
+          nullable: true
+          description: Prompt 模板版本号（V1.7→）
+        sampling:
+          type: object
+          nullable: true
+          description: 采样信息（V1.7→）
+          properties:
+            sampled_pages: { type: array, items: { type: integer } }
+            sample_ratio: { type: number }
+        evaluated_at: { type: string, format: date-time, nullable: true }
+        prescan_result:
+          type: object
+          description: 合并 V1.2 结构 + V1.7 raw_metrics
+          properties:
+            passed: { type: boolean }
+            penalties:
+              type: array
+              items:
+                type: object
+                properties:
+                  rule: { type: string, description: 规则名 }
+                  deduction: { type: number, description: 扣分值 }
+                  reason: { type: string }
+            total_deduction: { type: number }
+            raw_metrics:
+              type: object
+              description: 原始度量指标（V1.7→）
+              properties:
+                total_pages: { type: integer }
+                blank_page_count: { type: integer }
+                blank_rate: { type: number, format: float }
+                ocr_rate: { type: number, format: float }
+                image_count: { type: integer }
+
+    # ======== Config ========
+    ThresholdProfile:
+      type: object
+      properties:
+        profile_id: { type: string }
+        version: { type: string }
+        previous_version: { type: string, nullable: true }
+        category: { type: string, nullable: true }
+        industry: { type: string, nullable: true }
+        thresholds:
+          type: object
+          properties:
+            A: { type: number }
+            B: { type: number }
+            PV: { type: number }
+        confidence_weights: { type: object }
+        sku_validity_mode: { type: string, enum: [strict, lenient] }
+        is_active: { type: boolean }
+        effective_from: { type: string, format: date-time }
+        change_reason: { type: string, nullable: true }
+
+    # ======== Dashboard ========
+    DashboardMetrics:
+      type: object
+      properties:
+        today_jobs: { type: integer }
+        today_skus: { type: integer }
+        auto_rate: { type: number, format: float }
+        avg_process_time_sec: { type: number }
+        human_queue_size: { type: integer }
+        pending_calibrations: { type: integer }
+
+    # ======== Annotators ========
+    AnnotatorSummary:
+      type: object
+      properties:
+        annotator_id: { type: string }
+        name: { type: string }
+        current_tasks: { type: integer }
+        today_completed: { type: integer }
+        avg_duration_sec: { type: number }
+        accuracy_rate: { type: number }
+        online: { type: boolean }
+
+    AnnotatorDetail:
+      allOf:
+        - $ref: '#/components/schemas/AnnotatorSummary'
+        - type: object
+          properties:
+            total_tasks: { type: integer }
+            specialties: { type: array, items: { type: string } }
+            daily_trend:
+              type: array
+              items:
+                type: object
+                properties:
+                  date: { type: string, format: date }
+                  completed: { type: integer }
+                  accuracy: { type: number }
+
+    # ======== Eval ========
+    EvalReportSummary:
+      type: object
+      properties:
+        id: { type: integer }
+        golden_set_id: { type: string }
+        config_version: { type: string }
+        sku_f1: { type: number }
+        binding_accuracy: { type: number }
+        human_intervention_rate: { type: number }
+        created_at: { type: string, format: date-time }
+
+    EvalReport:
+      allOf:
+        - $ref: '#/components/schemas/EvalReportSummary'
+        - type: object
+          properties:
+            sku_precision: { type: number }
+            sku_recall: { type: number }
+            report_data: { type: object }
+
+    # ======== Audit ========
+    AuditLogEntry:
+      type: object
+      properties:
+        timestamp: { type: string, format: date-time }
+        operator: { type: string }
+        action: { type: string }
+        changes: { type: object }
+        profile_id: { type: string }
+
+    # ======== Health ========
+    HealthResponse:
+      type: object
+      properties:
+        status: { type: string, enum: [healthy, degraded, unhealthy] }
+        version: { type: string, description: 应用版本号 (V1.7→) }
+        uptime_sec: { type: number, description: 进程运行时间 (V1.7→) }
+        worker_id: { type: string, nullable: true, description: 当前 Worker ID (V1.7→) }
+        components:
+          type: object
+          properties:
+            postgres:
+              type: object
+              properties:
+                status: { type: string, enum: [ok, degraded, down] }
+                latency_ms: { type: number }
+                active_connections: { type: integer }
+            redis:
+              type: object
+              properties:
+                status: { type: string, enum: [ok, degraded, down] }
+                mode: { type: string, enum: [sentinel, standalone] }
+                memory_used_mb: { type: number }
+            llm_api:
+              type: object
+              properties:
+                status: { type: string, enum: [ok, degraded, circuit_open] }
+                circuit_state: { type: string }
+                budget_remaining_pct: { type: number }
+            minio:
+              type: object
+              properties:
+                status: { type: string, enum: [ok, down] }
+                free_space_gb: { type: number }
+
+    # ======== Error (统一错误码 + severity) ========
+    ErrorResponse:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: |
+            统一错误码。格式: DOMAIN_ERROR_NAME
+
+            **Gateway 域**:
+            - FILE_SIZE_EXCEEDED (413)
+            - PAGE_COUNT_EXCEEDED (413)
+            - SECURITY_JAVASCRIPT_EMBEDDED (400)
+            - SECURITY_ENCRYPTED_PDF (400)
+            - FILE_HASH_DUPLICATE (409)
+            - JOB_NOT_ORPHANED (409)
+
+            **Collaboration 域**:
+            - TASK_ALREADY_LOCKED (409)
+            - TASK_LOCK_EXPIRED (409)
+            - TASK_NOT_REVERTABLE (409)
+            - ANNOTATION_VALIDATION_FAILED (400)
+
+            **Config 域**:
+            - CONFIG_VERSION_CONFLICT (409)
+            - CONFIG_THRESHOLD_INVALID (400)
+
+            **LLM 域**:
+            - LLM_BUDGET_EXHAUSTED (503)
+            - LLM_CIRCUIT_OPEN (503)
+            - LLM_RATE_LIMITED (429)
+
+            **通用**:
+            - RATE_LIMITED (429)
+            - INTERNAL_ERROR (500)
+            - SERVICE_UNAVAILABLE (503)
+        message:
+          type: string
+          description: 人类可读的错误描述
+        details:
+          type: object
+          nullable: true
+          description: 错误上下文（如校验失败的字段列表）
+        severity:
+          type: string
+          enum: [info, warning, error, critical]
+          description: 错误严重度，前端据此决定 toast/modal/banner 展示方式
+
+    ValidationError:
+      type: object
+      properties:
+        code: { type: string, example: ANNOTATION_VALIDATION_FAILED }
+        message: { type: string }
+        field_errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }

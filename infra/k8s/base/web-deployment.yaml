@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pdf-sku-web
+  namespace: pdf-sku
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: pdf-sku-web }
+  template:
+    metadata:
+      labels: { app: pdf-sku-web }
+    spec:
+      containers:
+        - name: web
+          image: pdf-sku-web:latest
+          ports: [{ containerPort: 80 }]
+          resources:
+            requests: { cpu: 100m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }

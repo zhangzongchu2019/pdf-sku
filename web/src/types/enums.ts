@@ -1,0 +1,32 @@
+export enum JobStatus {
+  PROCESSING = "PROCESSING",
+  COMPLETED = "COMPLETED",
+  PARTIAL = "PARTIAL",
+  FAILED = "FAILED",
+  CANCELLED = "CANCELLED",
+}
+
+export enum PageStatus {
+  PENDING = "PENDING",
+  PROCESSING = "PROCESSING",
+  AI_COMPLETED = "AI_COMPLETED",
+  NEEDS_REVIEW = "NEEDS_REVIEW",
+  HUMAN_COMPLETED = "HUMAN_COMPLETED",
+  IMPORTED_CONFIRMED = "IMPORTED_CONFIRMED",
+  IMPORTED_ASSUMED = "IMPORTED_ASSUMED",
+  BLANK = "BLANK",
+  FAILED = "FAILED",
+}
+
+export enum TaskStatus {
+  CREATED = "CREATED",
+  LOCKED = "LOCKED",
+  COMPLETED = "COMPLETED",
+  SKIPPED = "SKIPPED",
+  ESCALATED = "ESCALATED",
+  TIMEOUT = "TIMEOUT",
+}
+
+export enum PageType { A = "A", B = "B", C = "C", D = "D", PV = "PV" }
+export enum Route { AUTO = "AUTO", HYBRID = "HYBRID", HUMAN_ALL = "HUMAN_ALL" }
+export type Priority = "URGENT" | "HIGH" | "NORMAL" | "LOW";

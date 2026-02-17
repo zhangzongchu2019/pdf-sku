@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pdf-sku-server
+  namespace: pdf-sku
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: pdf-sku-server }
+  template:
+    metadata:
+      labels: { app: pdf-sku-server }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: server
+          image: pdf-sku-server:latest
+          ports: [{ containerPort: 8000 }]
+          envFrom:
+            - secretRef: { name: pdf-sku-secrets }
+            - configMapRef: { name: pdf-sku-config }
+          resources:
+            requests: { cpu: 500m, memory: 512Mi }
+            limits: { cpu: "2", memory: 2Gi }
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 15
+            periodSeconds: 30

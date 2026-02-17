@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pdf-sku-config
+  namespace: pdf-sku
+data:
+  APP_ENV: "production"
+  LOG_LEVEL: "INFO"
+  MAX_UPLOAD_SIZE_MB: "100"
+  MAX_PAGE_COUNT: "1000"
+  CORS_ORIGINS: "https://pdf-sku.internal"
+  MINIO_BUCKET: "pdf-sku"
+  MINIO_SECURE: "true"

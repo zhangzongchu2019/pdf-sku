@@ -1,0 +1,100 @@
+groups:
+  - name: pdf-sku-server
+    rules:
+      # ─── 可用性 ───
+      - alert: ServerDown
+        expr: up{job="pdf-sku-server"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "PDF-SKU Server 不可用"
+          description: "{{ $labels.pod }} 已宕机超过 2 分钟"
+
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.05
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "5xx 错误率超过 5%"
+
+      # ─── Pipeline ───
+      - alert: PipelineBacklog
+        expr: pdf_sku_jobs_processing > 50
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Pipeline 积压: {{ $value }} 个 Job 处理中"
+
+      - alert: PageProcessingTimeout
+        expr: histogram_quantile(0.99, rate(pdf_sku_page_duration_seconds_bucket[5m])) > 120
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "P99 页面处理时间超过 120s"
+
+      # ─── LLM ───
+      - alert: LLMCircuitOpen
+        expr: pdf_sku_llm_circuit_state == 1
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "LLM 熔断器开启: {{ $labels.model }}"
+
+      - alert: LLMHighLatency
+        expr: histogram_quantile(0.95, rate(pdf_sku_llm_latency_seconds_bucket[5m])) > 30
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "LLM P95 延迟超过 30s"
+
+      - alert: LLMBudgetLow
+        expr: pdf_sku_llm_budget_remaining_usd < 10
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "LLM 预算剩余不足 $10"
+
+      # ─── 标注 ───
+      - alert: TaskQueueDeep
+        expr: pdf_sku_task_queue_depth > 100
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "标注队列深度: {{ $value }}"
+
+      - alert: SLABreach
+        expr: pdf_sku_sla_breaches_total > 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "SLA 违约: {{ $value }} 个任务超时"
+
+      # ─── 导入 ───
+      - alert: ImportFailureRate
+        expr: rate(pdf_sku_import_failures_total[10m]) / rate(pdf_sku_import_total[10m]) > 0.1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "导入失败率超过 10%"
+
+      # ─── 基础设施 ───
+      - alert: PostgresHighConnections
+        expr: pg_stat_activity_count > 80
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "PostgreSQL 连接数: {{ $value }}"
+
+      - alert: RedisHighMemory
+        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.85
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Redis 内存使用率: {{ $value | humanizePercentage }}"
+
+      - alert: DiskSpaceLow
+        expr: node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes < 0.15
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "磁盘剩余空间不足 15%"
