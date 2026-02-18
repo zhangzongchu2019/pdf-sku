@@ -4,15 +4,21 @@ import { useJobStore } from "../stores/jobStore";
 import { useSSEStore } from "../stores/sseStore";
 import StatusBadge from "../components/common/StatusBadge";
 import Loading from "../components/common/Loading";
-import { formatDate, formatDuration, formatPercent } from "../utils/format";
+import { PageHeatmap } from "../components/dashboard/PageHeatmap";
+import { EvaluationCard } from "../components/dashboard/EvaluationCard";
+import { PrescanCard } from "../components/dashboard/PrescanCard";
+import { SKUList } from "../components/dashboard/SKUList";
+import { TimelineDrawer } from "../components/dashboard/TimelineDrawer";
+import { formatDate, formatPercent } from "../utils/format";
+import type { PageHeatmapCell } from "../components/dashboard/PageHeatmap";
 
 export default function JobDetailPage() {
   const { jobId } = useParams<{ jobId: string }>();
   const { currentJob, pages, skus, fetchJob, fetchPages, fetchSkus, loading } = useJobStore();
   const { connect, disconnect, onEvent } = useSSEStore();
-  const updateJob = useJobStore((s) => s.updateJobFromSSE);
   const [selectedPage, setSelectedPage] = useState<number | null>(null);
-  const [tab, setTab] = useState<"pages" | "skus">("pages");
+  const [tab, setTab] = useState<"pages" | "skus" | "heatmap" | "eval">("pages");
+  const [showTimeline, setShowTimeline] = useState(false);
 
   useEffect(() => {
     if (!jobId) return;
@@ -76,12 +82,25 @@ export default function JobDetailPage() {
         </div>
       </div>
 
-      <div className="tab-bar">
+      <div className="tab-bar" style={{ display: "flex", gap: 4, marginBottom: 16 }}>
         <button className={`tab ${tab === "pages" ? "active" : ""}`} onClick={() => setTab("pages")}>
           页面 ({pages.length})
         </button>
         <button className={`tab ${tab === "skus" ? "active" : ""}`} onClick={() => { setTab("skus"); setSelectedPage(null); }}>
           SKU ({skus.length})
+        </button>
+        <button className={`tab ${tab === "heatmap" ? "active" : ""}`} onClick={() => setTab("heatmap")}>
+          热力图
+        </button>
+        <button className={`tab ${tab === "eval" ? "active" : ""}`} onClick={() => setTab("eval")}>
+          评估
+        </button>
+        <div style={{ flex: 1 }} />
+        <button
+          onClick={() => setShowTimeline(true)}
+          style={{ padding: "4px 12px", backgroundColor: "transparent", border: "1px solid #2D3548", borderRadius: 4, color: "#94A3B8", cursor: "pointer", fontSize: 12 }}
+        >
+          📅 时间线
         </button>
       </div>
 
@@ -111,27 +130,41 @@ export default function JobDetailPage() {
       )}
 
       {tab === "skus" && (
-        <table className="data-table">
-          <thead>
-            <tr>
-              <th>SKU ID</th><th>页码</th><th>有效性</th><th>属性</th>
-              <th>导入状态</th>
-            </tr>
-          </thead>
-          <tbody>
-            {skus.map((s) => (
-              <tr key={s.id}>
-                <td className="td-mono">{s.sku_id.slice(0, 12)}...</td>
-                <td>{s.page_number}</td>
-                <td><StatusBadge status={s.validity} /></td>
-                <td className="td-ellipsis">
-                  {Object.entries(s.attributes).slice(0, 3).map(([k, v]) => `${k}: ${v}`).join(" | ")}
-                </td>
-                <td><StatusBadge status={s.import_status} /></td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <SKUList skus={skus} />
+      )}
+
+      {tab === "heatmap" && (
+        <div style={{ backgroundColor: "#1B2233", border: "1px solid #2D3548", borderRadius: 8, padding: 16 }}>
+          <PageHeatmap
+            pages={pages.map((p): PageHeatmapCell => ({
+              page_no: p.page_number,
+              status: p.status,
+              confidence: p.page_confidence ?? undefined,
+              page_type: p.page_type ?? undefined,
+            }))}
+            onPageClick={(pageNum) => {
+              setSelectedPage(pageNum);
+              setTab("pages");
+            }}
+          />
+        </div>
+      )}
+
+      {tab === "eval" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <EvaluationCard />
+          <PrescanCard />
+        </div>
+      )}
+
+      {/* Timeline drawer */}
+      {showTimeline && (
+        <TimelineDrawer
+          visible={true}
+          title={`Job ${job.job_id} 时间线`}
+          events={[]}
+          onClose={() => setShowTimeline(false)}
+        />
       )}
     </div>
   );

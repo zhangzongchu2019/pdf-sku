@@ -3,26 +3,31 @@ import { useParams, useNavigate } from "react-router-dom";
 import { useAnnotationStore } from "../stores/annotationStore";
 import { useJobStore } from "../stores/jobStore";
 import { useNotificationStore } from "../stores/notificationStore";
+import { useSettingsStore } from "../stores/settingsStore";
 import StatusBadge from "../components/common/StatusBadge";
 import CanvasEngine from "../components/canvas/CanvasEngine";
 import GroupPanel from "../components/annotation/GroupPanel";
 import ToolBar from "../components/annotation/ToolBar";
+import { SLAStatusBar } from "../components/annotation/SLAStatusBar";
+import { SubmitConfirmModal } from "../components/annotation/SubmitConfirmModal";
+import { LockStatusIndicator } from "../components/annotation/LockStatusIndicator";
 import Loading from "../components/common/Loading";
 
 export default function AnnotationPage() {
-  const { taskId } = useParams<{ taskId: string }>();
+  useParams<{ taskId: string }>();
   const navigate = useNavigate();
-  const notify = useNotificationStore((s) => s.add);
+  const notify = useNotificationStore((s) => s.addNotification);
   const {
     currentTask, skus, annotations,
     setSkus, addAnnotation, updateAnnotation, removeAnnotation,
     selectSku, selectedSkuId,
     submitTask, skipTask, reset,
   } = useAnnotationStore();
-  const { fetchSkus, skus: jobSkus } = useJobStore();
+  const { fetchSkus } = useJobStore();
 
   const [pageImageUrl, setPageImageUrl] = useState<string | null>(null);
-  const [editingSku, setEditingSku] = useState<string | null>(null);
+  const [showSubmitConfirm, setShowSubmitConfirm] = useState(false);
+  const skipSubmitConfirm = useSettingsStore((s) => s.skipSubmitConfirm);
 
   // Load task data
   useEffect(() => {
@@ -84,12 +89,21 @@ export default function AnnotationPage() {
   }, [currentTask, addAnnotation]);
 
   const handleSubmit = async () => {
+    if (!skipSubmitConfirm) {
+      setShowSubmitConfirm(true);
+      return;
+    }
+    await doSubmit();
+  };
+
+  const doSubmit = async () => {
     try {
       await submitTask();
       notify({ type: "success", message: "标注提交成功" });
       navigate("/tasks");
-    } catch (e: any) {
-      notify({ type: "error", message: e.message });
+    } catch (e: unknown) {
+      const err = e as Error;
+      notify({ type: "error", message: err.message });
     }
   };
 
@@ -99,8 +113,9 @@ export default function AnnotationPage() {
       await skipTask("标注员手动跳过");
       notify({ type: "info", message: "已跳过" });
       navigate("/tasks");
-    } catch (e: any) {
-      notify({ type: "error", message: e.message });
+    } catch (e: unknown) {
+      const err = e as Error;
+      notify({ type: "error", message: err.message });
     }
   };
 
@@ -108,11 +123,34 @@ export default function AnnotationPage() {
 
   return (
     <div className="page annotation-page">
+      {/* SLA status bar */}
+      {currentTask.timeout_at && (
+        <SLAStatusBar
+          deadline={currentTask.timeout_at}
+          slaLevel="NORMAL"
+          taskId={currentTask.task_id}
+          reworkCount={currentTask.rework_count}
+        />
+      )}
+
+      {/* Lock indicator */}
+      <LockStatusIndicator
+        lockedBy={currentTask.locked_by ?? null}
+        lockedAt={currentTask.timeout_at ?? null}
+        timeoutAt={currentTask.timeout_at ?? null}
+        currentUserId=""
+      />
+
       <div className="annotation-header">
         <div className="task-info">
           <h2>标注: {currentTask.task_type}</h2>
           <span>Job: {currentTask.job_id.slice(0, 8)}... | 页码: {currentTask.page_number}</span>
           <StatusBadge status={currentTask.status} />
+          {currentTask.rework_count > 0 && (
+            <span style={{ marginLeft: 8, fontSize: 11, padding: "1px 6px", backgroundColor: "#F59E0B18", border: "1px solid #F59E0B33", borderRadius: 3, color: "#F59E0B" }}>
+              返工 ×{currentTask.rework_count}
+            </span>
+          )}
         </div>
         <ToolBar
           onSubmit={handleSubmit}
@@ -145,6 +183,18 @@ export default function AnnotationPage() {
           />
         </div>
       </div>
+
+      {/* Submit confirmation modal */}
+      {showSubmitConfirm && (
+        <SubmitConfirmModal
+          visible={true}
+          ungroupedCount={0}
+          groupCount={0}
+          warningMessages={[]}
+          onConfirm={() => { setShowSubmitConfirm(false); doSubmit(); }}
+          onCancel={() => setShowSubmitConfirm(false)}
+        />
+      )}
     </div>
   );
 }

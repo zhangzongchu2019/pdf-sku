@@ -11,3 +11,9 @@ export function escapeHtml(str: string): string {
   div.textContent = str;
   return div.innerHTML;
 }
+
+export function sanitizeHtml(html: string): string {
+  const div = document.createElement("div");
+  div.innerHTML = html;
+  return div.textContent ?? "";
+}
