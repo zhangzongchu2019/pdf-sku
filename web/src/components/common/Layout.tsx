@@ -3,6 +3,7 @@ import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useNotificationStore } from "../../stores/notificationStore";
 import { useSSEStore } from "../../stores/sseStore";
 import { useUploadStore } from "../../stores/uploadStore";
+import { useAuthStore } from "../../stores/authStore";
 
 /* ---- Navigation sections ---- */
 const MAIN_NAV = [
@@ -18,6 +19,7 @@ const ANNOTATOR_NAV = [
 ];
 
 const OPS_NAV = [
+  { path: "/admin/users", label: "用户管理", icon: "🔐" },
   { path: "/annotators", label: "标注员管理", icon: "👥" },
   { path: "/eval", label: "质量评估", icon: "🏆" },
   { path: "/ops/custom-attr-upgrades", label: "属性升级", icon: "🔄" },
@@ -66,6 +68,14 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   const sseConnected = useSSEStore((s) => s.status === "connected");
   const uploadItems = useUploadStore((s) => s.uploads);
   const activeUploads = uploadItems.filter((f) => f.status === "uploading" || f.status === "hashing");
+  const { username, displayName, role, logout, isLoggedIn } = useAuthStore();
+
+  const ROLE_LABELS: Record<string, string> = {
+    admin: "管理员",
+    uploader: "上传者",
+    annotator: "标注员",
+    operator: "操作员",
+  };
 
   return (
     <div className="app-layout">
@@ -81,11 +91,15 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         {/* Main nav */}
         <NavSection items={MAIN_NAV} currentPath={location.pathname} />
 
-        {/* Annotator section */}
-        <NavSection title="标注" items={ANNOTATOR_NAV} currentPath={location.pathname} />
+        {/* Annotator section — annotator & admin only */}
+        {(role === "annotator" || role === "admin") && (
+          <NavSection title="标注" items={ANNOTATOR_NAV} currentPath={location.pathname} />
+        )}
 
-        {/* Ops section */}
-        <NavSection title="运维" items={OPS_NAV} currentPath={location.pathname} />
+        {/* Ops section — admin only */}
+        {role === "admin" && (
+          <NavSection title="运维" items={OPS_NAV} currentPath={location.pathname} />
+        )}
 
         {/* Spacer */}
         <div style={{ flex: 1 }} />
@@ -171,6 +185,28 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             })}
           </ul>
         </div>
+
+        {/* User info + logout */}
+        {isLoggedIn && (
+          <div className="sidebar-user">
+            <div className="sidebar-user-info">
+              <span className="sidebar-user-avatar">
+                {role === "admin" ? "👑" : role === "annotator" ? "✏️" : "📤"}
+              </span>
+              <div>
+                <div className="sidebar-user-name">{displayName || username}</div>
+                <div className="sidebar-user-role">{ROLE_LABELS[role] || role}</div>
+              </div>
+            </div>
+            <button
+              className="btn btn-text btn-sm"
+              onClick={() => { logout(); navigate("/login"); }}
+              title="退出登录"
+            >
+              🚪
+            </button>
+          </div>
+        )}
       </nav>
 
       <main className="main-content">

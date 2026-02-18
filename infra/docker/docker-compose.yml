@@ -51,7 +51,7 @@ services:
   # 数据库迁移 (一次性运行)
   migrate:
     build:
-      context: ../../pdf-sku-server
+      context: ../../server
       dockerfile: Dockerfile
     command: >
       sh -c "
@@ -69,7 +69,7 @@ services:
 
   server:
     build:
-      context: ../../pdf-sku-server
+      context: ../../server
       dockerfile: Dockerfile
     ports: ["8000:8000"]
     environment:
@@ -99,8 +99,8 @@ services:
 
   web:
     build:
-      context: ../../pdf-sku-web
-      dockerfile: ../pdf-sku-infra/docker/Dockerfile.web
+      context: ../../web
+      dockerfile: ../infra/docker/Dockerfile.web
     ports: ["80:80"]
     depends_on:
       server:

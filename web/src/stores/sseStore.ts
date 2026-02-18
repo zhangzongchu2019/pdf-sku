@@ -67,7 +67,7 @@ export const useSSEStore = create<SSEState>()(
       es.addEventListener("page_completed", (e: MessageEvent) => {
         try {
           const data: SSEPageCompleted = JSON.parse(e.data);
-          useJobStore.getState().updateJobFromSSE(data.page_no.toString(), {});
+          useJobStore.getState().updatePageStatus(data.page_no, data.status ?? "AI_COMPLETED");
           dispatch("page_completed", data);
         } catch { /* ignore */ }
       });
@@ -166,7 +166,7 @@ export const useSSEStore = create<SSEState>()(
 
       set((s) => {
         s.eventSource = es as any;
-        s.status = "disconnected";
+        s.status = "reconnecting";
       });
     },
 

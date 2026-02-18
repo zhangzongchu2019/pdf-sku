@@ -24,6 +24,8 @@ info:
     - [V1.7→] Evaluation 增加 route_reason/sampling/prompt_version
     - [V1.7→] PrescanResult 增加 raw_metrics
     - [V1.7→] Tag 细分 (12 tag) + PaginationMeta 独立 schema
+    - [V2.1→] Auth 模块 9 个端点（login/register/me/change-password/admin CRUD）
+    - [V2.1→] User schema + LoginRequest/LoginResponse/RegisterRequest
 
     **未吸收 V1.7 项**（与模块设计不兼容）：
     - TaskCompleteRequest skus 模型 → 保留 V1.2 的 groups 元素-分组模型
@@ -47,6 +49,8 @@ security:
 # Tags (V1.7 细分 12 tag)
 # ====================================================================
 tags:
+  - name: Auth
+    description: 用户认证与管理（JWT）[V2.1 新增]
   - name: Upload
     description: tus 断点续传上传
   - name: Jobs
@@ -76,6 +80,202 @@ tags:
 # Paths
 # ====================================================================
 paths:
+
+  # ======================== Auth [V2.1 新增] ========================
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: 用户登录
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string, format: password }
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string, description: JWT Bearer Token }
+                  user: { $ref: '#/components/schemas/User' }
+        '401':
+          description: 用户名或密码错误
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: 用户注册
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password, role]
+              properties:
+                username: { type: string }
+                password: { type: string, format: password }
+                display_name: { type: string }
+                role: { type: string, enum: [uploader, annotator] }
+                merchant_id: { type: string, nullable: true }
+                specialties: { type: array, items: { type: string }, nullable: true }
+      responses:
+        '201':
+          description: 注册成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  user: { $ref: '#/components/schemas/User' }
+        '409':
+          description: 用户名已存在
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: 获取当前用户信息
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+    patch:
+      tags: [Auth]
+      summary: 更新当前用户资料
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name: { type: string }
+                merchant_id: { type: string }
+                specialties: { type: array, items: { type: string } }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+
+  /auth/me/change-password:
+    post:
+      tags: [Auth]
+      summary: 修改密码
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [old_password, new_password]
+              properties:
+                old_password: { type: string, format: password }
+                new_password: { type: string, format: password }
+      responses:
+        '200':
+          description: 密码修改成功
+        '400':
+          description: 旧密码不正确
+
+  /auth/users:
+    get:
+      tags: [Auth]
+      summary: 获取用户列表（管理员）
+      description: 仅 admin 角色可访问
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/User' }
+    post:
+      tags: [Auth]
+      summary: 创建用户（管理员）
+      description: 仅 admin 角色可访问
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password, role]
+              properties:
+                username: { type: string }
+                password: { type: string, format: password }
+                display_name: { type: string }
+                role: { type: string, enum: [admin, uploader, annotator] }
+                merchant_id: { type: string, nullable: true }
+                specialties: { type: array, items: { type: string }, nullable: true }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '409':
+          description: 用户名已存在
+
+  /auth/users/{user_id}:
+    patch:
+      tags: [Auth]
+      summary: 更新用户信息（管理员）
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name: { type: string }
+                role: { type: string, enum: [admin, uploader, annotator] }
+                merchant_id: { type: string }
+                specialties: { type: array, items: { type: string } }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+
+  /auth/users/{user_id}/status:
+    patch:
+      tags: [Auth]
+      summary: 启用/禁用用户（管理员）
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [is_active]
+              properties:
+                is_active: { type: boolean }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
 
   # ======================== Upload (tus) ========================
 
@@ -1212,9 +1412,11 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        JWT Token 由登录接口签发，有效期 24h。
+        JWT Token 由 POST /auth/login 签发，有效期 24h。
+        实现: python-jose + pbkdf2_hmac 密码哈希。
+        环境变量: JWT_SECRET_KEY（必须配置）
         Header: `Authorization: Bearer <token>`
-        Payload: { user_id, role, annotator_id?, merchant_id?, exp }
+        Payload: { user_id, username, role, merchant_id?, exp }
 
   parameters:
     JobId:
@@ -1247,6 +1449,20 @@ components:
       description: 每页条数，全局最大 100。响应头含 X-Total-Count。
 
   schemas:
+
+    # ======== User [V2.1 新增] ========
+    User:
+      type: object
+      properties:
+        user_id: { type: string, format: uuid }
+        username: { type: string }
+        display_name: { type: string, nullable: true }
+        role: { type: string, enum: [admin, uploader, annotator] }
+        is_active: { type: boolean }
+        merchant_id: { type: string, nullable: true }
+        specialties: { type: array, items: { type: string }, nullable: true }
+        created_at: { type: string, format: date-time }
+        last_login_at: { type: string, format: date-time, nullable: true }
 
     # ======== Pagination (V1.7→) ========
     PaginationMeta:

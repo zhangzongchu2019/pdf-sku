@@ -1,7 +1,7 @@
 # PDF-SKU 系统数据字典与状态机定义
 
 > **版本**: V1.0  
-> **权威源**: DDL V1.2（17 表）· OpenAPI V2.0（53 端点 / 30 schemas）· 接口契约 V1.2 · 前端详设 V1.1 · BA V1.1  
+> **权威源**: DDL V1.2（18 表）· OpenAPI V2.0（62 端点 / 34 schemas）· 接口契约 V1.2 · 前端详设 V1.1 · BA V1.1  
 > **定位**: 一站式开发参考，消除枚举、状态、字段定义的跨文档查阅痛点  
 > **约定**: 所有枚举值均为**冻结版本**，变更需前后端+DB 同步发布
 
@@ -12,8 +12,8 @@
 | 章节 | 内容 |
 |------|------|
 | §1 状态机 | Job / Page / SKU / Task / Image 五大实体状态机（Mermaid + 转换表 + 写入方） |
-| §2 枚举注册表 | 全系统 28 种枚举类型，一处定义 |
-| §3 数据字典 | 17 张表逐字段说明（类型 / 约束 / 来源 / 业务含义） |
+| §2 枚举注册表 | 全系统 29 种枚举类型，一处定义 |
+| §3 数据字典 | 18 张表逐字段说明（类型 / 约束 / 来源 / 业务含义） |
 | §4 跨实体协调规则 | user_status 映射 / SSE 事件触发 / action_hint 生成 / 错误码 |
 | §5 TypeScript 类型索引 | 前端类型与后端字段的映射对照 |
 
@@ -129,10 +129,10 @@ stateDiagram-v2
     IMPORT_FAILED --> IMPORTED_CONFIRMED: 重试成功 + 回执
     IMPORT_FAILED --> IMPORTED_ASSUMED: 重试成功但无回执
 
-    HUMAN_QUEUED --> HUMAN_PROCESSING: 运营领取（locked_by 加锁）
-    HUMAN_PROCESSING --> HUMAN_COMPLETED: 运营处理完成
-    HUMAN_PROCESSING --> AI_QUEUED: 运营触发 AI 重试（attempt_no++）
-    HUMAN_PROCESSING --> SKIPPED: 运营标记为不可处理
+    HUMAN_QUEUED --> HUMAN_PROCESSING: 标注员领取（locked_by 加锁）
+    HUMAN_PROCESSING --> HUMAN_COMPLETED: 标注员处理完成
+    HUMAN_PROCESSING --> AI_QUEUED: 标注员触发 AI 重试（attempt_no++）
+    HUMAN_PROCESSING --> SKIPPED: 标注员标记为不可处理
 
     HUMAN_COMPLETED --> IMPORTED_CONFIRMED: 导入成功 + 回执
     HUMAN_COMPLETED --> IMPORTED_ASSUMED: 导入成功但无回执
@@ -155,8 +155,8 @@ stateDiagram-v2
 | `AI_COMPLETED` | AI 处理成功，等待导入 | — |
 | `AI_FAILED` | AI 处理异常，待重试或转人工 | — |
 | `HUMAN_QUEUED` | 已分配给人工，排队中 | — |
-| `HUMAN_PROCESSING` | 运营正在处理（已加锁） | — |
-| `HUMAN_COMPLETED` | 运营处理完成，等待导入 | — |
+| `HUMAN_PROCESSING` | 标注员正在处理（已加锁） | — |
+| `HUMAN_COMPLETED` | 标注员处理完成，等待导入 | — |
 | `SKIPPED` | D 类噪声页或不可处理 | ✅ |
 | `IMPORTED_CONFIRMED` | 已导入 + 下游回执确认 | ✅ |
 | `IMPORTED_ASSUMED` | 已导入但无回执（降级确认） | ✅ |
@@ -244,10 +244,10 @@ stateDiagram-v2
 stateDiagram-v2
     [*] --> CREATED: 任务创建
 
-    CREATED --> ASSIGNED: 分配给运营
+    CREATED --> ASSIGNED: 分配给标注员
     CREATED --> PROCESSING: auto_pick_next 直接领取
 
-    ASSIGNED --> PROCESSING: 运营开始处理（locked_by 加锁）
+    ASSIGNED --> PROCESSING: 标注员开始处理（locked_by 加锁）
 
     PROCESSING --> COMPLETED: 处理完成（释放锁）
     PROCESSING --> EXPIRED: 超时未完成（锁过期回收）
@@ -267,8 +267,8 @@ stateDiagram-v2
 | 状态 | 含义 | locked_by | 终态 |
 |------|------|-----------|------|
 | `CREATED` | 任务已创建，待分配 | null | — |
-| `ASSIGNED` | 已分配给具体运营 | null | — |
-| `PROCESSING` | 运营正在处理（已加锁） | **非 null**（INV-08） | — |
+| `ASSIGNED` | 已分配给具体标注员 | null | — |
+| `PROCESSING` | 标注员正在处理（已加锁） | **非 null**（INV-08） | — |
 | `COMPLETED` | 处理完成 | null | ✅ |
 | `EXPIRED` | 超时（锁过期回收 / 超时未分配） | null | — |
 | `ESCALATED` | 超时降级（终态） | null | ✅ |
@@ -280,7 +280,7 @@ stateDiagram-v2
 | → CREATED | Pipeline | needs_review=true / HYBRID 路由 | human_needed |
 | CREATED → ASSIGNED | Collaboration (TaskDispatcher) | 手动分配 | — |
 | CREATED → PROCESSING | Collaboration (auto_pick_next) | POST /tasks/next 原子领取 | — |
-| ASSIGNED → PROCESSING | Collaboration | 运营开始处理 | — |
+| ASSIGNED → PROCESSING | Collaboration | 标注员开始处理 | — |
 | PROCESSING → COMPLETED | Collaboration | POST /tasks/{id}/complete | page_completed |
 | PROCESSING → EXPIRED | Collaboration (LockExpiryScanner) | 锁超时 15s 轮询 | — |
 | PROCESSING → CREATED | Collaboration (RevertManager) | POST /tasks/{id}/revert | — |
@@ -401,7 +401,13 @@ stateDiagram-v2
 | **ComponentStatus** | ok · degraded · down · circuit_open | components.*.status | 组件健康状态 |
 | **ErrorSeverity** | info · warning · error · critical | ErrorResponse.severity | 前端映射: info→toast · warning→toast · error→modal · critical→banner |
 
-## 2.9 SSE 事件类型
+## 2.9 用户与认证 [V1.2 新增]
+
+| 枚举名 | 值 | DB 列 | API 字段 | 前端类型 | 说明 |
+|--------|---|-------|---------|---------|------|
+| **UserRole** | admin · uploader · annotator | users.role | User.role | `'admin' \| 'uploader' \| 'annotator'` | 系统角色：管理员 / 上传员 / 标注员 |
+
+## 2.10 SSE 事件类型
 
 | 枚举名 | 值 | 说明 |
 |--------|---|------|
@@ -411,7 +417,7 @@ stateDiagram-v2
 
 # §3 数据字典
 
-> 17 张表逐字段说明。字段格式: `字段名` 类型 [约束] — 业务含义
+> 18 张表逐字段说明。字段格式: `字段名` 类型 [约束] — 业务含义
 
 ## 3.1 pdf_jobs — 处理作业主表
 
@@ -790,6 +796,28 @@ stateDiagram-v2
 
 ---
 
+## 3.18 users — 用户表 [V1.2 新增]
+
+| 字段 | 类型 | 约束 | 枚举/说明 |
+|------|------|------|----------|
+| user_id | UUID | PK, DEFAULT gen_random_uuid() | — |
+| username | TEXT | NOT NULL, UNIQUE | 登录用户名 |
+| display_name | TEXT | nullable | 显示名称 |
+| password_hash | TEXT | NOT NULL | pbkdf2_hmac 密码哈希 |
+| role | TEXT | NOT NULL, DEFAULT 'annotator' | §2.9 UserRole（admin/uploader/annotator） |
+| is_active | BOOLEAN | NOT NULL, DEFAULT true | 账户是否启用 |
+| merchant_id | TEXT | nullable | 所属商户（uploader 角色关联） |
+| specialties | TEXT[] | nullable | 标注员专长品类 |
+| created_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 创建时间 |
+| updated_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 更新时间 |
+| last_login_at | TIMESTAMPTZ | nullable | 最后登录时间 |
+
+**索引**: idx_users_username (UNIQUE) · idx_users_role
+
+**认证方案**: JWT (python-jose) + pbkdf2_hmac 密码哈希。JWT payload 含 user_id, username, role, merchant_id。环境变量 `JWT_SECRET_KEY` 为必须配置项。
+
+---
+
 # §4 跨实体协调规则
 
 ## 4.1 user_status 映射规则
@@ -908,6 +936,8 @@ stateDiagram-v2
 
 | 前端类型 | 后端表/Schema | 关键字段差异 |
 |---------|-------------|------------|
+| `User` | users / API User | user_id, username, display_name, role, is_active, merchant_id, specialties [V1.2 新增] |
+| `UserRole` | users.role | `'admin' \| 'uploader' \| 'annotator'` [V1.2 新增] |
 | `Job` | pdf_jobs / API Job | 字段一一对应 |
 | `JobDetail` | pdf_jobs / API JobDetail | 含时间线 + token_consumption |
 | `JobInternalStatus` | pdf_jobs.status | 12 值 union type |

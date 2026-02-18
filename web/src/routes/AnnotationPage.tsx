@@ -14,14 +14,14 @@ import { LockStatusIndicator } from "../components/annotation/LockStatusIndicato
 import Loading from "../components/common/Loading";
 
 export default function AnnotationPage() {
-  useParams<{ taskId: string }>();
+  const { taskId: urlTaskId } = useParams<{ taskId: string }>();
   const navigate = useNavigate();
   const notify = useNotificationStore((s) => s.addNotification);
   const {
     currentTask, skus, annotations,
     setSkus, addAnnotation, updateAnnotation, removeAnnotation,
     selectSku, selectedSkuId,
-    submitTask, skipTask, reset,
+    submitTask, skipTask, reset, loadTask,
   } = useAnnotationStore();
   const { fetchSkus } = useJobStore();
 
@@ -29,8 +29,12 @@ export default function AnnotationPage() {
   const [showSubmitConfirm, setShowSubmitConfirm] = useState(false);
   const skipSubmitConfirm = useSettingsStore((s) => s.skipSubmitConfirm);
 
-  // Load task data
+  // Load task from URL param if store is empty
   useEffect(() => {
+    if (!currentTask && urlTaskId) {
+      loadTask(urlTaskId);
+      return;
+    }
     if (!currentTask) {
       navigate("/tasks");
       return;

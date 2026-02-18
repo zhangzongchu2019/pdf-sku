@@ -44,6 +44,10 @@
 ```
 tests/
 ├── unit/
+│   ├── auth/                          # [V2.1 新增]
+│   │   ├── test_jwt_auth.py
+│   │   ├── test_password_hash.py
+│   │   └── test_rbac.py
 │   ├── gateway/
 │   │   ├── test_job_creator.py
 │   │   ├── test_pdf_prescan.py
@@ -111,6 +115,23 @@ tests/
 | G-U06 | 正常创建 Job | 有效 PDF + profile | Job 状态 UPLOADED | P0 |
 | G-U07 | 孤儿任务重提 | ORPHANED 状态 Job | 重置为 EVALUATING | P1 |
 | G-U08 | 非孤儿重提 | PROCESSING 状态 Job | 409 JOB_NOT_ORPHANED | P1 |
+
+#### Auth 模块 [V2.1 新增]
+
+| 用例 ID | 测试项 | 输入 | 预期 | 优先级 |
+|---------|--------|------|------|--------|
+| AU-U01 | 登录成功 | 有效用户名/密码 | 200 + JWT token + user 对象 | P0 |
+| AU-U02 | 登录失败 | 错误密码 | 401 INVALID_CREDENTIALS | P0 |
+| AU-U03 | 注册新用户 | 新用户名 + 密码 + role | 201 + token + user | P0 |
+| AU-U04 | 注册重复用户名 | 已存在用户名 | 409 USERNAME_EXISTS | P0 |
+| AU-U05 | JWT 有效验证 | 有效 token | 200 /auth/me 返回用户信息 | P0 |
+| AU-U06 | JWT 过期 | 过期 token | 401 TOKEN_EXPIRED | P0 |
+| AU-U07 | RBAC admin-only | annotator 访问 /auth/users | 403 FORBIDDEN | P0 |
+| AU-U08 | 修改密码 | 正确旧密码 + 新密码 | 200 密码已更新 | P1 |
+| AU-U09 | 修改密码-旧密码错误 | 错误旧密码 | 400 | P1 |
+| AU-U10 | Admin 创建用户 | admin token + 用户信息 | 201 | P1 |
+| AU-U11 | Admin 禁用用户 | PATCH /auth/users/{id}/status | is_active=false | P1 |
+| AU-U12 | 密码哈希不可逆 | 存储的 password_hash | 非明文 + pbkdf2 格式 | P0 |
 
 #### Evaluator 模块
 
@@ -265,6 +286,19 @@ def redis():
 ```
 
 ### 3.2 关键集成流
+
+#### 认证流 [V2.1 新增]
+
+```
+Step 1: POST /auth/register → 201 注册成功
+Step 2: POST /auth/login → 200 获取 JWT token
+Step 3: GET /auth/me (Bearer token) → 200 用户信息
+Step 4: PATCH /auth/me → 200 更新资料
+Step 5: POST /auth/me/change-password → 200
+Step 6: 使用无效 token → 401
+Step 7: annotator 访问 POST /jobs → 403 (RBAC)
+Step 8: uploader 访问 POST /tasks/next → 403 (RBAC)
+```
 
 #### 全自动流（Happy Path）
 
@@ -602,6 +636,8 @@ export default defineConfig({
 
 | 用例 ID | 路径 | 断言 | 优先级 |
 |---------|------|------|--------|
+| E2E-00 | 登录 → 角色首页 [V2.1] | 未登录→/login, 输入凭据, uploader→/dashboard, annotator→/annotate | P0 |
+| E2E-00a | Admin 用户管理 [V2.1] | /admin/users 创建用户 → 列表显示 → 禁用/启用 | P1 |
 | E2E-01 | PDF 上传 → Job 创建 | 进度 100% + toast | P0 |
 | E2E-02 | 标注完整流程 | 提交确认 → toast "已提取 N 个 SKU" | P0 |
 | E2E-03 | 标注快捷键 | V/L/G/1~4/Ctrl+Z/Ctrl+Enter | P0 |

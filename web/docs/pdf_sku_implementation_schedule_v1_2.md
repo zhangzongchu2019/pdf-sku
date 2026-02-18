@@ -3,7 +3,7 @@
 > **版本**: V1.2（对齐 OpenAPI V2.0 + 前端详设 V1.1 + 接口契约 V1.2）  
 > **团队假设**: 3 名后端开发 + 1 名前端 + 1 名 QA  
 > **Sprint 周期**: 2 周 / Sprint  
-> **依据**: 各模块详设 V1.1/V1.2 + DDL V1.2（17 表）+ OpenAPI V2.0（53 端点）+ 前端详设 V1.1（31 评审修复 + 15 V2.0 对齐）
+> **依据**: 各模块详设 V1.1/V1.2 + DDL V1.2（18 表）+ OpenAPI V2.1（62 端点）+ 前端详设 V1.1（31 评审修复 + 15 V2.0 对齐）
 
 ---
 
@@ -11,10 +11,10 @@
 
 | 变更项 | V1.0 | V1.2 | 增量原因 |
 |--------|------|------|---------|
-| DB 表数 | 15 | 17 | +custom_attr_upgrades, +worker_heartbeats |
+| DB 表数 | 15 | 18 | +custom_attr_upgrades, +worker_heartbeats, +users [V2.1] |
 | Migration 数 | 8 | 13 | +009~013 V1.2 增量 |
 | SSE 事件 | 7 | 9 | +heartbeat, +pages_batch_update |
-| API 端点 | ~40 | 53 | +/tasks/next, +/annotations, +/ops/custom-attr-upgrades, +batch-skip 等 |
+| API 端点 | ~40 | 62 | +/tasks/next, +/annotations, +/ops/custom-attr-upgrades, +batch-skip, +/auth/* 9 端点 [V2.1] |
 | 后端总人天 | 74d | 82d | +8d（+11%）：Gateway 双轨状态/SSE、Collaboration auto_pick/batch、Feedback 升级建议 |
 | 前端总人天 | 50d | 64d | +14d（+28%）：31 评审修复 + 15 V2.0 对齐 |
 | 后端并行周数 | 10 | 11 | +1 周缓冲吸收 V2.0 增量 |
@@ -28,7 +28,8 @@
 
 | # | 模块 | 设计行数 | 预估代码行数 | V1.0 人天 | V1.2 人天 | 增量说明 | 复杂度 | 前置依赖 |
 |---|------|---------|------------|----------|----------|---------|--------|---------|
-| 0 | **DB + 基础设施** | — | ~600 | 3d | **3.5d** | +2 表, +5 migration | 低 | — |
+| 0 | **DB + 基础设施** | — | ~600 | 3d | **3.5d** | +3 表, +5 migration (+users) | 低 | — |
+| 0.5 | **Auth [V2.1]** | — | ~500 | — | **1.5d** | User 模型 + JWT(python-jose) + 密码哈希 + RBAC + 9 个端点 | 低 | DB |
 | 1 | **Config** | 429 | ~900 | 4d | **4.5d** | +impact_preview API | 中 | DB |
 | 2 | **LLM Adapter** | 2900 | ~2900 | 12d | 12d | 无变更 | **高** | Config |
 | 3 | **Gateway** | 1423 | ~2800 | 8d | **9.5d** | +user_status 同步, +SSE 9 事件, +worker_heartbeats | 中 | Config, Storage |
@@ -139,9 +140,9 @@ graph TD
 | FastAPI 项目骨架 + 健康检查 + Dockerfile | Dev-C | 1.5d | 可启动的空壳服务 | — |
 | Prometheus + Langfuse 接入桩 | Dev-C | 1.5d | 指标注册 + trace 桩 | — |
 | **QA**: 测试框架搭建（pytest + testcontainers） | QA | 2d | conftest + DB fixture（17 表） | — |
-| **前端 FS0**: 项目骨架 + 路由 + Token + Auth + settingsStore | FE | 3d | 前端空壳可运行 | +settingsStore |
+| **前端 FS0**: 项目骨架 + 路由 + Token + Auth (Login/Register/RequireAuth/UserManage) + settingsStore (ProfileCard + ChangePasswordCard) | FE | 3d | 前端空壳可运行 | +settingsStore +authStore(persist) [V2.1] |
 
-**Sprint 0 产出**: 后端项目骨架 + DB 17 表就绪 + 前端骨架可运行
+**Sprint 0 产出**: 后端项目骨架 + DB 18 表就绪 + Auth 模块可用 + 前端骨架可运行
 
 ---
 
@@ -283,7 +284,7 @@ Week  1  2  3  4  5  6  7  8  9  10  11  12  13  14
 
 | 里程碑 | 时间 | 验收标准 | V1.2 新增验收 |
 |--------|------|---------|-------------|
-| **M0**: 骨架就绪 | W2 末 | DB **17** 表就绪，前后端可启动 | +custom_attr_upgrades, +worker_heartbeats |
+| **M0**: 骨架就绪 | W2 末 | DB **18** 表就绪 + Auth 可用，前后端可启动 | +custom_attr_upgrades, +worker_heartbeats, +users [V2.1] |
 | **M1**: 入口层就绪 | W4 末 | 可上传 PDF 并创建 Job | +**user_status 双轨** + **SSE 9 事件** + **impact_preview** |
 | **M2**: AI 链路跑通 | W6 末 | PDF → 评估 → 分类 | +**route_reason** 输出可验证 |
 | **M3**: 全链路跑通 | W8 末 | PDF → SKU 导入（含人工路径）| +**auto_pick_next** + **sync_job** |

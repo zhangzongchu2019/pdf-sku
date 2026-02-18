@@ -1,7 +1,159 @@
 /**
  * 设置页 /settings
+ * 包含: 个人信息修改、修改密码、偏好设置
  */
+import { useState } from "react";
 import { useSettingsStore } from "../stores/settingsStore";
+import { useAuthStore } from "../stores/authStore";
+import { authApi } from "../api/auth";
+
+/* ─── 个人信息卡片 ─── */
+function ProfileCard() {
+  const { username, displayName, role, merchantId } = useAuthStore();
+  const setAuth = useAuthStore((s) => s.setAuth);
+  const token = useAuthStore((s) => s.token);
+  const userId = useAuthStore((s) => s.userId);
+
+  const [editing, setEditing] = useState(false);
+  const [newDisplayName, setNewDisplayName] = useState(displayName);
+  const [newMerchantId, setNewMerchantId] = useState(merchantId || "");
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  const handleSave = async () => {
+    setSaving(true);
+    setMsg("");
+    try {
+      const res = await authApi.updateProfile({
+        display_name: newDisplayName,
+        merchant_id: role === "uploader" ? newMerchantId : undefined,
+      });
+      // 更新本地状态
+      setAuth({
+        userId,
+        username,
+        displayName: res.display_name,
+        role,
+        token: token!,
+        merchantId: res.merchant_id,
+      });
+      setMsg("✅ 个人信息已更新");
+      setEditing(false);
+      setTimeout(() => setMsg(""), 3000);
+    } catch (err: any) {
+      setMsg("❌ " + (err?.body?.detail || err.message || "更新失败"));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const ROLE_LABELS: Record<string, string> = {
+    admin: "管理员", uploader: "上传者", annotator: "标注员",
+  };
+
+  return (
+    <div className="settings-section">
+      <h3 className="settings-section-title">👤 个人信息</h3>
+      <div className="settings-card">
+        <div className="settings-row">
+          <span className="settings-label">用户名</span>
+          <span className="settings-value td-mono">{username}</span>
+        </div>
+        <div className="settings-row">
+          <span className="settings-label">角色</span>
+          <span className="settings-value">{ROLE_LABELS[role] || role}</span>
+        </div>
+        <div className="settings-row">
+          <span className="settings-label">显示名称</span>
+          {editing ? (
+            <input className="input input-sm" value={newDisplayName} onChange={(e) => setNewDisplayName(e.target.value)} style={{ maxWidth: 200 }} />
+          ) : (
+            <span className="settings-value">{displayName}</span>
+          )}
+        </div>
+        {role === "uploader" && (
+          <div className="settings-row">
+            <span className="settings-label">商户 ID</span>
+            {editing ? (
+              <input className="input input-sm" value={newMerchantId} onChange={(e) => setNewMerchantId(e.target.value)} style={{ maxWidth: 200 }} />
+            ) : (
+              <span className="settings-value td-mono">{merchantId || "—"}</span>
+            )}
+          </div>
+        )}
+        {msg && <div style={{ fontSize: 13, marginTop: 8 }}>{msg}</div>}
+        <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
+          {editing ? (
+            <>
+              <button className="btn btn-primary btn-sm" onClick={handleSave} disabled={saving}>
+                {saving ? "保存中..." : "保存"}
+              </button>
+              <button className="btn btn-sm" onClick={() => { setEditing(false); setNewDisplayName(displayName); setNewMerchantId(merchantId || ""); }}>
+                取消
+              </button>
+            </>
+          ) : (
+            <button className="btn btn-sm" onClick={() => setEditing(true)}>✏️ 编辑</button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─── 修改密码卡片 ─── */
+function ChangePasswordCard() {
+  const [oldPwd, setOldPwd] = useState("");
+  const [newPwd, setNewPwd] = useState("");
+  const [confirmPwd, setConfirmPwd] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setMsg("");
+    if (!oldPwd || !newPwd) { setMsg("❌ 请填写所有字段"); return; }
+    if (newPwd.length < 6) { setMsg("❌ 新密码至少 6 位"); return; }
+    if (newPwd !== confirmPwd) { setMsg("❌ 两次新密码不一致"); return; }
+    setLoading(true);
+    try {
+      await authApi.changePassword(oldPwd, newPwd);
+      setMsg("✅ 密码修改成功");
+      setOldPwd(""); setNewPwd(""); setConfirmPwd("");
+      setTimeout(() => setMsg(""), 3000);
+    } catch (err: any) {
+      setMsg("❌ " + (err?.body?.detail || err.message || "修改失败"));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="settings-section">
+      <h3 className="settings-section-title">🔒 修改密码</h3>
+      <div className="settings-card">
+        <form onSubmit={handleSubmit}>
+          <div className="form-group">
+            <label>当前密码</label>
+            <input className="input" type="password" value={oldPwd} onChange={(e) => setOldPwd(e.target.value)} style={{ maxWidth: 300 }} />
+          </div>
+          <div className="form-group">
+            <label>新密码</label>
+            <input className="input" type="password" value={newPwd} onChange={(e) => setNewPwd(e.target.value)} placeholder="至少 6 位" style={{ maxWidth: 300 }} />
+          </div>
+          <div className="form-group">
+            <label>确认新密码</label>
+            <input className="input" type="password" value={confirmPwd} onChange={(e) => setConfirmPwd(e.target.value)} style={{ maxWidth: 300 }} />
+          </div>
+          {msg && <div style={{ fontSize: 13, marginBottom: 8 }}>{msg}</div>}
+          <button type="submit" className="btn btn-primary btn-sm" disabled={loading}>
+            {loading ? "修改中..." : "修改密码"}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
 
 export default function SettingsPage() {
   const settings = useSettingsStore();
@@ -31,7 +183,16 @@ export default function SettingsPage() {
 
   return (
     <div style={{ padding: 24, maxWidth: 640, margin: "0 auto" }}>
-      <h2 style={{ margin: "0 0 24px", fontSize: 18, color: "#E2E8F4" }}>设置</h2>
+      {/* 个人信息 */}
+      <ProfileCard />
+
+      {/* 修改密码 */}
+      <ChangePasswordCard />
+
+      {/* 偏好设置 */}
+      <div className="settings-section">
+        <h3 className="settings-section-title">⚙️ 偏好设置</h3>
+      </div>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
         {/* Theme */}

@@ -10,6 +10,7 @@ from pdf_sku.common.dependencies import DBSession
 from pdf_sku.common.models import HumanTask, Annotation, AnnotatorProfile
 from pdf_sku.collaboration.annotation_service import TaskManager
 from pdf_sku.collaboration.lock_manager import LockManager
+from pdf_sku.auth.dependencies import CurrentUser, AnnotatorUser, AdminUser
 
 router = APIRouter(prefix="/api/v1", tags=["Collaboration"])
 
@@ -75,9 +76,10 @@ async def get_task(db: DBSession, task_id: str = Path(...)):
 
 @router.post("/tasks/next")
 async def auto_pick_next(
-    db: DBSession, operator: str = Body(..., embed=True),
+    db: DBSession, user: AnnotatorUser,
 ):
-    """原子领取下一个任务 (SKIP LOCKED)。"""
+    """原子领取下一个任务 (SKIP LOCKED)。需要标注员角色。"""
+    operator = user.username
     task = await _lock_mgr.acquire_next(db, operator)
     if not task:
         return {"data": None, "message": "No tasks available"}
@@ -102,10 +104,11 @@ async def assign_task(
 @router.post("/tasks/{task_id}/complete")
 async def complete_task(
     db: DBSession,
+    user: AnnotatorUser,
     task_id: str = Path(...),
     body: dict = Body(...),
 ):
-    operator = body.get("operator", "unknown")
+    operator = user.username
     result_data = body.get("result", {})
     try:
         task = await _task_mgr.complete_task(db, task_id, result_data, operator)

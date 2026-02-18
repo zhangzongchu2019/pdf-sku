@@ -16,8 +16,11 @@
 
 ```
 /                                     → 角色自适应首页 [V1.2 修订]
-│                                       Operator/Admin → /dashboard
+│                                       Uploader/Admin → /dashboard
 │                                       Annotator → /annotate
+│                                       未登录 → /login [V1.2 新增]
+├── /login                            → 登录页 [V1.2 新增]（公共路由，无需认证）
+├── /register                         → 注册页 [V1.2 新增]（公共路由，角色选择 uploader/annotator）
 ├── /upload                           → 上传 PDF（模块一）
 ├── /dashboard                        → 自动化任务看板（模块二）
 │   └── /dashboard/:jobId             → Job 详情页（§5.6）[V1.1 补全]
@@ -33,14 +36,16 @@
 │   └── /annotators/:id               → 标注员详情
 ├── /eval                             → 评测报告
 │   └── /eval/:reportId               → 报告详情
+├── /admin/users                      → 用户管理 [V1.2 新增]（仅 Admin）
 ├── /notifications                    → 通知中心 [V1.2 新增]
-└── /settings                         → 系统设置
+└── /settings                         → 系统设置（含个人资料/修改密码） [V1.2 增强]
 ```
 
 ### 1.2 角色与权限矩阵
 
-| 页面/功能 | 运营（Operator） | 标注员（Annotator） | 研发/运维（Admin） |
+| 页面/功能 | 上传员（Uploader） | 标注员（Annotator） | 研发/运维（Admin） |
 |-----------|:-:|:-:|:-:|
+| 登录 / 注册 | ✓ | ✓ | ✓ | `[V1.2 新增]`
 | 上传 PDF | ✓ | ✗ | ✓ |
 | 任务看板 | ✓（只读） | ✗ | ✓ |
 | Job 详情 | ✓ | ✗ | ✓ |
@@ -56,8 +61,10 @@
 | 触发评测 | ✗ | ✗ | ✓ |
 | 孤儿 Job 重提 requeue | ✗ | ✗ | ✓ |
 | 商家维度 Job 汇总 | ✓ | ✗ | ✓ |
+| 用户管理 CRUD | ✗ | ✗ | ✓ | `[V1.2 新增]`
+| 个人资料 / 修改密码 | ✓ | ✓ | ✓ | `[V1.2 新增]`
 
-> 对齐 BRD §2 角色定义。
+> 对齐 BRD §2 角色定义。[V1.2] 角色重命名：原“运营（Operator）”对应系统角色 uploader，“标注员（Annotator）”对应 annotator，“研发/运维（Admin）”对应 admin。
 
 ### 1.3 模块间跳转关系
 

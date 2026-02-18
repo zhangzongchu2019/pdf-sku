@@ -1,9 +1,16 @@
+import { useAuthStore } from "../stores/authStore";
+
 const TUS_BASE = import.meta.env.VITE_API_BASE || "/api/v1";
 
 export interface UploadProgress {
   loaded: number;
   total: number;
   percentage: number;
+}
+
+function getAuthHeaders(): Record<string, string> {
+  const token = useAuthStore.getState().token;
+  return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
 export async function tusUpload(
@@ -18,6 +25,7 @@ export async function tusUpload(
       "Upload-Length": String(file.size),
       "Upload-Metadata": `filename ${btoa(file.name)},filetype ${btoa(file.type)}`,
       "Tus-Resumable": "1.0.0",
+      ...getAuthHeaders(),
     },
   });
   if (!createRes.ok) throw new Error(`Upload creation failed: ${createRes.status}`);
@@ -38,6 +46,7 @@ export async function tusUpload(
         "Upload-Offset": String(offset),
         "Content-Type": "application/offset+octet-stream",
         "Tus-Resumable": "1.0.0",
+        ...getAuthHeaders(),
       },
       body: chunk,
     });
@@ -57,6 +66,6 @@ export async function tusUpload(
 
 export async function getUploadOffset(fileId: string): Promise<number> {
   const res = await fetch(`${TUS_BASE}/uploads/${fileId}`, { method: "HEAD",
-    headers: { "Tus-Resumable": "1.0.0" } });
+    headers: { "Tus-Resumable": "1.0.0", ...getAuthHeaders() } });
   return parseInt(res.headers.get("Upload-Offset") || "0", 10);
 }

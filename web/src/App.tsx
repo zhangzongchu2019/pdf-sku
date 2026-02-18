@@ -3,8 +3,11 @@ import { lazy, Suspense } from "react";
 import Layout from "./components/common/Layout";
 import { ErrorBoundary } from "./components/common/ErrorBoundary";
 import { PageSkeleton } from "./components/common/PageSkeleton";
+import { RequireAuth } from "./components/common/RequireAuth";
 
 /* ---- lazy pages ---- */
+const LoginPage          = lazy(() => import("./routes/LoginPage"));
+const RegisterPage       = lazy(() => import("./routes/RegisterPage"));
 const DashboardPage      = lazy(() => import("./routes/DashboardPage"));
 const UploadPage         = lazy(() => import("./routes/UploadPage"));
 const JobListPage        = lazy(() => import("./routes/JobListPage"));
@@ -22,6 +25,7 @@ const EvalListPage       = lazy(() => import("./routes/EvalListPage"));
 const EvalDetailPage     = lazy(() => import("./routes/EvalDetailPage"));
 const CustomAttrUpgradesPage = lazy(() => import("./routes/CustomAttrUpgradesPage"));
 const NotificationPage   = lazy(() => import("./routes/NotificationPage"));
+const UserManagePage     = lazy(() => import("./routes/UserManagePage"));
 const SettingsPage       = lazy(() => import("./routes/SettingsPage"));
 
 function LazyPage({ children }: { children: React.ReactNode }) {
@@ -34,55 +38,75 @@ function LazyPage({ children }: { children: React.ReactNode }) {
   );
 }
 
+function Protected({ children, roles }: { children: React.ReactNode; roles?: string[] }) {
+  return (
+    <RequireAuth roles={roles}>
+      <LazyPage>{children}</LazyPage>
+    </RequireAuth>
+  );
+}
+
 export default function App() {
   return (
     <BrowserRouter>
-      <Layout>
-        <Routes>
-          {/* Dashboard */}
-          <Route path="/" element={<LazyPage><DashboardPage /></LazyPage>} />
-          <Route path="/dashboard" element={<LazyPage><DashboardPage /></LazyPage>} />
+      <Routes>
+        {/* 公开页: 登录 / 注册 (不带 Layout) */}
+        <Route path="/login" element={<LazyPage><LoginPage /></LazyPage>} />
+        <Route path="/register" element={<LazyPage><RegisterPage /></LazyPage>} />
 
-          {/* Upload */}
-          <Route path="/upload" element={<LazyPage><UploadPage /></LazyPage>} />
+        {/* 所有业务页面 — 都要求登录 */}
+        <Route path="/*" element={
+          <Layout>
+            <Routes>
+              {/* Dashboard — 所有角色 */}
+              <Route path="/" element={<Protected><DashboardPage /></Protected>} />
+              <Route path="/dashboard" element={<Protected><DashboardPage /></Protected>} />
 
-          {/* Jobs */}
-          <Route path="/jobs" element={<LazyPage><JobListPage /></LazyPage>} />
-          <Route path="/jobs/:jobId" element={<LazyPage><JobDetailPage /></LazyPage>} />
+              {/* Upload — 仅 uploader / admin */}
+              <Route path="/upload" element={<Protected roles={["uploader", "admin"]}><UploadPage /></Protected>} />
 
-          {/* Tasks */}
-          <Route path="/tasks" element={<LazyPage><TaskListPage /></LazyPage>} />
+              {/* Jobs — 所有已登录 */}
+              <Route path="/jobs" element={<Protected><JobListPage /></Protected>} />
+              <Route path="/jobs/:jobId" element={<Protected><JobDetailPage /></Protected>} />
 
-          {/* Annotation */}
-          <Route path="/annotate/:taskId" element={<LazyPage><AnnotationPage /></LazyPage>} />
-          <Route path="/annotate/my-stats" element={<LazyPage><MyStatsPage /></LazyPage>} />
-          <Route path="/annotate/history" element={<LazyPage><HistoryPage /></LazyPage>} />
+              {/* Tasks — 所有已登录 */}
+              <Route path="/tasks" element={<Protected><TaskListPage /></Protected>} />
 
-          {/* Config */}
-          <Route path="/config" element={<LazyPage><ConfigPage /></LazyPage>} />
-          <Route path="/config/:profileId" element={<LazyPage><ConfigEditPage /></LazyPage>} />
+              {/* Annotation — 仅 annotator / admin */}
+              <Route path="/annotate/:taskId" element={<Protected roles={["annotator", "admin"]}><AnnotationPage /></Protected>} />
+              <Route path="/annotate/my-stats" element={<Protected roles={["annotator", "admin"]}><MyStatsPage /></Protected>} />
+              <Route path="/annotate/history" element={<Protected roles={["annotator", "admin"]}><HistoryPage /></Protected>} />
 
-          {/* Merchants */}
-          <Route path="/merchants/:merchantId" element={<LazyPage><MerchantJobsPage /></LazyPage>} />
+              {/* User Management — admin */}
+              <Route path="/admin/users" element={<Protected roles={["admin"]}><UserManagePage /></Protected>} />
 
-          {/* Annotators (Ops) */}
-          <Route path="/annotators" element={<LazyPage><AnnotatorListPage /></LazyPage>} />
-          <Route path="/annotators/:annotatorId" element={<LazyPage><AnnotatorDetailPage /></LazyPage>} />
+              {/* Config — admin */}
+              <Route path="/config" element={<Protected roles={["admin"]}><ConfigPage /></Protected>} />
+              <Route path="/config/:profileId" element={<Protected roles={["admin"]}><ConfigEditPage /></Protected>} />
 
-          {/* Evaluation */}
-          <Route path="/eval" element={<LazyPage><EvalListPage /></LazyPage>} />
-          <Route path="/eval/:reportId" element={<LazyPage><EvalDetailPage /></LazyPage>} />
+              {/* Merchants */}
+              <Route path="/merchants/:merchantId" element={<Protected><MerchantJobsPage /></Protected>} />
 
-          {/* Custom Attr Upgrades (Ops) */}
-          <Route path="/ops/custom-attr-upgrades" element={<LazyPage><CustomAttrUpgradesPage /></LazyPage>} />
+              {/* Annotators (Ops) — admin */}
+              <Route path="/annotators" element={<Protected roles={["admin"]}><AnnotatorListPage /></Protected>} />
+              <Route path="/annotators/:annotatorId" element={<Protected roles={["admin"]}><AnnotatorDetailPage /></Protected>} />
 
-          {/* Notifications */}
-          <Route path="/notifications" element={<LazyPage><NotificationPage /></LazyPage>} />
+              {/* Evaluation — admin */}
+              <Route path="/eval" element={<Protected roles={["admin"]}><EvalListPage /></Protected>} />
+              <Route path="/eval/:reportId" element={<Protected roles={["admin"]}><EvalDetailPage /></Protected>} />
 
-          {/* Settings */}
-          <Route path="/settings" element={<LazyPage><SettingsPage /></LazyPage>} />
-        </Routes>
-      </Layout>
+              {/* Custom Attr Upgrades (Ops) — admin */}
+              <Route path="/ops/custom-attr-upgrades" element={<Protected roles={["admin"]}><CustomAttrUpgradesPage /></Protected>} />
+
+              {/* Notifications — 所有 */}
+              <Route path="/notifications" element={<Protected><NotificationPage /></Protected>} />
+
+              {/* Settings — 所有 */}
+              <Route path="/settings" element={<Protected><SettingsPage /></Protected>} />
+            </Routes>
+          </Layout>
+        } />
+      </Routes>
     </BrowserRouter>
   );
 }

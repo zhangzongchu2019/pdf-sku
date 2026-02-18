@@ -26,6 +26,7 @@ from pdf_sku.common.enums import (
 )
 from pdf_sku.common.exceptions import JobNotFoundError, PDFSKUError
 from pdf_sku.common.schemas import PaginationMeta, ErrorResponse
+from pdf_sku.auth.dependencies import CurrentUser, UploaderUser, AnyUser
 import structlog
 
 logger = structlog.get_logger()
@@ -133,14 +134,16 @@ async def create_job(
     request: Request,
     db: DBSession,
     redis: RedisClient,
+    user: UploaderUser,
 ):
     """
     创建 Job。对齐: Gateway 详设 §4.1
     Body: {"upload_id": str, "merchant_id": str, "category"?: str}
+    需要 uploader 或 admin 角色。
     """
     body = await request.json()
     upload_id = body.get("upload_id")
-    merchant_id = body.get("merchant_id", "")
+    merchant_id = body.get("merchant_id", user.merchant_id or "")
     category = body.get("category")
 
     if not upload_id or not merchant_id:
@@ -166,6 +169,7 @@ async def create_job(
         filename=meta["filename"],
         merchant_id=merchant_id,
         category=category,
+        uploaded_by=f"{user.username} ({str(user.user_id)[:8]})",
     )
     await db.commit()
 

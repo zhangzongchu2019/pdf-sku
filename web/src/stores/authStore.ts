@@ -3,11 +3,21 @@ import { persist } from "zustand/middleware";
 
 interface AuthState {
   userId: string;
-  role: "operator" | "annotator" | "admin";
+  username: string;
+  displayName: string;
+  role: "operator" | "uploader" | "annotator" | "admin";
   annotatorId: string | null;
   token: string | null;
   merchantId: string | null;
-  setAuth: (auth: Partial<AuthState>) => void;
+  isLoggedIn: boolean;
+  setAuth: (auth: {
+    userId: string;
+    username: string;
+    displayName?: string;
+    role: string;
+    token: string;
+    merchantId?: string | null;
+  }) => void;
   logout: () => void;
 }
 
@@ -15,14 +25,46 @@ export const useAuthStore = create<AuthState>()(
   persist(
     (set) => ({
       userId: "",
-      role: "operator",
+      username: "",
+      displayName: "",
+      role: "operator" as const,
       annotatorId: null,
       token: null,
       merchantId: null,
-      setAuth: (auth) => set(auth),
+      isLoggedIn: false,
+      setAuth: (auth) =>
+        set({
+          userId: auth.userId,
+          username: auth.username,
+          displayName: auth.displayName || auth.username,
+          role: auth.role as AuthState["role"],
+          annotatorId: auth.role === "annotator" ? auth.userId : null,
+          token: auth.token,
+          merchantId: auth.merchantId ?? null,
+          isLoggedIn: true,
+        }),
       logout: () =>
-        set({ userId: "", role: "operator", annotatorId: null, token: null, merchantId: null }),
+        set({
+          userId: "",
+          username: "",
+          displayName: "",
+          role: "operator",
+          annotatorId: null,
+          token: null,
+          merchantId: null,
+          isLoggedIn: false,
+        }),
     }),
-    { name: "pdf-sku-auth", storage: { getItem: (k) => { const v = sessionStorage.getItem(k); return v ? JSON.parse(v) : null; }, setItem: (k, v) => sessionStorage.setItem(k, JSON.stringify(v)), removeItem: (k) => sessionStorage.removeItem(k) } },
+    {
+      name: "pdf-sku-auth",
+      storage: {
+        getItem: (k) => {
+          const v = localStorage.getItem(k);
+          return v ? JSON.parse(v) : null;
+        },
+        setItem: (k, v) => localStorage.setItem(k, JSON.stringify(v)),
+        removeItem: (k) => localStorage.removeItem(k),
+      },
+    },
   ),
 );

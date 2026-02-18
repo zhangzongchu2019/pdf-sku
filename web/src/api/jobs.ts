@@ -12,9 +12,10 @@ function adaptPaginated<T>(resp: BackendPaginated<T>): { items: T[]; total: numb
 }
 
 export const jobsApi = {
-  list: async (params?: { status?: string; page?: number; size?: number }) => {
+  list: async (params?: { status?: string; page?: number; size?: number; merchantId?: string }) => {
     const q = new URLSearchParams();
     if (params?.status) q.set("status", params.status);
+    if (params?.merchantId) q.set("merchant_id", params.merchantId);
     q.set("page", String(params?.page ?? 1));
     q.set("page_size", String(params?.size ?? 20));
     const resp = await api.get<BackendPaginated<Job>>(`/jobs?${q}`);

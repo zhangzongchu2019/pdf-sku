@@ -6,7 +6,7 @@ engine = create_async_engine(
     settings.database_url,
     pool_size=settings.database_pool_size,
     max_overflow=settings.database_max_overflow,
-    echo=settings.app_env == "development",
+    echo=settings.sql_echo,
 )
 
 async_session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)

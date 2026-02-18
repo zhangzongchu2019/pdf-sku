@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://pdfsku:pdfsku@localhost:5432/pdfsku"
     db_pool_size: int = 10
     db_max_overflow: int = 20
+    sql_echo: bool = False
 
     @property
     def database_pool_size(self) -> int:

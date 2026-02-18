@@ -7,17 +7,17 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 echo "=== 启动基础设施 ==="
 cd "$ROOT_DIR/docker"
-docker compose up -d postgres redis minio
+docker-compose up -d postgres redis minio
 
 echo "=== 等待服务就绪 ==="
 sleep 5
-until docker compose exec -T postgres pg_isready -U pdfsku > /dev/null 2>&1; do
+until docker-compose exec -T postgres pg_isready -U pdfsku > /dev/null 2>&1; do
   echo "  等待 PostgreSQL..."
   sleep 2
 done
 echo "  ✅ PostgreSQL 就绪"
 
-until docker compose exec -T redis redis-cli ping > /dev/null 2>&1; do
+until docker-compose exec -T redis redis-cli ping > /dev/null 2>&1; do
   echo "  等待 Redis..."
   sleep 2
 done
@@ -25,7 +25,7 @@ echo "  ✅ Redis 就绪"
 
 echo ""
 echo "=== 运行数据库迁移 ==="
-cd "$ROOT_DIR/../pdf-sku-server"
+cd "$ROOT_DIR/../server"
 PYTHONPATH=src alembic upgrade head 2>/dev/null || echo "  ⚠️ 迁移跳过 (可能未初始化)"
 
 echo ""
@@ -39,7 +39,7 @@ SERVER_PID=$!
 
 echo ""
 echo "=== 启动前端 ==="
-cd "$ROOT_DIR/../pdf-sku-web"
+cd "$ROOT_DIR/../web"
 npm run dev &
 WEB_PID=$!
 
@@ -55,5 +55,5 @@ echo "════════════════════════�
 echo ""
 echo "按 Ctrl+C 停止所有服务"
 
-trap "kill $SERVER_PID $WEB_PID 2>/dev/null; cd $ROOT_DIR/docker && docker compose stop" EXIT
+trap "kill $SERVER_PID $WEB_PID 2>/dev/null; cd $ROOT_DIR/docker && docker-compose stop" EXIT
 wait

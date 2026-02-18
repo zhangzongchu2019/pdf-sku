@@ -61,7 +61,7 @@ async def lifespan(app: FastAPI):
             settings.database_url,
             pool_size=settings.db_pool_size,
             max_overflow=settings.db_max_overflow,
-            echo=settings.app_env == "development",
+            echo=settings.sql_echo,
         )
         # Test connection
         async with engine.connect() as conn:
@@ -350,11 +350,13 @@ def create_app() -> FastAPI:
         )
 
     # ─── Routers ───
+    from pdf_sku.auth.router import router as auth_router
     from pdf_sku.gateway.router import router as gateway_router
     from pdf_sku.config.router import router as config_router
     from pdf_sku.collaboration.router import router as collab_router
     from pdf_sku.feedback.router import router as feedback_router
 
+    app.include_router(auth_router)  # /api/v1/auth/*
     app.include_router(gateway_router, prefix="/api/v1")
     app.include_router(config_router)  # already has /api/v1/config prefix
     app.include_router(collab_router)  # already has /api/v1 prefix

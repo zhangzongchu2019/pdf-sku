@@ -203,7 +203,23 @@ export const useAnnotationStore = create<AnnotationState>()(
       useUndoStore.getState().push({
         type: "CREATE_GROUP",
         description: `创建分组（${elementIds.length} 个元素）`,
-        forward: () => get().createGroup(elementIds),
+        forward: () => {
+          // Re-apply: restore to post-create state
+          set((s) => {
+            const groupId = `g-${Date.now()}`;
+            s.groups.push({
+              id: groupId,
+              label: `分组 ${s.groups.length + 1}`,
+              skuType: "complete",
+              elementIds: [...elementIds],
+              skuAttributes: {},
+              customAttributes: [],
+              crossPageSkuId: null,
+            });
+            s.selectedElementIds = [];
+            s.selectedGroupId = groupId;
+          });
+        },
         backward: () => set((s) => {
           s.groups = prevGroups;
           s.selectedElementIds = prevSelected;
@@ -220,7 +236,10 @@ export const useAnnotationStore = create<AnnotationState>()(
       useUndoStore.getState().push({
         type: "DELETE_GROUP",
         description: "删除分组",
-        forward: () => get().deleteGroup(groupId),
+        forward: () => set((s) => {
+          s.groups = s.groups.filter((g) => g.id !== groupId);
+          if (s.selectedGroupId === groupId) s.selectedGroupId = null;
+        }),
         backward: () => set((s) => { s.groups = prevGroups; }),
       });
     },
@@ -237,7 +256,13 @@ export const useAnnotationStore = create<AnnotationState>()(
       useUndoStore.getState().push({
         type: "MOVE_ELEMENT",
         description: "移动元素到分组",
-        forward: () => get().moveElementToGroup(elementId, groupId),
+        forward: () => set((s) => {
+          for (const g of s.groups) {
+            g.elementIds = g.elementIds.filter((id) => id !== elementId);
+          }
+          const target = s.groups.find((g) => g.id === groupId);
+          if (target) target.elementIds.push(elementId);
+        }),
         backward: () => set((s) => { s.groups = prevGroups; }),
       });
     },
@@ -252,7 +277,11 @@ export const useAnnotationStore = create<AnnotationState>()(
       useUndoStore.getState().push({
         type: "MOVE_ELEMENT",
         description: "从分组移除元素",
-        forward: () => get().removeElementFromGroup(elementId),
+        forward: () => set((s) => {
+          for (const g of s.groups) {
+            g.elementIds = g.elementIds.filter((id) => id !== elementId);
+          }
+        }),
         backward: () => set((s) => { s.groups = prevGroups; }),
       });
     },
@@ -267,7 +296,10 @@ export const useAnnotationStore = create<AnnotationState>()(
       useUndoStore.getState().push({
         type: "MODIFY_ATTRIBUTE",
         description: `修改 ${field}`,
-        forward: () => get().updateSKUAttribute(groupId, field, value),
+        forward: () => set((s) => {
+          const g = s.groups.find((g) => g.id === groupId);
+          if (g) g.skuAttributes[field] = value;
+        }),
         backward: () => set((s) => {
           const g = s.groups.find((g) => g.id === groupId);
           if (g) g.skuAttributes[field] = prevValue;
@@ -281,7 +313,7 @@ export const useAnnotationStore = create<AnnotationState>()(
       useUndoStore.getState().push({
         type: "CHANGE_PAGE_TYPE",
         description: `页面类型 ${prev} → ${type}`,
-        forward: () => get().setPageType(type),
+        forward: () => set((s) => { s.pageType = type; s.pageTypeModified = true; }),
         backward: () => set((s) => { s.pageType = prev; }),
       });
     },
@@ -292,7 +324,7 @@ export const useAnnotationStore = create<AnnotationState>()(
       useUndoStore.getState().push({
         type: "CHANGE_LAYOUT_TYPE",
         description: `布局类型 ${prev} → ${type}`,
-        forward: () => get().setLayoutType(type),
+        forward: () => set((s) => { s.layoutType = type; s.layoutTypeModified = true; }),
         backward: () => set((s) => { s.layoutType = prev; }),
       });
     },

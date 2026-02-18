@@ -4,9 +4,10 @@
 import { useState, useEffect, useCallback } from "react";
 import { tasksApi } from "../api/tasks";
 import Pagination from "../components/common/Pagination";
+import type { HumanTask } from "../types/models";
 
 export default function HistoryPage() {
-  const [tasks, setTasks] = useState<Record<string, unknown>[]>([]);
+  const [tasks, setTasks] = useState<HumanTask[]>([]);
   const [page, setPage] = useState(1);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -16,8 +17,8 @@ export default function HistoryPage() {
     try {
       setLoading(true);
       const res = await tasksApi.list({ page, status: "COMPLETED" });
-      setTasks((res as unknown as { data: Record<string, unknown>[] }).data ?? []);
-      setTotal((res as unknown as { pagination: { total: number } }).pagination?.total ?? 0);
+      setTasks(res.items);
+      setTotal(res.total);
     } catch {
       // handle
     } finally {
@@ -66,20 +67,20 @@ export default function HistoryPage() {
               </tr>
             </thead>
             <tbody>
-              {tasks.map((t, i) => (
-                <tr key={i} style={{ borderBottom: "1px solid #2D354866" }}>
-                  <td style={{ padding: "8px" }}>{String(t.task_id ?? "—")}</td>
+              {tasks.map((t) => (
+                <tr key={t.task_id} style={{ borderBottom: "1px solid #2D354866" }}>
+                  <td style={{ padding: "8px" }}>{t.task_id.slice(0, 8)}</td>
                   <td style={{ padding: "8px", color: "#94A3B8" }}>
-                    {String(t.job_id ?? "—")}
+                    {t.job_id.slice(0, 8)}
                   </td>
                   <td style={{ padding: "8px", color: "#94A3B8" }}>
-                    {String(t.page_number ?? "—")}
+                    {t.page_number}
                   </td>
                   <td style={{ padding: "8px", color: "#94A3B8" }}>
-                    {String(t.task_type ?? "—")}
+                    {t.task_type}
                   </td>
                   <td style={{ padding: "8px", color: "#94A3B8" }}>
-                    {t.completed_at ? new Date(String(t.completed_at)).toLocaleString() : "—"}
+                    {t.completed_at ? new Date(t.completed_at).toLocaleString() : "—"}
                   </td>
                 </tr>
               ))}

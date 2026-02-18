@@ -67,19 +67,19 @@ export default function DashboardPage() {
         <MetricsCard title="今日 SKU" value={d?.today_skus ?? 0} color="#52c41a" />
         <MetricsCard
           title="页面完成率"
-          value={formatPercent(d?.page_stats.completion_rate ?? 0)}
+          value={formatPercent(d?.page_stats?.completion_rate ?? 0)}
           color="#722ed1"
         />
         <MetricsCard
           title="导入成功率"
-          value={formatPercent(d?.import_stats.success_rate ?? 0)}
+          value={formatPercent(d?.import_stats?.success_rate ?? 0)}
           color="#13c2c2"
         />
-        <MetricsCard title="活跃 Job" value={d?.job_stats.active ?? 0} color="#fa8c16" />
+        <MetricsCard title="活跃 Job" value={d?.job_stats?.active ?? 0} color="#fa8c16" />
         <MetricsCard
           title="标注队列深度"
-          value={d?.task_stats.queue_depth ?? 0}
-          subtitle={`SLA 健康度: ${formatPercent(d?.task_stats.sla_health ?? 0)}`}
+          value={d?.task_stats?.queue_depth ?? 0}
+          subtitle={`SLA 健康度: ${formatPercent(d?.task_stats?.sla_health ?? 0)}`}
           color="#eb2f96"
         />
       </div>

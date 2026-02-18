@@ -10,8 +10,9 @@ const levelColors: Record<string, string> = {
 };
 
 export default function NotificationPage() {
-  const notifications = useNotificationStore((s) => s.notifications);
+  const notifications = useNotificationStore((s) => s.items);
   const markRead = useNotificationStore((s) => s.markRead);
+  const markAllRead = useNotificationStore((s) => s.markAllRead);
   const clearAll = useNotificationStore((s) => s.clearAll);
 
   const unreadCount = notifications.filter((n) => !n.read).length;
@@ -29,7 +30,7 @@ export default function NotificationPage() {
         </h2>
         <div style={{ display: "flex", gap: 8 }}>
           <button
-            onClick={() => notifications.filter((n) => !n.read).forEach((n) => markRead(n.id))}
+            onClick={() => markAllRead()}
             style={{ padding: "4px 12px", backgroundColor: "transparent", border: "1px solid #2D3548", borderRadius: 4, color: "#94A3B8", cursor: "pointer", fontSize: 12 }}
           >
             全部已读

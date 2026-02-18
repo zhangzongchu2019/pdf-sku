@@ -27,7 +27,9 @@ export default function JobDetailPage() {
     connect(jobId);
 
     const unsub = onEvent((e) => {
-      if (e.data.job_id === jobId) {
+      // SSE is per-job, so all events belong to this job.
+      // Some events (page_completed) don't have job_id field.
+      if (!e.data.job_id || e.data.job_id === jobId) {
         fetchJob(jobId);
         fetchPages(jobId);
       }

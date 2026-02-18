@@ -86,10 +86,11 @@
 ├─────────────────────────────────────────────────────────┤
 │                    State Management (Zustand + immer)    │  状态层 ← V1.1: immer
 │  uploadStore │ jobStore │ annotationStore │ sseStore ... │
+│  authStore (persist/localStorage)                        │  ← V1.2 新增
 │  settingsStore                                          │  ← V1.1 新增
 ├─────────────────────────────────────────────────────────┤
 │                    API / Service Layer                   │  服务层
-│  apiClient │ sseManager │ tusUploader │ authService      │
+│  apiClient │ sseManager │ tusUploader │ authApi           │
 │  annotationApi │ opsApi                                  │  ← V1.1 新增
 ├─────────────────────────────────────────────────────────┤
 │                    Infrastructure                        │  基础设施
@@ -108,6 +109,11 @@ src/
 │   └── providers.tsx                  # 全局 Provider 组合
 │
 ├── pages/                             # 路由页面（thin wrapper）
+│   ├── auth/                          # [V1.2] 认证页面
+│   │   ├── LoginPage.tsx              #   登录（公共路由）
+│   │   └── RegisterPage.tsx           #   注册（公共路由，角色选择 uploader/annotator）
+│   ├── admin/                         # [V1.2] 管理页面
+│   │   └── UserManagePage.tsx         #   用户 CRUD（仅 admin）
 │   ├── upload/
 │   │   └── UploadPage.tsx
 │   ├── dashboard/
@@ -228,9 +234,10 @@ src/
 │   ├── components/
 │   │   ├── layout/
 │   │   │   ├── AppLayout.tsx
-│   │   │   ├── Sidebar.tsx
+│   │   │   ├── Sidebar.tsx             # [V1.2] 按角色条件渲染导航分区
 │   │   │   ├── GlobalBanner.tsx
-│   │   │   └── PageSkeleton.tsx
+│   │   │   ├── PageSkeleton.tsx
+│   │   │   └── RequireAuth.tsx         # [V1.2] 路由守卫（未登录→/login, 角色不符→重定向）
 │   │   ├── ContextMenu.tsx             # [V1.1] 完整实现 (A1)
 │   │   ├── OnboardingGuide.tsx         # [V1.1] 完整实现 (A3)
 │   │   ├── RestReminderFloat.tsx       # [V1.1] 休息浮窗 (A4)
@@ -250,14 +257,15 @@ src/
 │
 ├── services/
 │   ├── api/
-│   │   ├── client.ts                   # [V1.1] severity→UI 映射 (E2)
-│   │   ├── jobs.ts                     # [V1.1] +batch-retry/cancel, created_after/before
+│   │   ├── client.ts                   # [V1.1] severity→UI 映射; [V1.2] 解构 init 避免 headers 覆盖
+│   │   ├── auth.ts                     # [V1.2] login/register/me/changePassword/admin CRUD
+│   │   ├── jobs.ts                     # [V1.1] +batch-retry/cancel, created_after/before; [V1.2] +merchantId
 │   │   ├── tasks.ts                    # [V1.1] +/tasks/next, batch-skip/reassign
 │   │   ├── config.ts                   # [V1.1] +impact-preview
 │   │   ├── annotations.ts             # [V1.1] POST /annotations (V2.0)
 │   │   ├── eval.ts                     # [V1.1] 评测 API (B5)
 │   │   ├── ops.ts                      # [V1.1] custom-attr-upgrades + dashboard events
-│   │   └── upload.ts
+│   │   └── upload.ts                   # [V1.2] getUploadOffset HEAD 补充 auth headers
 │   └── sse/
 │       └── SSEManager.ts              # [V1.1] 9 事件 + 动态轮询 (B1, F2)
 │
@@ -316,9 +324,13 @@ src/
 import { createBrowserRouter } from 'react-router-dom';
 
 const router = createBrowserRouter([
+  // [V1.2] 公共路由（无需登录）
+  { path: '/login', lazy: () => import('@/pages/auth/LoginPage') },
+  { path: '/register', lazy: () => import('@/pages/auth/RegisterPage') },
+
   {
     path: '/',
-    element: <AppLayout />,       // 侧边栏 + GlobalBanner + Outlet
+    element: <RequireAuth><AppLayout /></RequireAuth>,  // [V1.2] 路由守卫包裹
     errorElement: <ErrorBoundary />,
     children: [
       // 首页：角色自适应重定向
@@ -356,6 +368,9 @@ const router = createBrowserRouter([
       // [V1.1] 运维
       { path: 'ops/custom-attr-upgrades', lazy: () => import('@/pages/ops/CustomAttrUpgradesPage') },
 
+      // [V1.2] 用户管理（仅 admin）
+      { path: 'admin/users', lazy: () => import('@/pages/admin/UserManagePage') },
+
       // 通知
       { path: 'notifications', lazy: () => import('@/pages/notifications/NotificationPage') },
 
@@ -374,15 +389,16 @@ function AppLayout() {
   const { role } = useAuthStore();
   const location = useLocation();
 
-  // 角色权限矩阵（对齐 UI/UX §1.2）
+  // 角色权限矩阵（对齐 UI/UX §1.2）[V1.2 修订：operator → uploader]
   const ROLE_ACCESS: Record<string, string[]> = {
-    '/upload':      ['operator', 'admin'],
-    '/dashboard':   ['operator', 'admin'],          // operator 只读
+    '/upload':      ['uploader', 'admin'],
+    '/dashboard':   ['uploader', 'admin'],          // uploader 只读
     '/annotate':    ['annotator', 'admin'],
-    '/config':      ['operator', 'admin'],           // operator 只查看
-    '/annotators':  ['operator', 'admin'],
-    '/eval':        ['operator', 'admin'],
+    '/config':      ['uploader', 'admin'],           // uploader 只查看
+    '/annotators':  ['uploader', 'admin'],
+    '/eval':        ['uploader', 'admin'],
     '/ops':         ['admin'],                        // [V1.1] 运维页面仅 admin
+    '/admin':       ['admin'],                        // [V1.2] 用户管理仅 admin
   };
 
   useEffect(() => {
@@ -667,10 +683,18 @@ export const useAnnotationStore = createStore<AnnotationStore>((set, get) => ({
     });
 
     // 原子推送 undo
+    // [V1.2 修正] forward 不得调用 get().createGroup()（会导致重复 push undo）
+    const snapshotGroups = structuredClone(get().groups);
+    const snapshotSelected = [...get().selectedElementIds];
+    const snapshotGroupId = get().selectedGroupId;
     useUndoStore.getState().push({
       type: 'CREATE_GROUP',
       description: `创建分组（${elementIds.length} 个元素）`,
-      forward: () => get().createGroup(elementIds),
+      forward: () => set((s) => {
+        s.groups = snapshotGroups;
+        s.selectedElementIds = snapshotSelected;
+        s.selectedGroupId = snapshotGroupId;
+      }),
       backward: () => set((s) => {
         s.groups = prevGroups;
         s.selectedElementIds = prevSelected;
@@ -684,10 +708,12 @@ export const useAnnotationStore = createStore<AnnotationStore>((set, get) => ({
       s.groups = s.groups.filter(g => g.id !== groupId);
       if (s.selectedGroupId === groupId) s.selectedGroupId = null;
     });
+    // [V1.2 修正] forward 直接 set 状态，不重新调用 deleteGroup
+    const afterGroups = structuredClone(get().groups);
     useUndoStore.getState().push({
       type: 'DELETE_GROUP',
       description: '删除分组',
-      forward: () => get().deleteGroup(groupId),
+      forward: () => set((s) => { s.groups = afterGroups; }),
       backward: () => set((s) => { s.groups = prevGroups; }),
     });
   },
@@ -703,10 +729,12 @@ export const useAnnotationStore = createStore<AnnotationStore>((set, get) => ({
       const target = s.groups.find(g => g.id === groupId);
       if (target) target.elementIds.push(elementId);
     });
+    // [V1.2 修正] forward 直接 set 状态
+    const afterGroups = structuredClone(get().groups);
     useUndoStore.getState().push({
       type: 'MOVE_ELEMENT',
       description: '移动元素到分组',
-      forward: () => get().moveElementToGroup(elementId, groupId),
+      forward: () => set((s) => { s.groups = afterGroups; }),
       backward: () => set((s) => { s.groups = prevGroups; }),
     });
   },
@@ -718,10 +746,12 @@ export const useAnnotationStore = createStore<AnnotationStore>((set, get) => ({
         g.elementIds = g.elementIds.filter(id => id !== elementId);
       }
     });
+    // [V1.2 修正] forward 直接 set 状态
+    const afterGroupsRemove = structuredClone(get().groups);
     useUndoStore.getState().push({
       type: 'MOVE_ELEMENT',
       description: '从分组移除元素',
-      forward: () => get().removeElementFromGroup(elementId),
+      forward: () => set((s) => { s.groups = afterGroupsRemove; }),
       backward: () => set((s) => { s.groups = prevGroups; }),
     });
   },
@@ -733,10 +763,14 @@ export const useAnnotationStore = createStore<AnnotationStore>((set, get) => ({
       const g = s.groups.find(g => g.id === groupId);
       if (g) g.skuAttributes[field] = value;
     });
+    // [V1.2 修正] forward 直接 set 状态
     useUndoStore.getState().push({
       type: 'MODIFY_ATTRIBUTE',
       description: `修改 ${field}`,
-      forward: () => get().updateSKUAttribute(groupId, field, value),
+      forward: () => set((s) => {
+        const g = s.groups.find(g => g.id === groupId);
+        if (g) g.skuAttributes[field] = value;
+      }),
       backward: () => set((s) => {
         const g = s.groups.find(g => g.id === groupId);
         if (g) g.skuAttributes[field] = prevValue;
@@ -747,10 +781,11 @@ export const useAnnotationStore = createStore<AnnotationStore>((set, get) => ({
   setPageType: (type) => {
     const prev = get().pageType;
     set((s) => { s.pageType = type; s.pageTypeModified = true; });
+    // [V1.2 修正] forward 直接 set 状态
     useUndoStore.getState().push({
       type: 'CHANGE_PAGE_TYPE',
       description: `页面类型 ${prev} → ${type}`,
-      forward: () => get().setPageType(type),
+      forward: () => set((s) => { s.pageType = type; s.pageTypeModified = true; }),
       backward: () => set((s) => { s.pageType = prev; }),
     });
   },
@@ -758,10 +793,11 @@ export const useAnnotationStore = createStore<AnnotationStore>((set, get) => ({
   setLayoutType: (type) => {
     const prev = get().layoutType;
     set((s) => { s.layoutType = type; s.layoutTypeModified = true; });
+    // [V1.2 修正] forward 直接 set 状态
     useUndoStore.getState().push({
       type: 'CHANGE_LAYOUT_TYPE',
       description: `布局类型 ${prev} → ${type}`,
-      forward: () => get().setLayoutType(type),
+      forward: () => set((s) => { s.layoutType = type; s.layoutTypeModified = true; }),
       backward: () => set((s) => { s.layoutType = prev; }),
     });
   },
@@ -1023,13 +1059,49 @@ export const useNotificationStore = createPersistStore<NotificationStore>(
 
 ```typescript
 // src/stores/authStore.ts
-interface AuthStore {
-  userId: string;
-  role: 'operator' | 'annotator' | 'admin';
-  annotatorId: string | null;
-  token: string | null;
-  merchantId: string | null;          // [V1.1 V2.0] JWT payload
+// [V1.2] 完整认证状态 — JWT + 用户信息，persist 到 localStorage
+interface User {
+  user_id: string;
+  username: string;
+  display_name: string | null;
+  role: 'admin' | 'uploader' | 'annotator';   // [V1.2] operator → uploader
+  is_active: boolean;
+  merchant_id: string | null;
+  specialties: string[] | null;
 }
+
+interface AuthStore {
+  token: string | null;
+  user: User | null;
+  isAuthenticated: boolean;
+
+  // 认证方法
+  setAuth: (token: string, user: User) => void;
+  logout: () => void;
+  updateUser: (patch: Partial<User>) => void;
+}
+
+export const useAuthStore = createPersistStore<AuthStore>(
+  (set) => ({
+    token: null,
+    user: null,
+    isAuthenticated: false,
+    setAuth: (token, user) => set((s) => {
+      s.token = token;
+      s.user = user;
+      s.isAuthenticated = true;
+    }),
+    logout: () => set((s) => {
+      s.token = null;
+      s.user = null;
+      s.isAuthenticated = false;
+    }),
+    updateUser: (patch) => set((s) => {
+      if (s.user) Object.assign(s.user, patch);
+    }),
+  }),
+  { name: 'pdf-sku-auth' }
+);
 ```
 
 ```typescript

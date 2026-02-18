@@ -16,6 +16,31 @@ class Base(DeclarativeBase):
     pass
 
 
+# ───────────────────────── 用户/认证 ─────────────────────────
+
+class User(Base):
+    """用户表 — 支持 uploader / annotator / admin 三种角色。"""
+    __tablename__ = "users"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    display_name: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    password_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    role: Mapped[str] = mapped_column(String(20), nullable=False, default="uploader")  # uploader | annotator | admin
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    merchant_id: Mapped[str | None] = mapped_column(Text)  # uploader 关联的商户
+    specialties: Mapped[list[str] | None] = mapped_column(ARRAY(Text))  # annotator 擅长品类
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("idx_users_role", "role"),
+        Index("idx_users_username", "username"),
+    )
+
+
+# ───────────────────────── 业务模型 ─────────────────────────
+
 class PDFJob(Base):
     __tablename__ = "pdf_jobs"
 
