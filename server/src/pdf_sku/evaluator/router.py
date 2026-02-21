@@ -101,7 +101,7 @@ class EvaluatorService:
 
         # 获取冻结配置
         profile = await self._config.get_frozen_config(
-            db, job.frozen_config_version or "default:v1.0")
+            db, job.frozen_config_version or "default")
         thresholds = profile.get("thresholds", {"A": 0.85, "B": 0.45})
         weights = profile.get("confidence_weights")
 
@@ -112,7 +112,7 @@ class EvaluatorService:
                 route="HUMAN_ALL", reason="prescan_reject")
 
         # 缓存查询
-        cache_key = f"{job.file_hash}:{job.frozen_config_version or 'default:v1.0'}"
+        cache_key = f"{job.file_hash}:{job.frozen_config_version or 'default'}"
         cached = await self._cache.get(cache_key)
         if cached:
             logger.info("eval_cache_hit", job_id=str(job.job_id), key=cache_key)
@@ -214,7 +214,7 @@ class EvaluatorService:
         # 7. 持久化
         eval_data = {
             "file_hash": job.file_hash,
-            "config_version": job.frozen_config_version or "default:v1.0",
+            "config_version": job.frozen_config_version or "default",
             "doc_confidence": c_doc,
             "route": route,
             "route_reason": route_reason,
@@ -272,7 +272,7 @@ class EvaluatorService:
         """创建降级评估结果。"""
         eval_data = {
             "file_hash": job.file_hash,
-            "config_version": job.frozen_config_version or "default:v1.0",
+            "config_version": job.frozen_config_version or "default",
             "doc_confidence": 0.0,
             "route": route,
             "route_reason": None,

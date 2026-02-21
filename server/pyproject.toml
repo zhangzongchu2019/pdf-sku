@@ -1,6 +1,6 @@
 [project]
 name = "pdf-sku-server"
-version = "0.1.0"
+version = "0.2.0"
 description = "PDF Classification & SKU Extraction System — Backend Server"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }

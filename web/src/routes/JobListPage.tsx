@@ -10,7 +10,7 @@ import { formatDate } from "../utils/format";
 const STATUSES = ["", "PROCESSING", "COMPLETED", "PARTIAL", "FAILED", "CANCELLED"];
 
 export default function JobListPage() {
-  const { jobs, total, loading, fetchJobs, cancelJob } = useJobStore();
+  const { jobs, total, loading, fetchJobs, cancelJob, deleteJob } = useJobStore();
   const [filter, setFilter] = useState("");
   const [page, setPage] = useState(1);
 
@@ -68,6 +68,16 @@ export default function JobListPage() {
                     {job.user_status === "FAILED" && (
                       <button className="btn btn-text btn-sm" onClick={() => useJobStore.getState().retryJob(job.job_id)}>重试</button>
                     )}
+                    <button
+                      className="btn btn-danger btn-sm"
+                      style={{ marginLeft: 8 }}
+                      onClick={async () => {
+                        if (!window.confirm("确认删除该任务？将同时删除关联页面/SKU/标注数据，且不可恢复")) return;
+                        await deleteJob(job.job_id);
+                      }}
+                    >
+                      删除
+                    </button>
                   </td>
                 </tr>
               ))}

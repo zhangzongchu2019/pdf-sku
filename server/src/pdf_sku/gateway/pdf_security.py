@@ -51,10 +51,15 @@ class PDFSecurityChecker:
             if doc.is_encrypted:
                 issues.append("encrypted_pdf")
 
-            # 2. JavaScript 注入 — 文档级
-            doc_js = doc.get_js()
-            if doc_js:
-                issues.append("javascript_embedded")
+            # 2. JavaScript 注入 — 文档级（部分 PyMuPDF 版本无 get_js，需兼容）
+            if hasattr(doc, "get_js"):
+                try:
+                    doc_js = doc.get_js()
+                    if doc_js:
+                        issues.append("javascript_embedded")
+                except Exception:
+                    # 安全检查不应因接口缺失直接失败，继续后续检查
+                    pass
 
             # 3. JavaScript — Widget 注解级 (抽查前50页)
             if "javascript_embedded" not in issues:

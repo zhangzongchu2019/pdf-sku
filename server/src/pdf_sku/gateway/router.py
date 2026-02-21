@@ -10,23 +10,37 @@ Gateway API 路由。对齐: OpenAPI V2.0 §/jobs + §/uploads + §/dashboard
 """
 from __future__ import annotations
 import uuid
+import shutil
+from pathlib import Path
 from typing import Annotated
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response, Path as PathParam
-from fastapi.responses import JSONResponse
-from sqlalchemy import select, func, desc
+from fastapi.responses import JSONResponse, FileResponse
+from sqlalchemy import select, func, desc, delete, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
 from pdf_sku.common.dependencies import DBSession, RedisClient
-from pdf_sku.common.models import PDFJob, Page, SKU, Evaluation
+from pdf_sku.common.models import (
+    PDFJob,
+    Page,
+    SKU,
+    Evaluation,
+    Annotation,
+    HumanTask,
+    Image,
+    SKUImageBinding,
+    StateTransition,
+)
 from pdf_sku.common.enums import (
     JobInternalStatus, JobUserStatus, compute_user_status, ACTION_HINT_MAP,
 )
 from pdf_sku.common.exceptions import JobNotFoundError, PDFSKUError
 from pdf_sku.common.schemas import PaginationMeta, ErrorResponse
 from pdf_sku.auth.dependencies import CurrentUser, UploaderUser, AnyUser
+from pdf_sku.settings import settings
+from pdf_sku.gateway.event_bus import event_bus
 import structlog
 
 logger = structlog.get_logger()
@@ -264,6 +278,104 @@ async def requeue_job(job_id: uuid.UUID, db: DBSession, redis: RedisClient):
     return {"job_id": str(job_id), "status": job.status, "user_status": job.user_status}
 
 
+@router.delete("/ops/jobs/{job_id}")
+async def delete_job(job_id: uuid.UUID, db: DBSession):
+    """物理删除 Job 及其关联数据。"""
+    result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise JobNotFoundError(f"Job {job_id} not found")
+
+    task_ids = (await db.execute(
+        select(HumanTask.task_id).where(HumanTask.job_id == job_id)
+    )).scalars().all()
+
+    if task_ids:
+        await db.execute(
+            delete(StateTransition).where(
+                StateTransition.entity_type == "task",
+                StateTransition.entity_id.in_([str(tid) for tid in task_ids]),
+            )
+        )
+
+    await db.execute(delete(StateTransition).where(
+        StateTransition.entity_type == "job",
+        StateTransition.entity_id == str(job_id),
+    ))
+    await db.execute(delete(Annotation).where(Annotation.job_id == job_id))
+    await db.execute(delete(HumanTask).where(HumanTask.job_id == job_id))
+    await db.execute(delete(SKUImageBinding).where(SKUImageBinding.job_id == job_id))
+    await db.execute(delete(Image).where(Image.job_id == job_id))
+    await db.execute(delete(SKU).where(SKU.job_id == job_id))
+    await db.execute(delete(Page).where(Page.job_id == job_id))
+    await db.execute(delete(Evaluation).where(Evaluation.job_id == job_id))
+    await db.execute(delete(PDFJob).where(PDFJob.job_id == job_id))
+    await db.commit()
+
+    job_dir = Path(settings.job_data_dir) / str(job_id)
+    if job_dir.exists():
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+    return {"job_id": str(job_id), "deleted": True}
+
+
+@router.post("/ops/jobs/{job_id}/reprocess-ai")
+async def reprocess_job_ai(job_id: uuid.UUID, db: DBSession):
+    """强制该 Job 全量走 AI 处理。"""
+    result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise JobNotFoundError(f"Job {job_id} not found")
+
+    task_ids = (await db.execute(
+        select(HumanTask.task_id).where(HumanTask.job_id == job_id)
+    )).scalars().all()
+
+    deleted_tasks = len(task_ids)
+    if task_ids:
+        await db.execute(
+            delete(StateTransition).where(
+                StateTransition.entity_type == "task",
+                StateTransition.entity_id.in_([str(tid) for tid in task_ids]),
+            )
+        )
+
+    # 清理人工相关数据
+    if task_ids:
+        await db.execute(delete(Annotation).where(Annotation.task_id.in_(task_ids)))
+    await db.execute(delete(HumanTask).where(HumanTask.job_id == job_id))
+
+    blank_pages = set(job.blank_pages or [])
+    await db.execute(
+        update(Page)
+        .where(Page.job_id == job_id)
+        .values(status="PENDING", needs_review=False, sku_count=0)
+    )
+    if blank_pages:
+        await db.execute(
+            update(Page)
+            .where(Page.job_id == job_id, Page.page_number.in_(list(blank_pages)))
+            .values(status="BLANK")
+        )
+
+    await db.commit()
+
+    eval_data = {
+        "job_id": str(job_id),
+        "route": "AI_ONLY",
+        "degrade_reason": None,
+        "prescan": {"blank_pages": sorted(blank_pages)},
+    }
+    await event_bus.publish("EvaluationCompleted", eval_data)
+
+    return {
+        "job_id": str(job_id),
+        "queued": True,
+        "route": "AI_ONLY",
+        "deleted_human_tasks": deleted_tasks,
+    }
+
+
 # ───────────────────────── Pages / SKUs / Evaluation ─────────────────────────
 
 @router.get("/jobs/{job_id}/pages")
@@ -290,22 +402,243 @@ async def get_pages(
     }
 
 
+@router.get("/jobs/{job_id}/pages/{page_number}/screenshot")
+async def get_page_screenshot(
+    job_id: uuid.UUID,
+    db: DBSession,
+    page_number: int = PathParam(..., ge=1),
+):
+    """返回指定页面的截图 (PNG)。"""
+
+    job_result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
+    job = job_result.scalar_one_or_none()
+    if not job:
+        raise JobNotFoundError(f"Job {job_id} not found")
+
+    page_result = await db.execute(
+        select(Page).where(Page.job_id == job_id, Page.page_number == page_number)
+    )
+    page = page_result.scalar_one_or_none()
+    if not page:
+        return JSONResponse(status_code=404, content={
+            "error_code": "PAGE_NOT_FOUND",
+            "message": f"Page {page_number} not found for job {job_id}",
+        })
+
+    job_dir = Path(settings.job_data_dir) / str(job_id)
+    cache_path = job_dir / "screenshots" / f"page-{page_number}.png"
+
+    # 优先返回已缓存的截图
+    if cache_path.exists():
+        return FileResponse(str(cache_path), media_type="image/png")
+
+    # 显式指定的截图路径
+    if page.screenshot_path:
+        explicit = Path(page.screenshot_path)
+        if not explicit.is_absolute():
+            explicit = job_dir / explicit
+        if explicit.exists():
+            return FileResponse(str(explicit), media_type="image/png")
+
+    source_pdf = job_dir / "source.pdf"
+    if not source_pdf.exists():
+        return JSONResponse(status_code=404, content={
+            "error_code": "SOURCE_PDF_MISSING",
+            "message": f"Source PDF not found for job {job_id}",
+        })
+
+    try:
+        import fitz
+
+        doc = fitz.open(source_pdf)
+        try:
+            if page_number < 1 or page_number > doc.page_count:
+                return JSONResponse(status_code=404, content={
+                    "error_code": "PAGE_OUT_OF_RANGE",
+                    "message": f"Page {page_number} is out of range",
+                })
+
+            zoom = 150 / 72
+            pix = doc[page_number - 1].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+            png_bytes = pix.tobytes("png")
+        finally:
+            doc.close()
+    except Exception as e:
+        logger.exception(
+            "screenshot_render_failed",
+            job_id=str(job_id),
+            page_number=page_number,
+            error=str(e),
+        )
+        return JSONResponse(status_code=500, content={
+            "error_code": "RENDER_FAILED",
+            "message": "Failed to render page screenshot",
+        })
+
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(png_bytes)
+    except Exception as e:
+        logger.warning(
+            "screenshot_cache_failed",
+            job_id=str(job_id),
+            page_number=page_number,
+            error=str(e),
+        )
+
+    return Response(content=png_bytes, media_type="image/png")
+
+
+@router.get("/jobs/{job_id}/images/{image_id}")
+async def get_job_image(
+    job_id: uuid.UUID,
+    image_id: str,
+    db: DBSession,
+):
+    """返回 Job 中提取的图片文件。"""
+    result = await db.execute(
+        select(Image).where(Image.job_id == job_id, Image.image_id == image_id)
+    )
+    img = result.scalar_one_or_none()
+    if not img or not img.extracted_path:
+        return JSONResponse(status_code=404, content={
+            "error_code": "IMAGE_NOT_FOUND",
+            "message": f"Image {image_id} not found",
+        })
+
+    job_dir = Path(settings.job_data_dir) / str(job_id)
+    file_path = job_dir / img.extracted_path
+    if not file_path.exists():
+        return JSONResponse(status_code=404, content={
+            "error_code": "IMAGE_FILE_MISSING",
+            "message": "Image file not found on disk",
+        })
+
+    media = "image/jpeg" if img.format == "jpg" else f"image/{img.format or 'jpeg'}"
+    return FileResponse(str(file_path), media_type=media)
+
+
+@router.get("/jobs/{job_id}/pages/{page_number}/detail")
+async def get_page_detail(
+    job_id: uuid.UUID,
+    db: DBSession,
+    page_number: int = PathParam(..., ge=1),
+):
+    """返回页面 + SKU + Images 合并响应。"""
+    page_result = await db.execute(
+        select(Page).where(Page.job_id == job_id, Page.page_number == page_number)
+    )
+    pg = page_result.scalar_one_or_none()
+    if not pg:
+        return JSONResponse(status_code=404, content={
+            "error_code": "PAGE_NOT_FOUND",
+            "message": f"Page {page_number} not found for job {job_id}",
+        })
+
+    skus_result = await db.execute(
+        select(SKU).where(
+            SKU.job_id == job_id,
+            SKU.page_number == page_number,
+            SKU.superseded == False,
+        ).order_by(SKU.id)
+    )
+    page_skus = skus_result.scalars().all()
+
+    images_result = await db.execute(
+        select(Image).where(
+            Image.job_id == job_id,
+            Image.page_number == page_number,
+        ).order_by(Image.id)
+    )
+    page_images = images_result.scalars().all()
+
+    # Build SKU → images map via bindings
+    sku_ids = [s.sku_id for s in page_skus]
+    bindings_map: dict[str, list] = {sid: [] for sid in sku_ids}
+    if sku_ids:
+        bindings_result = await db.execute(
+            select(SKUImageBinding).where(
+                SKUImageBinding.job_id == job_id,
+                SKUImageBinding.sku_id.in_(sku_ids),
+            )
+        )
+        for b in bindings_result.scalars().all():
+            if b.sku_id in bindings_map:
+                bindings_map[b.sku_id].append({
+                    "image_id": b.image_id,
+                    "method": b.binding_method,
+                    "confidence": b.binding_confidence,
+                    "rank": b.rank,
+                })
+
+    return {
+        "page": _page_to_dict(pg),
+        "skus": [{
+            "sku_id": s.sku_id, "page_number": s.page_number,
+            "attributes": s.attributes, "status": s.status,
+            "validity": s.validity, "attribute_source": s.attribute_source,
+            "import_confirmation": s.import_confirmation,
+            "source_bbox": s.source_bbox,
+            "images": bindings_map.get(s.sku_id, []),
+        } for s in page_skus],
+        "images": [{
+            "image_id": img.image_id,
+            "role": img.role,
+            "bbox": img.bbox,
+            "extracted_path": img.extracted_path,
+            "resolution": img.resolution,
+            "short_edge": img.short_edge,
+            "search_eligible": img.search_eligible,
+        } for img in page_images],
+    }
+
+
 @router.get("/jobs/{job_id}/skus")
 async def get_skus(
-    job_id: uuid.UUID, db: DBSession,
-    page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200),
+    job_id: uuid.UUID,
+    db: DBSession,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    page_number: int | None = Query(None, ge=1),
 ):
-    """获取 Job 的 SKU 列表。"""
-    count = (await db.execute(
-        select(func.count()).where(SKU.job_id == job_id, SKU.superseded == False)
-    )).scalar() or 0
+    """获取 Job 的 SKU 列表（可按页面过滤），附带 images。"""
+
+    base_query = select(SKU).where(SKU.job_id == job_id, SKU.superseded == False)
+    count_query = select(func.count()).select_from(SKU).where(
+        SKU.job_id == job_id, SKU.superseded == False,
+    )
+
+    if page_number:
+        base_query = base_query.where(SKU.page_number == page_number)
+        count_query = count_query.where(SKU.page_number == page_number)
+
+    count = (await db.execute(count_query)).scalar() or 0
 
     skus = (await db.execute(
-        select(SKU)
-        .where(SKU.job_id == job_id, SKU.superseded == False)
+        base_query
         .order_by(SKU.page_number, SKU.id)
-        .offset((page - 1) * page_size).limit(page_size)
+        .offset((page - 1) * page_size)
+        .limit(page_size)
     )).scalars().all()
+
+    # Fetch bindings for all returned SKUs
+    sku_ids = [s.sku_id for s in skus]
+    bindings_map: dict[str, list] = {sid: [] for sid in sku_ids}
+    if sku_ids:
+        bindings_result = await db.execute(
+            select(SKUImageBinding).where(
+                SKUImageBinding.job_id == job_id,
+                SKUImageBinding.sku_id.in_(sku_ids),
+            )
+        )
+        for b in bindings_result.scalars().all():
+            if b.sku_id in bindings_map:
+                bindings_map[b.sku_id].append({
+                    "image_id": b.image_id,
+                    "method": b.binding_method,
+                    "confidence": b.binding_confidence,
+                    "rank": b.rank,
+                })
 
     return {
         "data": [{
@@ -313,6 +646,8 @@ async def get_skus(
             "attributes": s.attributes, "status": s.status,
             "validity": s.validity, "attribute_source": s.attribute_source,
             "import_confirmation": s.import_confirmation,
+            "source_bbox": s.source_bbox,
+            "images": bindings_map.get(s.sku_id, []),
         } for s in skus],
         "pagination": {"page": page, "page_size": page_size,
                         "total_count": count, "total_pages": (count + page_size - 1) // page_size},

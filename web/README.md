@@ -23,9 +23,9 @@ npm run dev
 ```
 src/
 ├── api/          # Axios 封装 (4 个模块: jobs/tasks/config/ops)
-├── stores/       # Zustand Stores (6个: job/sse/upload/annotation/notification/settings)
+├── stores/       # Zustand Stores (7个: job/sse/upload/annotation/notification/settings/importConfig)
 ├── types/        # TypeScript 类型 (对齐数据字典 §2 + §5)
-├── routes/       # 7 个路由页面
+├── routes/       # 路由页面 (含 ImportConfigPage)
 ├── components/   # canvas/ + annotation/ + dashboard/ + common/
 ├── hooks/        # useDebounce / useKeyboard
 ├── utils/        # security (DOMPurify) / a11y (ARIA)

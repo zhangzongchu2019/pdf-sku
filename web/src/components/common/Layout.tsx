@@ -24,6 +24,7 @@ const OPS_NAV = [
   { path: "/eval", label: "质量评估", icon: "🏆" },
   { path: "/ops/custom-attr-upgrades", label: "属性升级", icon: "🔄" },
   { path: "/config", label: "配置管理", icon: "⚙️" },
+  { path: "/config/import", label: "导入配置", icon: "📦" },
 ];
 
 const BOTTOM_NAV = [

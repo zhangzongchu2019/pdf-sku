@@ -13,6 +13,11 @@ function getAuthHeaders(): Record<string, string> {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
+function encodeMetadata(value: string): string {
+  // btoa 仅支持 Latin1；tus Metadata 需 base64，所以先转 UTF-8 再编码
+  return btoa(unescape(encodeURIComponent(value)));
+}
+
 export async function tusUpload(
   file: File,
   onProgress?: (p: UploadProgress) => void,
@@ -23,7 +28,7 @@ export async function tusUpload(
     method: "POST",
     headers: {
       "Upload-Length": String(file.size),
-      "Upload-Metadata": `filename ${btoa(file.name)},filetype ${btoa(file.type)}`,
+      "Upload-Metadata": `filename ${encodeMetadata(file.name)},filetype ${encodeMetadata(file.type)}`,
       "Tus-Resumable": "1.0.0",
       ...getAuthHeaders(),
     },

@@ -145,7 +145,14 @@ export const useAnnotationStore = create<AnnotationState>()(
     acquireTask: async (annotatorId) => {
       set((s) => { s.loading = true; });
       try {
-        const task = await tasksApi.acquireNext(annotatorId);
+        let attempt = 0;
+        let task = await tasksApi.acquireNext(annotatorId);
+        while (task && task.status === "SKIPPED" && attempt < 3) {
+          // 过滤掉已作废任务，再拉取下一个
+          task = await tasksApi.acquireNext(annotatorId);
+          attempt += 1;
+        }
+
         set((s) => {
           s.currentTask = task;
           s.loading = false;

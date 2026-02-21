@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import select, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from pdf_sku.common.models import (
@@ -30,11 +30,13 @@ MAX_REWORK_COUNT = 5
 VALID_TRANSITIONS = {
     ("CREATED", "PROCESSING"),
     ("CREATED", "ESCALATED"),
+    ("CREATED", "SKIPPED"),
     ("PROCESSING", "COMPLETED"),
     ("PROCESSING", "SKIPPED"),
     ("PROCESSING", "CREATED"),     # lock timeout
     ("ESCALATED", "PROCESSING"),
     ("ESCALATED", "COMPLETED"),    # auto SLA
+    ("ESCALATED", "SKIPPED"),
     ("COMPLETED", "CREATED"),      # revert
     ("SKIPPED", "CREATED"),        # revert
 }
@@ -272,6 +274,34 @@ class TaskManager:
                 succeeded += 1
             except Exception as e:
                 logger.warning("batch_skip_failed", task_id=tid, error=str(e))
+                failed += 1
+        return {"total": len(task_ids), "succeeded": succeeded, "failed": failed}
+
+    async def delete_task(
+        self, db: AsyncSession, task_id: str, operator: str,
+    ) -> None:
+        """物理删除任务及其标注。"""
+        task = await self._get_task(db, task_id)
+        # 删除关联标注
+        await db.execute(
+            delete(Annotation).where(Annotation.task_id == UUID(task_id))
+        )
+        await db.execute(
+            delete(HumanTask).where(HumanTask.task_id == UUID(task_id))
+        )
+        logger.info("task_deleted", task_id=task_id, operator=operator, status=task.status)
+
+    async def batch_delete(
+        self, db: AsyncSession, task_ids: list[str], operator: str,
+    ) -> dict:
+        """批量删除任务。"""
+        succeeded = failed = 0
+        for tid in task_ids:
+            try:
+                await self.delete_task(db, tid, operator)
+                succeeded += 1
+            except Exception as e:
+                logger.warning("batch_delete_failed", task_id=tid, error=str(e))
                 failed += 1
         return {"total": len(task_ids), "succeeded": succeeded, "failed": failed}
 

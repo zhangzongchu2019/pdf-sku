@@ -6,7 +6,7 @@ info:
 
     **架构**: 模块化单体（Modular Monolith）  
     **认证**: Bearer Token (JWT)  
-    **对齐文档**: TA V1.6 §5 · UI/UX V1.3 §8 · 接口契约总表 V1.1 · BA V1.1 · 后端详设 V1.1 · LLM Adapter V1.2 · 前端详设 V1.0
+    **对齐文档**: TA V1.7 §5 · UI/UX V1.4 §8 · 接口契约总表 V1.1 · BA V1.1 · 后端详设 V1.2 · LLM Adapter V1.2 · 前端详设 V1.2
 
     ## 状态枚举冻结声明
     ⚠ Job/Page/SKU 状态枚举为冻结版本 V2.0。变更需前后端同步发布，禁止单端修改。
@@ -26,6 +26,10 @@ info:
     - [V1.7→] Tag 细分 (12 tag) + PaginationMeta 独立 schema
     - [V2.1→] Auth 模块 9 个端点（login/register/me/change-password/admin CRUD）
     - [V2.1→] User schema + LoginRequest/LoginResponse/RegisterRequest
+
+    ## V0.2.0 新增端点
+    - GET /jobs/{job_id}/pages/{page_no}/detail — 页面+SKU+图片合并响应
+    - GET /jobs/{job_id}/images/{image_id} — 提取的产品图片服务
 
     **未吸收 V1.7 项**（与模块设计不兼容）：
     - TaskCompleteRequest skus 模型 → 保留 V1.2 的 groups 元素-分组模型
@@ -494,6 +498,55 @@ paths:
           content:
             image/png:
               schema: { type: string, format: binary }
+
+  /jobs/{job_id}/pages/{page_no}/detail:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+      - in: path
+        name: page_no
+        required: true
+        schema: { type: integer }
+    get:
+      tags: [Jobs]
+      summary: 页面详情（页面 + SKU + 图片合并响应）
+      description: |
+        返回单页的完整详情，包含页面信息、该页提取的 SKU 列表及关联图片。
+        用于 Job 详情页展开行，减少前端请求次数。
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  page: { $ref: '#/components/schemas/PageInfo' }
+                  skus:
+                    type: array
+                    items: { $ref: '#/components/schemas/SKU' }
+                  images:
+                    type: array
+                    items: { $ref: '#/components/schemas/SKUImage' }
+        '404':
+          description: 页面不存在
+
+  /jobs/{job_id}/images/{image_id}:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+      - in: path
+        name: image_id
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Jobs]
+      summary: 获取提取的产品图片
+      description: 从 job_data_dir 返回 AI 提取的产品图片文件
+      responses:
+        '200':
+          content:
+            image/*:
+              schema: { type: string, format: binary }
+        '404':
+          description: 图片不存在
 
   /jobs/{job_id}/skus:
     parameters:

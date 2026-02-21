@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { immer } from "zustand/middleware/immer";
 import { jobsApi } from "../api/jobs";
+import type { PageDetail } from "../api/jobs";
 import type { Job, Page, SKU, DashboardMetrics } from "../types/models";
 
 interface PaginationMeta { page: number; size: number; total: number; total_pages: number; }
@@ -24,6 +25,7 @@ interface JobState {
   currentJob: Job | null;
   pages: Page[];
   skus: SKU[];
+  pageDetail: PageDetail | null;
   dashboard: DashboardMetrics | null;
   loading: boolean;
   error: string | null;
@@ -39,10 +41,12 @@ interface JobState {
   fetchJob: (jobId: string) => Promise<void>;
   fetchPages: (jobId: string) => Promise<void>;
   fetchSkus: (jobId: string, pageNo?: number) => Promise<void>;
+  fetchPageDetail: (jobId: string, pageNo: number) => Promise<void>;
   fetchDashboard: () => Promise<void>;
   createJob: (fileId: string, merchantId: string, category?: string) => Promise<Job>;
   cancelJob: (jobId: string) => Promise<void>;
   retryJob: (jobId: string) => Promise<void>;
+  deleteJob: (jobId: string) => Promise<void>;
 
   // SSE callbacks
   updateJobFromSSE: (jobId: string, updates: Partial<Job>) => void;
@@ -59,6 +63,7 @@ export const useJobStore = create<JobState>()(
     currentJob: null,
     pages: [],
     skus: [],
+    pageDetail: null,
     dashboard: null,
     loading: false,
     error: null,
@@ -114,6 +119,15 @@ export const useJobStore = create<JobState>()(
       set((s) => { s.skus = items; });
     },
 
+    fetchPageDetail: async (jobId, pageNo) => {
+      try {
+        const detail = await jobsApi.getPageDetail(jobId, pageNo);
+        set((s) => { s.pageDetail = detail; });
+      } catch (e: any) {
+        set((s) => { s.pageDetail = null; s.error = e.message; });
+      }
+    },
+
     fetchDashboard: async () => {
       try {
         const data = await jobsApi.dashboard();
@@ -142,6 +156,15 @@ export const useJobStore = create<JobState>()(
       set((s) => {
         const job = s.jobs.find((j) => j.job_id === jobId);
         if (job) job.user_status = "processing" as any;
+      });
+    },
+
+    deleteJob: async (jobId) => {
+      await jobsApi.delete(jobId);
+      set((s) => {
+        s.jobs = s.jobs.filter((j) => j.job_id !== jobId);
+        s.total = Math.max(0, s.total - 1);
+        s.selectedIds = s.selectedIds.filter((id) => id !== jobId);
       });
     },
 

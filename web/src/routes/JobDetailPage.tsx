@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import { useJobStore } from "../stores/jobStore";
 import { useSSEStore } from "../stores/sseStore";
+import { jobsApi } from "../api/jobs";
+import type { PageDetail } from "../api/jobs";
 import StatusBadge from "../components/common/StatusBadge";
 import Loading from "../components/common/Loading";
 import { PageHeatmap } from "../components/dashboard/PageHeatmap";
@@ -17,6 +19,9 @@ export default function JobDetailPage() {
   const { currentJob, pages, skus, fetchJob, fetchPages, fetchSkus, loading } = useJobStore();
   const { connect, disconnect, onEvent } = useSSEStore();
   const [selectedPage, setSelectedPage] = useState<number | null>(null);
+  const [expandedPage, setExpandedPage] = useState<number | null>(null);
+  const [pageDetail, setPageDetail] = useState<PageDetail | null>(null);
+  const [lightboxImg, setLightboxImg] = useState<string | null>(null);
   const [tab, setTab] = useState<"pages" | "skus" | "heatmap" | "eval">("pages");
   const [showTimeline, setShowTimeline] = useState(false);
 
@@ -45,6 +50,27 @@ export default function JobDetailPage() {
       fetchSkus(jobId);
     }
   }, [jobId, selectedPage, tab]);
+
+  const apiBase = import.meta.env.VITE_API_BASE || "/api/v1";
+  const screenshotUrl = (pageNo: number) =>
+    `${apiBase}/jobs/${jobId}/pages/${pageNo}/screenshot`;
+  const imageUrl = (imageId: string) =>
+    jobsApi.getImageUrl(jobId!, imageId);
+
+  const toggleExpand = async (pageNo: number) => {
+    if (expandedPage === pageNo) {
+      setExpandedPage(null);
+      setPageDetail(null);
+      return;
+    }
+    setExpandedPage(pageNo);
+    try {
+      const detail = await jobsApi.getPageDetail(jobId!, pageNo);
+      setPageDetail(detail);
+    } catch {
+      setPageDetail(null);
+    }
+  };
 
   if (loading && !currentJob) return <Loading />;
   if (!currentJob) return <div className="page"><h2>Job 不存在</h2></div>;
@@ -110,29 +136,107 @@ export default function JobDetailPage() {
         <table className="data-table">
           <thead>
             <tr>
+              <th style={{ width: 70 }}>缩略图</th>
               <th>页码</th><th>状态</th><th>类型</th><th>SKU数</th>
               <th>置信度</th><th>提取方式</th><th>LLM模型</th>
             </tr>
           </thead>
           <tbody>
             {pages.map((p) => (
-              <tr key={p.id} className={selectedPage === p.page_number ? "selected" : ""}
-                  onClick={() => setSelectedPage(p.page_number)}>
-                <td>{p.page_number}</td>
-                <td><StatusBadge status={p.status} /></td>
-                <td>{p.page_type || "-"}</td>
-                <td>{p.sku_count}</td>
-                <td>{p.page_confidence ? formatPercent(p.page_confidence) : "-"}</td>
-                <td>{p.extraction_method || "-"}</td>
-                <td>{p.llm_model_used || "-"}</td>
-              </tr>
+              <>
+                <tr key={p.id} className={selectedPage === p.page_number ? "selected" : ""}
+                    onClick={() => toggleExpand(p.page_number)}
+                    style={{ cursor: "pointer" }}>
+                  <td>
+                    <img
+                      src={screenshotUrl(p.page_number)}
+                      loading="lazy"
+                      alt={`p${p.page_number}`}
+                      style={{ width: 60, height: 80, objectFit: "cover", borderRadius: 3, border: "1px solid #2D3548" }}
+                    />
+                  </td>
+                  <td>{p.page_number}</td>
+                  <td><StatusBadge status={p.status} /></td>
+                  <td>{p.page_type || "-"}</td>
+                  <td>{p.sku_count}</td>
+                  <td>{p.page_confidence ? formatPercent(p.page_confidence) : "-"}</td>
+                  <td>{p.extraction_method || "-"}</td>
+                  <td>{p.llm_model_used || "-"}</td>
+                </tr>
+                {expandedPage === p.page_number && (
+                  <tr key={`detail-${p.id}`}>
+                    <td colSpan={8} style={{ padding: 0 }}>
+                      <div style={{ display: "flex", gap: 16, padding: 16, backgroundColor: "#151C2C", borderBottom: "2px solid #22D3EE33" }}>
+                        {/* Left: large screenshot */}
+                        <div style={{ flexShrink: 0 }}>
+                          <img
+                            src={screenshotUrl(p.page_number)}
+                            alt={`page-${p.page_number}`}
+                            style={{ width: 300, borderRadius: 4, border: "1px solid #2D3548", cursor: "pointer" }}
+                            onClick={() => setLightboxImg(screenshotUrl(p.page_number))}
+                          />
+                        </div>
+                        {/* Right: SKUs with images */}
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <h4 style={{ margin: "0 0 8px", fontSize: 13, color: "#94A3B8" }}>
+                            页面 SKU ({pageDetail?.skus.length ?? 0})
+                          </h4>
+                          {pageDetail?.skus.map((sku) => (
+                            <div key={sku.sku_id} style={{ marginBottom: 10, padding: 8, backgroundColor: "#1B2233", borderRadius: 6, border: "1px solid #2D3548" }}>
+                              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
+                                <span style={{ color: "#E2E8F4" }}>{sku.attributes?.model || sku.attributes?.name || sku.sku_id}</span>
+                                <span style={{ color: "#64748B" }}>{sku.validity}</span>
+                              </div>
+                              {sku.images.length > 0 && (
+                                <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                                  {sku.images.slice(0, 3).map((img) => (
+                                    <img
+                                      key={img.image_id}
+                                      src={imageUrl(img.image_id)}
+                                      style={{ width: 48, height: 48, objectFit: "cover", borderRadius: 3, border: "1px solid #2D3548", cursor: "pointer" }}
+                                      onClick={(e) => { e.stopPropagation(); setLightboxImg(imageUrl(img.image_id)); }}
+                                    />
+                                  ))}
+                                  {sku.images.length > 3 && (
+                                    <span style={{ display: "flex", alignItems: "center", fontSize: 11, color: "#64748B" }}>
+                                      +{sku.images.length - 3}
+                                    </span>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                          {pageDetail?.images && pageDetail.images.length > 0 && (
+                            <>
+                              <h4 style={{ margin: "12px 0 8px", fontSize: 13, color: "#94A3B8" }}>
+                                页面图片 ({pageDetail.images.length})
+                              </h4>
+                              <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                                {pageDetail.images.map((img) => (
+                                  <img
+                                    key={img.image_id}
+                                    src={imageUrl(img.image_id)}
+                                    style={{ width: 48, height: 48, objectFit: "cover", borderRadius: 3, border: "1px solid #2D3548", cursor: "pointer" }}
+                                    onClick={() => setLightboxImg(imageUrl(img.image_id))}
+                                  />
+                                ))}
+                              </div>
+                            </>
+                          )}
+                          {!pageDetail && <span style={{ fontSize: 12, color: "#64748B" }}>加载中...</span>}
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
+                )}
+              </>
             ))}
           </tbody>
         </table>
       )}
 
       {tab === "skus" && (
-        <SKUList skus={skus} />
+        <SKUList skus={skus} jobId={jobId} />
       )}
 
       {tab === "heatmap" && (
@@ -167,6 +271,21 @@ export default function JobDetailPage() {
           events={[]}
           onClose={() => setShowTimeline(false)}
         />
+      )}
+
+      {/* Lightbox */}
+      {lightboxImg && (
+        <div
+          onClick={() => setLightboxImg(null)}
+          style={{
+            position: "fixed", inset: 0, zIndex: 9999,
+            backgroundColor: "rgba(0,0,0,0.85)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            cursor: "pointer",
+          }}
+        >
+          <img src={lightboxImg} style={{ maxWidth: "90vw", maxHeight: "90vh", borderRadius: 6 }} />
+        </div>
       )}
     </div>
   );

@@ -15,6 +15,11 @@ class LLMResponse:
     raw_response: dict | None = None
 
     @property
+    def text(self) -> str:
+        """Alias for content (backward compat)."""
+        return self.content
+
+    @property
     def total_tokens(self) -> int:
         return self.usage.get("input_tokens", 0) + self.usage.get("output_tokens", 0)
 
@@ -62,3 +67,8 @@ class BaseLLMClient(ABC):
     @abstractmethod
     def provider(self) -> str:
         ...
+
+    @property
+    def model_name(self) -> str:
+        """Alias for model_id (backward compat)."""
+        return self.model_id

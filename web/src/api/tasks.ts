@@ -45,4 +45,21 @@ export const tasksApi = {
     api.post<void>(`/tasks/${taskId}/revert`, {
       operator: "web_user",
     }),
+
+  /** 运维作废（单个或批量）。*/
+  batchSkip: (taskIds: string[], reason: string, operator = "web_user") =>
+    api.post(`/ops/tasks/batch-skip`, {
+      task_ids: taskIds,
+      reason,
+      operator,
+    }),
+
+  /** 物理删除（单个或批量）。*/
+  batchDelete: (taskIds: string[], operator = "web_user") =>
+    api.post(`/ops/tasks/batch-delete`, {
+      task_ids: taskIds,
+      operator,
+    }),
+  delete: (taskId: string, operator = "web_user") =>
+    api.delete(`/ops/tasks/${taskId}?operator=${encodeURIComponent(operator)}`),
 };

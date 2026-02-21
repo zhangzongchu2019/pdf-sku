@@ -1,9 +1,24 @@
 # PDF-SKU 提取系统前端技术详细设计
 
-> **文档版本**: V1.1  
-> **上游依赖**: UI/UX V1.3 · TA V1.6 · OpenAPI V2.0 · BRD V2.1 · 后端详设 V1.1 · 前端评审报告  
-> **技术栈**: React 18 + TypeScript 5 + Vite 5 + Ant Design 5.x + Zustand (immer)  
+> **文档版本**: V1.2
+> **上游依赖**: UI/UX V1.3 · TA V1.7 · OpenAPI V2.0 · BRD V2.1 · 后端详设 V1.2 · 前端评审报告
+> **技术栈**: React 18 + TypeScript 5 + Vite 5 + Zustand (immer)
 > **目标浏览器**: Chrome/Edge 100+, Firefox 100+, Safari 16+
+
+---
+
+## V1.2 变更记录 (2026-02-21)
+
+| 变更 | 影响章节 |
+|------|---------|
+| 新增 `importConfigStore.ts` — 商品导入配置 (Zustand + persist + immer, localStorage) | §1.2, §3.1 |
+| 新增 `ImportConfigPage.tsx` — 商品导入配置页面 (/config/import, admin) | §1.2, §2.1 |
+| `jobStore.ts` 新增 `pageDetail` 状态 + `fetchPageDetail` action | §3.1 |
+| `jobs.ts` API 新增 `getPageDetail`, `getImageUrl` 方法 + PageDetail 类型 | §5.2 |
+| `JobDetailPage.tsx` Pages tab 增加缩略图列 + 点击展开详情行（大图+SKU+图片） | §5.6 |
+| `SKUList.tsx` 图片列展示缩略图 + 点击展开全属性 + Lightbox | §5.6 |
+| `Layout.tsx` OPS_NAV 新增"导入配置"入口 | §2.1 |
+| 兼容 `model_number`/`product_name` 和 `model`/`name` 属性字段名 | §5.6 |
 
 ---
 
@@ -125,7 +140,8 @@ src/
 │   │   └── HistoryPage.tsx
 │   ├── config/
 │   │   ├── ConfigListPage.tsx
-│   │   └── ConfigEditPage.tsx
+│   │   ├── ConfigEditPage.tsx
+│   │   └── ImportConfigPage.tsx       # [V1.2] 商品导入配置 (API+字段映射+COS)
 │   ├── annotators/
 │   │   ├── AnnotatorListPage.tsx
 │   │   └── AnnotatorDetailPage.tsx
@@ -277,7 +293,8 @@ src/
 │   ├── sseStore.ts
 │   ├── notificationStore.ts           # [V1.1] 三级优先级 (A2)
 │   ├── authStore.ts
-│   └── settingsStore.ts               # [V1.1] 用户偏好 (A6)
+│   ├── settingsStore.ts               # [V1.1] 用户偏好 (A6)
+│   └── importConfigStore.ts           # [V1.2] 商品导入配置 (persist/localStorage)
 │
 ├── types/
 │   ├── models.ts                       # [V1.1] 对齐 OpenAPI V2.0
@@ -355,6 +372,7 @@ const router = createBrowserRouter([
 
       // 配置
       { path: 'config', lazy: () => import('@/pages/config/ConfigListPage') },
+      { path: 'config/import', lazy: () => import('@/pages/config/ImportConfigPage') },  // [V1.2]
       { path: 'config/:profileId', lazy: () => import('@/pages/config/ConfigEditPage') },
 
       // 标注员

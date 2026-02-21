@@ -4,6 +4,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Path, Body, Query, HTTPException
 from sqlalchemy import select, func
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from pdf_sku.common.dependencies import DBSession
@@ -186,6 +187,24 @@ async def batch_reassign(db: DBSession, body: dict = Body(...)):
         db,
         task_ids=body.get("task_ids", []),
         target=body.get("target", ""),
+        operator=body.get("operator", "ops"),
+    )
+    await db.commit()
+    return result
+
+
+@router.delete("/ops/tasks/{task_id}")
+async def delete_task(db: DBSession, task_id: str = Path(...), operator: str = Query("ops")):
+    await _task_mgr.delete_task(db, task_id, operator)
+    await db.commit()
+    return {"ok": True}
+
+
+@router.post("/ops/tasks/batch-delete")
+async def batch_delete(db: DBSession, body: dict = Body(...)):
+    result = await _task_mgr.batch_delete(
+        db,
+        task_ids=body.get("task_ids", []),
         operator=body.get("operator", "ops"),
     )
     await db.commit()

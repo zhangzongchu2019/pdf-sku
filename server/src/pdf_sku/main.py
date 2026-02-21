@@ -185,7 +185,6 @@ async def lifespan(app: FastAPI):
             # Pipeline
             from pdf_sku.pipeline.page_processor import PageProcessor
             from pdf_sku.pipeline.orchestrator import Orchestrator
-            from pdf_sku.pipeline.chunking import ChunkingStrategy
 
             orchestrator = Orchestrator(
                 page_processor=PageProcessor(
@@ -193,7 +192,6 @@ async def lifespan(app: FastAPI):
                     process_pool=process_pool,
                     config_provider=ConfigProvider(),
                 ),
-                chunking=ChunkingStrategy(),
                 db_session_factory=session_factory,
             )
 

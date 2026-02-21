@@ -96,7 +96,8 @@ async def refresh_job_page_stats(db: AsyncSession, job_id: str) -> PDFJob:
     job.skipped_pages = status_pages.get(PageStatus.SKIPPED.value, [])
     job.failed_pages = sorted(
         status_pages.get(PageStatus.AI_FAILED.value, []) +
-        status_pages.get(PageStatus.HUMAN_FAILED.value, [])
+        status_pages.get(PageStatus.IMPORT_FAILED.value, []) +
+        status_pages.get(PageStatus.DEAD_LETTER.value, [])
     )
 
     # SKU 总数

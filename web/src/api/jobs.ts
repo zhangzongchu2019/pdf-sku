@@ -1,6 +1,41 @@
 import api from "./client";
 import type { Job, Page, SKU, DashboardMetrics } from "../types/models";
 
+export interface SKUBindingImage {
+  image_id: string;
+  method: string;
+  confidence: number;
+  rank: number;
+}
+
+export interface PageDetailSKU {
+  sku_id: string;
+  page_number: number;
+  attributes: Record<string, string>;
+  status: string;
+  validity: string;
+  attribute_source: string;
+  import_confirmation: string;
+  source_bbox: number[] | null;
+  images: SKUBindingImage[];
+}
+
+export interface PageDetailImage {
+  image_id: string;
+  role: string;
+  bbox: number[] | null;
+  extracted_path: string;
+  resolution: number[] | null;
+  short_edge: number;
+  search_eligible: boolean;
+}
+
+export interface PageDetail {
+  page: Page;
+  skus: PageDetailSKU[];
+  images: PageDetailImage[];
+}
+
 /** 后端分页响应格式适配 */
 interface BackendPaginated<T> {
   data: T[];
@@ -24,11 +59,12 @@ export const jobsApi = {
 
   get: (jobId: string) => api.get<Job>(`/jobs/${jobId}`),
 
-  create: (fileId: string, merchantId: string, category?: string) =>
-    api.post<Job>("/jobs", { file_id: fileId, merchant_id: merchantId, category }),
+  create: (uploadId: string, merchantId: string, category?: string) =>
+    api.post<Job>("/jobs", { upload_id: uploadId, merchant_id: merchantId, category }),
 
   cancel: (jobId: string) => api.post<void>(`/jobs/${jobId}/cancel`),
   retry: (jobId: string) => api.post<void>(`/jobs/${jobId}/requeue`),
+  delete: (jobId: string) => api.delete<void>(`/ops/jobs/${jobId}`),
 
   getPages: async (jobId: string) => {
     const resp = await api.get<BackendPaginated<Page>>(`/jobs/${jobId}/pages?page_size=200`);
@@ -50,6 +86,14 @@ export const jobsApi = {
     api.get<{ items: Array<{ image_id: string; bbox: number[]; url?: string }> }>(
       `/jobs/${jobId}/pages/${pageNo}/images`
     ),
+
+  getPageDetail: (jobId: string, pageNo: number) =>
+    api.get<PageDetail>(`/jobs/${jobId}/pages/${pageNo}/detail`),
+
+  getImageUrl: (jobId: string, imageId: string) => {
+    const base = import.meta.env.VITE_API_BASE || "/api/v1";
+    return `${base}/jobs/${jobId}/images/${imageId}`;
+  },
 
   dashboard: () => api.get<DashboardMetrics>("/dashboard/metrics"),
 };

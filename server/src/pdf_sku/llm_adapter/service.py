@@ -19,6 +19,7 @@ import structlog
 logger = structlog.get_logger()
 
 MAX_RETRIES = 2
+EVAL_BATCH_SIZE = 5
 
 
 class LLMService:
@@ -47,7 +48,7 @@ class LLMService:
     @property
     def current_model_name(self) -> str:
         try:
-            return get_client(self._default_client).model_name
+            return get_client(self._default_client).model_id
         except KeyError:
             return self._default_client
 
@@ -66,45 +67,59 @@ class LLMService:
             "category": category or "",
         })
 
-        llm_response = await self._call_llm(
-            operation="evaluate_document",
-            prompt=prompt_text,
-            images=screenshots,
-        )
-
-        # 解析响应
-        raw_scores = self._parser.parse_eval_scores(llm_response.text)
-
-        # 转换为 PageScore
-        pages = sample_pages or list(range(1, len(raw_scores) + 1))
+        pages = sample_pages or list(range(1, len(screenshots) + 1))
         page_scores: list[PageScore] = []
 
-        for i, score_data in enumerate(raw_scores):
-            page_no = pages[i] if i < len(pages) else i + 1
-            if isinstance(score_data, dict):
-                ps = PageScore(
-                    page_no=page_no,
-                    overall=float(score_data.get("overall", 0.5)),
-                    dimensions={
-                        "text_clarity": float(score_data.get("text_clarity", 0.5)),
-                        "image_quality": float(score_data.get("image_quality", 0.5)),
-                        "layout_structure": float(score_data.get("layout_structure", 0.5)),
-                        "table_regularity": float(score_data.get("table_regularity", 0.5)),
-                        "sku_density": float(score_data.get("sku_density", 0.5)),
-                    },
-                    raw_response=str(score_data),
-                )
-            else:
-                ps = PageScore(page_no=page_no, overall=0.5)
-            page_scores.append(ps)
+        # 分批发送图片，每批最多 EVAL_BATCH_SIZE 张
+        for batch_start in range(0, len(screenshots), EVAL_BATCH_SIZE):
+            batch_end = batch_start + EVAL_BATCH_SIZE
+            batch_images = screenshots[batch_start:batch_end]
+            batch_pages = pages[batch_start:batch_end]
+
+            logger.info("eval_document_batch",
+                        batch_start=batch_start,
+                        batch_size=len(batch_images),
+                        total=len(screenshots))
+
+            llm_response = await self._call_llm(
+                operation="evaluate_document",
+                prompt=prompt_text,
+                images=batch_images,
+            )
+
+            # 解析响应
+            raw_scores = self._parser.parse_eval_scores(llm_response.content)
+
+            for i, score_data in enumerate(raw_scores):
+                page_no = batch_pages[i] if i < len(batch_pages) else batch_start + i + 1
+                if isinstance(score_data, dict):
+                    ps = PageScore(
+                        page_no=page_no,
+                        overall=float(score_data.get("overall", 0.5)),
+                        dimensions={
+                            "text_clarity": float(score_data.get("text_clarity", 0.5)),
+                            "image_quality": float(score_data.get("image_quality", 0.5)),
+                            "layout_structure": float(score_data.get("layout_structure", 0.5)),
+                            "table_regularity": float(score_data.get("table_regularity", 0.5)),
+                            "sku_density": float(score_data.get("sku_density", 0.5)),
+                        },
+                        raw_response=str(score_data),
+                    )
+                else:
+                    ps = PageScore(page_no=page_no, overall=0.5)
+                page_scores.append(ps)
+
+            logger.info("eval_document_batch_done",
+                        batch_start=batch_start,
+                        batch_scores=len(raw_scores),
+                        model=llm_response.model,
+                        tokens_in=llm_response.usage.get("input_tokens", 0),
+                        tokens_out=llm_response.usage.get("output_tokens", 0),
+                        latency_ms=llm_response.latency_ms)
 
         logger.info("eval_document_complete",
                      pages=len(page_scores),
-                     avg_overall=round(sum(p.overall for p in page_scores) / max(len(page_scores), 1), 3),
-                     model=llm_response.model,
-                     tokens_in=llm_response.input_tokens,
-                     tokens_out=llm_response.output_tokens,
-                     latency_ms=llm_response.latency_ms)
+                     avg_overall=round(sum(p.overall for p in page_scores) / max(len(page_scores), 1), 3))
 
         return page_scores
 
@@ -125,7 +140,7 @@ class LLMService:
                 client_name=client_name,
                 timeout=30.0,
             )
-            return self._parser.parse_page_score(resp.text)
+            return self._parser.parse_page_score(resp.content)
         except Exception as e:
             logger.warning("lightweight_eval_failed", error=str(e))
             return 0.5
@@ -188,7 +203,7 @@ class LLMService:
                 self._circuit.record_failure()
                 if attempt < MAX_RETRIES:
                     logger.warning("llm_call_retry",
-                                    attempt=attempt + 1, error=str(e),
+                                    attempt=attempt + 1, error=repr(e),
                                     operation=operation)
                     continue
                 raise RetryableError(f"LLM call failed after {MAX_RETRIES + 1} attempts: {e}")

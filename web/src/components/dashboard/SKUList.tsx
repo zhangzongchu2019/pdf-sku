@@ -1,14 +1,30 @@
 /**
  * SKU 列表 — 展示提取结果表格
  */
+import { useState } from "react";
 import type { SKU } from "../../types/models";
 
 interface SKUListProps {
   skus: SKU[];
+  jobId?: string;
   onReconcile?: (skuId: string) => void;
 }
 
-export function SKUList({ skus, onReconcile }: SKUListProps) {
+const ATTR_LABELS: Record<string, string> = {
+  product_name: "名称", model_number: "型号", model: "型号",
+  name: "名称", brand: "品牌", category: "分类",
+  price: "价格", unit: "单位", spec: "规格",
+  material: "材质", color: "颜色", size: "尺寸",
+  weight: "重量", origin: "产地", barcode: "条码",
+  description: "描述",
+};
+
+export function SKUList({ skus, jobId, onReconcile }: SKUListProps) {
+  const [lightboxImg, setLightboxImg] = useState<string | null>(null);
+  const [expandedSku, setExpandedSku] = useState<string | null>(null);
+  const apiBase = import.meta.env.VITE_API_BASE || "/api/v1";
+  const imgUrl = (imageId: string) =>
+    jobId ? `${apiBase}/jobs/${jobId}/images/${imageId}` : "";
   const validCount = skus.filter((s) => s.validity === "valid").length;
   const needsReviewCount = skus.filter((s) => s.validity === "needs_review").length;
   const invalidCount = skus.filter((s) => s.validity === "invalid").length;
@@ -90,36 +106,120 @@ export function SKUList({ skus, onReconcile }: SKUListProps) {
           </thead>
           <tbody>
             {skus.map((sku) => (
-              <tr
-                key={sku.sku_id}
-                style={{ borderBottom: "1px solid #2D354866" }}
-              >
-                <td style={{ padding: "6px", color: "#E2E8F4" }}>
-                  {sku.attributes?.model ?? "—"}
-                </td>
-                <td style={{ padding: "6px", color: "#E2E8F4" }}>
-                  {sku.attributes?.name ?? "—"}
-                </td>
-                <td style={{ padding: "6px" }}>
-                  <ValidityTag validity={sku.validity} />
-                </td>
-                <td style={{ padding: "6px", color: "#94A3B8" }}>
-                  {sku.status ?? "—"}
-                </td>
-                <td style={{ padding: "6px" }}>
-                  <ImportTag status={sku.import_status} />
-                </td>
-                <td style={{ padding: "6px", color: "#94A3B8" }}>
-                  {sku.images?.length ?? 0}
-                </td>
-                <td style={{ padding: "6px", color: "#94A3B8" }}>
-                  {sku.page_number}
-                </td>
-              </tr>
+              <>
+                <tr
+                  key={sku.sku_id}
+                  style={{ borderBottom: "1px solid #2D354866", cursor: "pointer" }}
+                  onClick={() => setExpandedSku(expandedSku === sku.sku_id ? null : sku.sku_id)}
+                >
+                  <td style={{ padding: "6px", color: "#E2E8F4" }}>
+                    {sku.attributes?.model_number ?? sku.attributes?.model ?? "—"}
+                  </td>
+                  <td style={{ padding: "6px", color: "#E2E8F4" }}>
+                    {sku.attributes?.product_name ?? sku.attributes?.name ?? "—"}
+                  </td>
+                  <td style={{ padding: "6px" }}>
+                    <ValidityTag validity={sku.validity} />
+                  </td>
+                  <td style={{ padding: "6px", color: "#94A3B8" }}>
+                    {sku.status ?? "—"}
+                  </td>
+                  <td style={{ padding: "6px" }}>
+                    <ImportTag status={sku.import_status} />
+                  </td>
+                  <td style={{ padding: "6px" }}>
+                    {jobId && sku.images && sku.images.length > 0 ? (
+                      <div style={{ display: "flex", gap: 2, alignItems: "center" }}>
+                        {sku.images.slice(0, 3).map((img: any) => (
+                          <img
+                            key={img.image_id}
+                            src={imgUrl(img.image_id)}
+                            style={{ width: 32, height: 32, objectFit: "cover", borderRadius: 2, border: "1px solid #2D3548", cursor: "pointer" }}
+                            onClick={(e) => { e.stopPropagation(); setLightboxImg(imgUrl(img.image_id)); }}
+                          />
+                        ))}
+                        {sku.images.length > 3 && (
+                          <span style={{ fontSize: 10, color: "#64748B" }}>+{sku.images.length - 3}</span>
+                        )}
+                      </div>
+                    ) : (
+                      <span style={{ color: "#64748B", fontSize: 11 }}>{sku.images?.length ?? 0}</span>
+                    )}
+                  </td>
+                  <td style={{ padding: "6px", color: "#94A3B8" }}>
+                    {sku.page_number}
+                  </td>
+                </tr>
+                {expandedSku === sku.sku_id && (
+                  <tr key={`detail-${sku.sku_id}`}>
+                    <td colSpan={7} style={{ padding: 0 }}>
+                      <div style={{
+                        padding: "10px 16px",
+                        backgroundColor: "#151C2C",
+                        borderBottom: "2px solid #22D3EE33",
+                        display: "flex",
+                        gap: 24,
+                      }}>
+                        {/* Attributes */}
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: 12, color: "#CBD5E1", marginBottom: 6, fontWeight: 600 }}>全部属性</div>
+                          <div style={{ display: "grid", gridTemplateColumns: "100px 1fr", gap: "4px 8px", fontSize: 13 }}>
+                            {Object.entries(sku.attributes || {}).map(([key, val]) => (
+                              val != null && String(val).trim() !== "" ? (
+                                <>
+                                  <span key={`k-${key}`} style={{ color: "#94A3B8", fontWeight: 500 }}>{ATTR_LABELS[key] || key}</span>
+                                  <span key={`v-${key}`} style={{ color: "#F1F5F9" }}>{String(val)}</span>
+                                </>
+                              ) : null
+                            ))}
+                            {Object.values(sku.attributes || {}).every((v) => v == null || String(v).trim() === "") && (
+                              <span style={{ color: "#94A3B8", gridColumn: "1 / -1" }}>无有效属性</span>
+                            )}
+                          </div>
+                          <div style={{ marginTop: 8, fontSize: 11, color: "#94A3B8" }}>
+                            SKU ID: {sku.sku_id} | 来源: {sku.attribute_source}
+                          </div>
+                        </div>
+                        {/* Images */}
+                        {jobId && sku.images && sku.images.length > 0 && (
+                          <div>
+                            <div style={{ fontSize: 11, color: "#64748B", marginBottom: 6 }}>关联图片 ({sku.images.length})</div>
+                            <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                              {sku.images.map((img: any) => (
+                                <img
+                                  key={img.image_id}
+                                  src={imgUrl(img.image_id)}
+                                  style={{ width: 64, height: 64, objectFit: "cover", borderRadius: 3, border: "1px solid #2D3548", cursor: "pointer" }}
+                                  onClick={(e) => { e.stopPropagation(); setLightboxImg(imgUrl(img.image_id)); }}
+                                />
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                )}
+              </>
             ))}
           </tbody>
         </table>
       </div>
+
+      {/* Lightbox */}
+      {lightboxImg && (
+        <div
+          onClick={() => setLightboxImg(null)}
+          style={{
+            position: "fixed", inset: 0, zIndex: 9999,
+            backgroundColor: "rgba(0,0,0,0.85)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            cursor: "pointer",
+          }}
+        >
+          <img src={lightboxImg} style={{ maxWidth: "90vw", maxHeight: "90vh", borderRadius: 6 }} />
+        </div>
+      )}
     </div>
   );
 }

@@ -108,7 +108,7 @@ class PageProcessor:
                 raw = self._extractor.extract(file_path, page_no)
 
             # 缓存到 CrossPageMerger
-            self._xpage.cache_page(job_id, page_no, raw)
+            await self._xpage.cache_page(job_id, page_no, raw)
 
             # ═══ Phase 2: 图片预处理 ═══
             for img in raw.images:
@@ -121,7 +121,7 @@ class PageProcessor:
             features = self._feat.extract(raw)
 
             # ═══ Phase 4: 跨页表格检测 ═══
-            continuation = self._xpage.find_continuation(job_id, page_no, raw)
+            continuation = await self._xpage.find_continuation(job_id, page_no, raw)
             if continuation:
                 raw.tables = self._xpage.merge(continuation.source_tables, raw.tables)
 

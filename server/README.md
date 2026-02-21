@@ -30,7 +30,7 @@ src/pdf_sku/
 ├── config/          # 阈值配置 + impact_preview
 ├── gateway/         # 上传(TUS) + Job管理 + SSE(9事件) + user_status双轨
 ├── evaluator/       # 置信度评估 + 路由决策
-├── pipeline/        # AI处理管线 (parser→classifier→extractor→binder→exporter)
+├── pipeline/        # AI处理管线 (Semaphore并行 + parser→classifier→extractor→binder→exporter)
 ├── collaboration/   # 任务管理 + auto_pick_next + 标注 + SLA
 ├── output/          # 增量导入 + 对账 + sync_job
 ├── feedback/        # 校准 + 升级建议 + few-shot

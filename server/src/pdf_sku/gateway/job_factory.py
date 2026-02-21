@@ -88,7 +88,7 @@ class JobFactory:
                 f"Duplicate file detected for merchant {merchant_id}")
 
         # === Step 4: 冻结配置版本 ===
-        config_version = "default:v1.0"  # 初始默认, 运行时从 ConfigProvider 覆盖
+        config_version = "default"  # 初始默认, 运行时由 ConfigProvider 返回活跃版本
 
         # === Step 5: 规则预筛 ===
         prescan = await self._prescanner.scan(str(upload_file_path))
@@ -157,6 +157,9 @@ class JobFactory:
                 trigger="upload",
             ))
             await db.flush()
+
+            # 提前提交以确保后续事件处理能读取到 Job
+            await db.commit()
 
             # Redis: Job → Worker 路由映射
             await redis.set(f"job_worker:{job_id}", settings.worker_id, ex=86400 * 7)

@@ -1,8 +1,8 @@
 # Pipeline 模块详细设计
 
-> **文档版本**: V1.1  
-> **上游依赖**: TA V1.6 §3.3 + §2.4 + §2.5 | BRD V2.1 | BA V1.1 §4  
-> **模块定位**: 系统核心 — 9 阶段串行处理链，承接单页解析→分类→SKU提取→绑定→校验→导出  
+> **文档版本**: V1.2
+> **上游依赖**: TA V1.6 §3.3 + §2.4 + §2.5 | BRD V2.1 | BA V1.1 §4
+> **模块定位**: 系统核心 — 9 阶段处理链 + Semaphore 并行编排，承接单页解析→分类→SKU提取→绑定→校验→导出
 > **设计原则**: 路由准确率 > SKU 召回率 > 图片质量 > 人工成本 > 速度（BRD §1.4）
 
 ### V1.1 修订说明
@@ -30,6 +30,15 @@
 | C17 | 碎图光栅化超时控制 | Qwen3+DeepSeek | P1 |
 | C18 | CrossPageMerger DB 查询超时 + 合并原子性元数据 | Qwen3+DeepSeek | P1 |
 
+### V1.2 修订说明 (2026-02-21)
+
+| 编号 | 变更 | 说明 |
+|------|------|------|
+| P1 | 统一并行处理 | 删除串行/分片双模式，所有 Job 统一使用 Semaphore 并行（PIPELINE_CONCURRENCY 环境变量，默认 5） |
+| P2 | CrossPageMerger 并发安全 | cache_page/find_continuation 改为 async def + per-job asyncio.Lock；前页未缓存时优雅降级返回 None |
+| P3 | Orchestrator 简化 | 删除 _process_sequential/_process_chunked，新增 _process_parallel；每页独立 DB session；finalize/error 用新 session |
+| P4 | ChunkingStrategy 解耦 | Orchestrator 不再依赖 ChunkingStrategy（保留模块但不使用） |
+
 ---
 
 ## 1. 模块职责边界
@@ -50,7 +59,7 @@
 | **SKU ID 生成** | 坐标归一化 + 双键排序：`{hash8}_p{page}_{seq}` | TA §3.3 |
 | **Checkpoint** | 每 10 页持久化进度（DB+Redis），支持故障恢复 | TA T52 |
 | **增量导出** | 每页完成即触发 Output 模块增量导入 | TA T35 |
-| **分片并行** | >100 页自动分 Chunk（50页/Chunk），Chunk 间并行 | TA G1 |
+| **Semaphore 并行** | 所有页面统一并行处理（Semaphore 控制并发数，默认 5），每页独立 DB session | TA G1, V1.2:P1 |
 
 ### 1.2 不负责的事
 
@@ -137,13 +146,12 @@ app/
 ```mermaid
 classDiagram
     class Orchestrator {
-        -chunking: ChunkingStrategy
         -page_processor: PageProcessor
+        -db_session_factory: Callable
         -checkpoint: CheckpointManager
         -output: SKUImporter
-        +process_job(job, evaluation) void
-        -_process_sequential(job, eval) void
-        -_process_chunked(job, eval) void
+        +process_job(db, job, evaluation) void
+        -_process_parallel(job, pages, file_path) void
     }
 
     class PageProcessor {
@@ -235,7 +243,6 @@ classDiagram
         -_is_in_middle_of_table(page, boundaries) bool
     }
 
-    Orchestrator --> ChunkingStrategy
     Orchestrator --> PageProcessor
 
     PageProcessor --> PDFExtractor

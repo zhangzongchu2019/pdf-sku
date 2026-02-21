@@ -11,6 +11,7 @@ Orchestrator — Job 级处理编排。对齐: Pipeline 详设 §5.1
 """
 from __future__ import annotations
 import asyncio
+import os
 from pathlib import Path
 from uuid import UUID
 
@@ -20,13 +21,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pdf_sku.common.models import PDFJob, Page
 from pdf_sku.common.enums import JobInternalStatus, PageStatus
 from pdf_sku.gateway.event_bus import event_bus
-from pdf_sku.gateway.user_status import update_job_status
-from pdf_sku.pipeline.ir import PageResult, PageChunk
+from pdf_sku.gateway.user_status import update_job_status, refresh_job_page_stats
+from pdf_sku.pipeline.ir import PageResult
 from pdf_sku.pipeline.page_processor import PageProcessor
-from pdf_sku.pipeline.chunking import ChunkingStrategy
 import structlog
 
 logger = structlog.get_logger()
+
+PIPELINE_CONCURRENCY = int(os.environ.get("PIPELINE_CONCURRENCY", "5"))
 
 
 class Orchestrator:
@@ -35,11 +37,10 @@ class Orchestrator:
     def __init__(
         self,
         page_processor: PageProcessor,
-        chunking: ChunkingStrategy | None = None,
         db_session_factory=None,
+        **_kwargs,
     ) -> None:
         self._pp = page_processor
-        self._chunking = chunking or ChunkingStrategy()
         self._db_factory = db_session_factory
 
     async def process_job(
@@ -52,11 +53,12 @@ class Orchestrator:
         Job 处理入口。
 
         Args:
-            db: 数据库会话
+            db: 数据库会话（仅用于初始状态更新）
             job: PDFJob ORM
             evaluation: 评估结果 dict (route, prescan, ...)
         """
         job_id = str(job.job_id)
+        job_uuid = job.job_id
         file_path = self._resolve_file_path(job)
         blank_pages = evaluation.get("prescan", {}).get("blank_pages", [])
 
@@ -65,7 +67,10 @@ class Orchestrator:
                      total_pages=job.total_pages,
                      route=evaluation.get("route"))
 
-        # 更新状态: EVALUATED → PROCESSING
+        # 更新路由 & 状态: EVALUATED → PROCESSING
+        route = evaluation.get("route")
+        if route:
+            job.route = route
         await update_job_status(db, job_id, JobInternalStatus.PROCESSING.value,
                                 trigger="pipeline_start")
         await db.commit()
@@ -74,69 +79,52 @@ class Orchestrator:
             non_blank = [p for p in range(1, job.total_pages + 1)
                          if p not in blank_pages]
 
-            if self._chunking.should_chunk(len(non_blank)):
-                await self._process_chunked(db, job, non_blank, file_path)
-            else:
-                await self._process_sequential(db, job, non_blank, file_path)
+            await self._process_parallel(job, non_blank, file_path)
 
-            # 终态判定
-            await self._finalize_job(db, job)
+            # 终态判定 — 用新 session
+            async with self._db_factory() as final_db:
+                result = await final_db.execute(
+                    select(PDFJob).where(PDFJob.job_id == job_uuid))
+                fresh_job = result.scalar_one()
+                await self._finalize_job(final_db, fresh_job)
+                await final_db.commit()
 
         except Exception as e:
             logger.exception("pipeline_failed", job_id=job_id)
-            await update_job_status(
-                db, job_id, JobInternalStatus.PARTIAL_FAILED.value,
-                trigger="pipeline_error", error_message=str(e))
+            async with self._db_factory() as err_db:
+                await update_job_status(
+                    err_db, job_id, JobInternalStatus.PARTIAL_FAILED.value,
+                    trigger="pipeline_error", error_message=str(e))
+                await err_db.commit()
 
-        await db.commit()
         self._pp.clear_job_cache(job_id)
 
-    async def _process_sequential(
+    async def _process_parallel(
         self,
-        db: AsyncSession,
         job: PDFJob,
         pages: list[int],
         file_path: str,
     ) -> None:
-        """串行处理 (≤100 页)。"""
-        for page_no in pages:
-            result = await self._process_single_page(
-                db, job, page_no, file_path)
-            await self._on_page_done(db, job, page_no, result)
-            await db.commit()
+        """并行处理所有页面（Semaphore 控制并发）。"""
+        semaphore = asyncio.Semaphore(PIPELINE_CONCURRENCY)
 
-    async def _process_chunked(
-        self,
-        db: AsyncSession,
-        job: PDFJob,
-        pages: list[int],
-        file_path: str,
-    ) -> None:
-        """分片并行处理 (>100 页)。"""
-        chunks = self._chunking.create_chunks(len(pages), [])
-        # 重映射 chunk pages 到实际页号
-        for chunk in chunks:
-            chunk.pages = [pages[p - 1] for p in chunk.pages if p - 1 < len(pages)]
-
-        semaphore = asyncio.Semaphore(self._chunking.MAX_PARALLEL)
-
-        async def process_chunk(chunk: PageChunk):
+        async def process_one(page_no: int):
             async with semaphore:
-                for page_no in chunk.pages:
+                async with self._db_factory() as page_db:
                     result = await self._process_single_page(
-                        db, job, page_no, file_path)
-                    await self._on_page_done(db, job, page_no, result)
+                        page_db, job, page_no, file_path)
+                    await self._on_page_done(page_db, job, page_no, result)
+                    await page_db.commit()
 
-        # [C4] gather + return_exceptions
         results = await asyncio.gather(
-            *[process_chunk(c) for c in chunks],
+            *[process_one(p) for p in pages],
             return_exceptions=True,
         )
 
-        # 扫描异常
         for i, r in enumerate(results):
             if isinstance(r, Exception):
-                logger.error("chunk_failed", chunk_id=i, error=str(r))
+                logger.error("page_parallel_failed",
+                             page_no=pages[i], error=str(r))
 
     async def _process_single_page(
         self,
@@ -229,37 +217,58 @@ class Orchestrator:
         """持久化 SKU/Image/Binding 到 DB。"""
         from pdf_sku.common.models import SKU, Image, SKUImageBinding
 
-        for sku in result.skus:
+        job_dir = Path(os.environ.get("JOB_DATA_DIR", "/data/jobs")) / str(job_id)
+        img_dir = job_dir / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+
+        for idx, sku in enumerate(result.skus, start=1):
             if sku.validity == "valid":
+                bbox = [int(v) for v in sku.source_bbox] if sku.source_bbox else None
                 db.add(SKU(
+                    sku_id=sku.sku_id or f"SKU-{page_no}-{idx}",
                     job_id=job_id,
                     page_number=page_no,
-                    sku_external_id=sku.sku_id,
                     attributes=sku.attributes,
                     validity=sku.validity,
-                    confidence=sku.confidence,
-                    extraction_method=sku.extraction_method,
-                    source_bbox=list(sku.source_bbox),
+                    source_bbox=bbox,
+                    attribute_source="AI_EXTRACTED",
+                    status="EXTRACTED",
                 ))
 
-        for img in result.images:
+        for idx, img in enumerate(result.images, start=1):
             if img.search_eligible:
+                image_id = img.image_id or f"{str(job_id)[:8]}-{page_no}-{idx}"
+                file_rel = f"images/{image_id}.jpg"
+                file_abs = job_dir / file_rel
+                if img.data:
+                    file_abs.write_bytes(img.data)
+
+                bbox = [int(v) for v in img.bbox] if img.bbox else None
+                resolution = [int(img.width), int(img.height)] if img.width and img.height else None
                 db.add(Image(
+                    image_id=image_id,
                     job_id=job_id,
                     page_number=page_no,
                     role=img.role or "unknown",
+                    bbox=bbox,
+                    extracted_path=file_rel,
+                    format="jpg",
+                    resolution=resolution,
                     short_edge=img.short_edge,
                     image_hash=img.image_hash,
                     is_duplicate=img.is_duplicate,
                     search_eligible=img.search_eligible,
+                    is_fragmented=img.is_fragmented,
                 ))
 
         for binding in result.bindings:
             if binding.image_id and not binding.is_ambiguous:
                 db.add(SKUImageBinding(
+                    sku_id=binding.sku_id,
+                    image_id=binding.image_id,
                     job_id=job_id,
-                    method=binding.method,
-                    confidence=binding.confidence,
+                    binding_method=binding.method,
+                    binding_confidence=binding.confidence,
                     is_ambiguous=binding.is_ambiguous,
                     rank=binding.rank,
                 ))
@@ -303,6 +312,7 @@ class Orchestrator:
                            job_id=str(job.job_id),
                            status_counts=status_counts)
 
+        await refresh_job_page_stats(db, str(job.job_id))
         await update_job_status(db, str(job.job_id), new_status,
                                 trigger="pipeline_finalize")
 

@@ -1,4 +1,4 @@
-# PDF-SKU Server 系统架构概览
+# PDF-SKU Server 系统架构概览 (V0.2.0)
 
 ## 模块拓扑
 
@@ -39,7 +39,8 @@ POST /uploads (TUS) → POST /jobs
 Evaluator: prescan → score → route (AUTO/HYBRID/HUMAN_ALL)
   ↓ EvaluationCompleted
 Pipeline Orchestrator:
-  ≤100页: sequential | >100页: chunked (Semaphore=3)
+  统一并行处理 (Semaphore=PIPELINE_CONCURRENCY, 默认5)
+  每页独立DB会话, CrossPageMerger per-job 加锁
   PageProcessor 9-phase:
     1.PDF解析 (pdfplumber→PyMuPDF→OCR fallback)
     2.图片预处理
@@ -104,10 +105,10 @@ Pipeline needs_review → TaskCreated
 
 | ID | 约束 | 实现 |
 |----|------|------|
-| C1 | 分片不跨表格 | ChunkingStrategy.create_chunks_table_aware |
+| C1 | 并行安全跨页合并 | CrossPageMerger per-job asyncio.Lock |
 | C2 | 终态=import_status | ReconciliationPoller._check_job_completion |
 | C3 | import_dedup幂等 | IncrementalImporter._check_dedup |
-| C4 | gather+exception scan | Orchestrator._process_chunked |
+| C4 | gather+exception scan | Orchestrator._process_parallel |
 | C6 | SKU valid/invalid | ConsistencyValidator.enforce_sku_validity |
 | C7 | 最终兜底 | PageProcessor (needs_review=true) |
 | C11 | 图片去重后绑定 | SKUImageBinder (dedup filter) |
@@ -119,7 +120,19 @@ Pipeline needs_review → TaskCreated
 
 - **生产代码**: ~10,300 行
 - **测试代码**: ~2,300 行
-- **API 端点**: 45
+- **API 端点**: 47 (+2: 图片服务、页面详情)
 - **ORM 模型**: 18 表
 - **事件类型**: 8
 - **定时任务**: 6
+
+## V0.2.0 变更摘要 (2026-02-21)
+
+| 变更 | 说明 |
+|------|------|
+| Pipeline 并行化 | 删除串行/分片模式，统一 Semaphore 并行（默认5并发），18页 PDF 处理时间 ~22min → ~5min |
+| CrossPageMerger 加锁 | cache_page/find_continuation 改为 async + per-job Lock，保障并行安全 |
+| Orchestrator 重构 | 删除 _process_sequential/_process_chunked，每页独立 DB session |
+| Job 详情增强 | 新增 GET /jobs/{id}/images/{image_id}、GET /jobs/{id}/pages/{n}/detail 端点 |
+| SKU 图片绑定 | GET /jobs/{id}/skus 返回 images 数组（JOIN sku_image_bindings） |
+| 商品导入配置 UI | 前端新增 /config/import 页面 + importConfigStore (localStorage 持久化) |
+| SKU 属性展示 | SKUList 组件支持点击展开全部属性，兼容 model_number/product_name 字段名 |

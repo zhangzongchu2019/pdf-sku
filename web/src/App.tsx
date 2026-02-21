@@ -27,6 +27,7 @@ const CustomAttrUpgradesPage = lazy(() => import("./routes/CustomAttrUpgradesPag
 const NotificationPage   = lazy(() => import("./routes/NotificationPage"));
 const UserManagePage     = lazy(() => import("./routes/UserManagePage"));
 const SettingsPage       = lazy(() => import("./routes/SettingsPage"));
+const ImportConfigPage   = lazy(() => import("./routes/ImportConfigPage"));
 
 function LazyPage({ children }: { children: React.ReactNode }) {
   return (
@@ -82,6 +83,7 @@ export default function App() {
 
               {/* Config — admin */}
               <Route path="/config" element={<Protected roles={["admin"]}><ConfigPage /></Protected>} />
+              <Route path="/config/import" element={<Protected roles={["admin"]}><ImportConfigPage /></Protected>} />
               <Route path="/config/:profileId" element={<Protected roles={["admin"]}><ConfigEditPage /></Protected>} />
 
               {/* Merchants */}

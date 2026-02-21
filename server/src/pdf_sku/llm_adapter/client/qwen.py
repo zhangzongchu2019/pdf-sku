@@ -41,13 +41,13 @@ class QwenClient(BaseLLMClient):
         json_mode: bool = False,
         images: list[bytes] | None = None,
     ) -> LLMResponse:
-        is_vl = images and ("vl" in self._model.lower())
+        is_vl = "vl" in self._model.lower()
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
 
-        if is_vl:
-            # Qwen-VL multimodal format
+        if is_vl and images:
+            # Qwen-VL multimodal format (with images)
             import base64
             content_parts = []
             for img_bytes in images:
@@ -57,6 +57,9 @@ class QwenClient(BaseLLMClient):
                 })
             content_parts.append({"text": prompt})
             messages.append({"role": "user", "content": content_parts})
+        elif is_vl:
+            # Qwen-VL text-only: still use VL endpoint with text content part
+            messages.append({"role": "user", "content": [{"text": prompt}]})
         else:
             messages.append({"role": "user", "content": prompt})
 
@@ -87,6 +90,9 @@ class QwenClient(BaseLLMClient):
         output = data.get("output", {})
         choices = output.get("choices", [{}])
         content = choices[0].get("message", {}).get("content", "") if choices else ""
+        # Qwen VL 返回 content 为数组 [{"text": "..."}]，提取文本
+        if isinstance(content, list):
+            content = content[0].get("text", "") if content else ""
         usage = data.get("usage", {})
 
         return LLMResponse(
