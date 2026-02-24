@@ -194,6 +194,7 @@ class PageProcessor:
                 validation=validation,
                 classification_confidence=cls_result.confidence,
                 extraction_method=extraction_method,
+                llm_model_used=self._llm.current_model_name if self._llm else None,
                 fallback_reason=fallback_reason,
             )
 
@@ -224,10 +225,14 @@ class PageProcessor:
         remaining = MAX_LLM_CALLS_PER_PAGE - llm_calls_used
         if remaining >= 2:
             try:
+                # 获取截图实际像素尺寸，传给 VLM 做坐标归一化
+                _img_size = self._two_stage._get_image_size(screenshot) if screenshot else (0, 0)
                 boundaries = await self._two_stage.identify_boundaries(
-                    raw.text_blocks, None, screenshot)
+                    raw.text_blocks, None, screenshot, image_size=_img_size,
+                    images=raw.images)
                 if boundaries:
-                    skus = await self._two_stage.extract_batch(boundaries, raw)
+                    skus = await self._two_stage.extract_batch(
+                        boundaries, raw, screenshot=screenshot)
                     if skus:
                         invalid_count = sum(1 for s in skus if s.validity == "invalid")
                         if len(skus) > 0 and invalid_count / len(skus) <= 0.3:
@@ -240,7 +245,7 @@ class PageProcessor:
 
         # 单阶段 Fallback
         try:
-            skus = await self._single_stage.extract(raw)
+            skus = await self._single_stage.extract(raw, screenshot=screenshot)
             if skus:
                 return skus
         except Exception as e:

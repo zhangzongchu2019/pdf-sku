@@ -95,5 +95,15 @@ export const jobsApi = {
     return `${base}/jobs/${jobId}/images/${imageId}`;
   },
 
+  updateSku: (jobId: string, skuId: string, data: { attributes?: Record<string, string>; validity?: string }) =>
+    api.patch<{ sku_id: string; attributes: Record<string, string>; validity: string; status: string }>(
+      `/jobs/${jobId}/skus/${skuId}`, data
+    ),
+
+  ocrRegion: (jobId: string, pageNo: number, bbox: number[]) =>
+    api.post<{ attributes: Record<string, string>; source_text: string }>(
+      `/jobs/${jobId}/pages/${pageNo}/ocr-region`, { bbox }
+    ),
+
   dashboard: () => api.get<DashboardMetrics>("/dashboard/metrics"),
 };

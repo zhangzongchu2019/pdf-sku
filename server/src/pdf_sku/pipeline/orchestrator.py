@@ -11,6 +11,7 @@ Orchestrator — Job 级处理编排。对齐: Pipeline 详设 §5.1
 """
 from __future__ import annotations
 import asyncio
+import json
 import os
 from pathlib import Path
 from uuid import UUID
@@ -28,7 +29,37 @@ import structlog
 
 logger = structlog.get_logger()
 
-PIPELINE_CONCURRENCY = int(os.environ.get("PIPELINE_CONCURRENCY", "5"))
+PIPELINE_CONCURRENCY_FALLBACK = int(os.environ.get("PIPELINE_CONCURRENCY", "5"))
+
+# Redis key for pipeline concurrency rules
+CONCURRENCY_RULES_KEY = "pdf_sku:pipeline_concurrency_rules"
+
+# Default rules: page_threshold → concurrency
+DEFAULT_CONCURRENCY_RULES = [
+    {"min_pages": 1, "concurrency": 1},
+    {"min_pages": 10, "concurrency": 2},
+]
+
+
+async def get_concurrency_for_pages(total_pages: int, redis=None) -> int:
+    """Determine pipeline concurrency based on page count and stored rules."""
+    rules = DEFAULT_CONCURRENCY_RULES
+    if redis:
+        try:
+            raw = await redis.get(CONCURRENCY_RULES_KEY)
+            if raw:
+                rules = json.loads(raw)
+        except Exception:
+            logger.warning("concurrency_rules_read_failed, using defaults")
+
+    # Sort by min_pages desc, pick the first rule where total_pages >= min_pages
+    concurrency = PIPELINE_CONCURRENCY_FALLBACK
+    for rule in sorted(rules, key=lambda r: r["min_pages"], reverse=True):
+        if total_pages >= rule["min_pages"]:
+            concurrency = rule["concurrency"]
+            break
+
+    return max(1, concurrency)
 
 
 class Orchestrator:
@@ -38,10 +69,12 @@ class Orchestrator:
         self,
         page_processor: PageProcessor,
         db_session_factory=None,
+        redis=None,
         **_kwargs,
     ) -> None:
         self._pp = page_processor
         self._db_factory = db_session_factory
+        self._redis = redis
 
     async def process_job(
         self,
@@ -105,8 +138,13 @@ class Orchestrator:
         pages: list[int],
         file_path: str,
     ) -> None:
-        """并行处理所有页面（Semaphore 控制并发）。"""
-        semaphore = asyncio.Semaphore(PIPELINE_CONCURRENCY)
+        """并行处理所有页面（Semaphore 控制并发，根据页数动态调整）。"""
+        concurrency = await get_concurrency_for_pages(len(pages), self._redis)
+        logger.info("pipeline_concurrency",
+                     job_id=str(job.job_id),
+                     total_pages=len(pages),
+                     concurrency=concurrency)
+        semaphore = asyncio.Semaphore(concurrency)
 
         async def process_one(page_no: int):
             async with semaphore:
@@ -190,6 +228,7 @@ class Orchestrator:
                 sku_count=len(result.skus),
                 needs_review=result.needs_review,
                 extraction_method=result.extraction_method,
+                llm_model_used=result.llm_model_used,
                 classification_confidence=result.classification_confidence,
             )
         )
@@ -233,6 +272,8 @@ class Orchestrator:
                     source_bbox=bbox,
                     attribute_source="AI_EXTRACTED",
                     status="EXTRACTED",
+                    product_id=sku.product_id or None,
+                    variant_label=sku.variant_label or None,
                 ))
 
         for idx, img in enumerate(result.images, start=1):

@@ -126,6 +126,8 @@ class SKUResult:
     confidence: float = 0.0
     extraction_method: str = ""  # two_stage | single_stage | table_rule | final_fallback
     raw_response: str = ""
+    product_id: str = ""         # 所属产品组 ID（同一产品的多个 SKU 变体共享）
+    variant_label: str = ""      # 变体描述（如 "双人位"、"红色"）
 
 
 @dataclass
@@ -177,6 +179,7 @@ class PageResult:
     validation: ValidationResult | None = None
     classification_confidence: float = 0.0
     extraction_method: str | None = None
+    llm_model_used: str | None = None
     fallback_reason: str | None = None
     degrade_reason: str | None = None
     error: str | None = None

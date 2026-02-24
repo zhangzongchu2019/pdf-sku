@@ -38,7 +38,7 @@ from pdf_sku.common.enums import (
 )
 from pdf_sku.common.exceptions import JobNotFoundError, PDFSKUError
 from pdf_sku.common.schemas import PaginationMeta, ErrorResponse
-from pdf_sku.auth.dependencies import CurrentUser, UploaderUser, AnyUser
+from pdf_sku.auth.dependencies import CurrentUser, UploaderUser, AnyUser, AdminUser
 from pdf_sku.settings import settings
 from pdf_sku.gateway.event_bus import event_bus
 import structlog
@@ -62,6 +62,11 @@ def get_job_factory():
 def get_sse_manager():
     from pdf_sku.gateway._deps import sse_manager
     return sse_manager
+
+
+def get_llm_service():
+    from pdf_sku.gateway._deps import llm_service
+    return llm_service
 
 
 # ───────────────────────── TUS 端点 ─────────────────────────
@@ -185,7 +190,7 @@ async def create_job(
         category=category,
         uploaded_by=f"{user.username} ({str(user.user_id)[:8]})",
     )
-    await db.commit()
+    # 注意: job_factory.create_job 内部已 commit，此处无需再次 commit
 
     # 清理 TUS 元数据 (文件已移走)
     await tus_store.delete(upload_id)
@@ -344,6 +349,15 @@ async def reprocess_job_ai(job_id: uuid.UUID, db: DBSession):
     if task_ids:
         await db.execute(delete(Annotation).where(Annotation.task_id.in_(task_ids)))
     await db.execute(delete(HumanTask).where(HumanTask.job_id == job_id))
+
+    # 清理旧的 SKU 及关联数据，避免重处理后产生重复
+    await db.execute(delete(SKUImageBinding).where(SKUImageBinding.job_id == job_id))
+    await db.execute(delete(SKU).where(SKU.job_id == job_id))
+    await db.execute(delete(Image).where(Image.job_id == job_id))
+
+    # 重置 Job 级计数
+    job.total_skus = 0
+    job.total_images = 0
 
     blank_pages = set(job.blank_pages or [])
     await db.execute(
@@ -648,9 +662,52 @@ async def get_skus(
             "import_confirmation": s.import_confirmation,
             "source_bbox": s.source_bbox,
             "images": bindings_map.get(s.sku_id, []),
+            "product_id": s.product_id,
+            "variant_label": s.variant_label,
         } for s in skus],
         "pagination": {"page": page, "page_size": page_size,
                         "total_count": count, "total_pages": (count + page_size - 1) // page_size},
+    }
+
+
+@router.patch("/jobs/{job_id}/skus/{sku_id}")
+async def update_sku(
+    request: Request,
+    job_id: uuid.UUID,
+    sku_id: str,
+    db: DBSession,
+):
+    """更新 SKU 属性（支持已完成 Job 的后期修正）。"""
+    body = await request.json()
+    attributes = body.get("attributes")
+    validity = body.get("validity")
+
+    result = await db.execute(
+        select(SKU).where(
+            SKU.job_id == job_id,
+            SKU.sku_id == sku_id,
+            SKU.superseded == False,
+        )
+    )
+    sku = result.scalar_one_or_none()
+    if not sku:
+        return JSONResponse(status_code=404, content={
+            "error_code": "SKU_NOT_FOUND",
+            "message": f"SKU {sku_id} not found in job {job_id}",
+        })
+
+    if attributes is not None:
+        sku.attributes = {**sku.attributes, **attributes}
+    if validity is not None:
+        sku.validity = validity
+
+    await db.commit()
+
+    return {
+        "sku_id": sku.sku_id,
+        "attributes": sku.attributes,
+        "validity": sku.validity,
+        "status": sku.status,
     }
 
 
@@ -752,6 +809,274 @@ async def health(db: DBSession, redis: RedisClient):
         status_code=200 if healthy else 503,
         content={"status": "healthy" if healthy else "degraded", "checks": checks},
     )
+
+
+# ───────────────────────── OCR Region ─────────────────────────
+
+OCR_REGION_PROMPT = """Extract product attributes from this image region.
+Return JSON: {"product_name": "...", "model_number": "...", "price": "...",
+"description": "...", "material": "...", "color": "...", "size": "...", "weight": "...", "source_text": "all visible text"}
+Only include attributes clearly visible. Use null for missing ones."""
+
+
+@router.post("/jobs/{job_id}/pages/{page_number}/ocr-region")
+async def ocr_region(
+    request: Request,
+    job_id: uuid.UUID,
+    db: DBSession,
+    page_number: int = PathParam(..., ge=1),
+):
+    """OCR 识别页面指定区域的文字，提取商品属性。"""
+    body = await request.json()
+    bbox = body.get("bbox")
+    if not bbox or len(bbox) != 4:
+        return JSONResponse(status_code=400, content={
+            "error_code": "INVALID_BBOX",
+            "message": "bbox must be [x1, y1, x2, y2]",
+        })
+
+    llm_service = get_llm_service()
+    if llm_service is None:
+        return JSONResponse(status_code=503, content={
+            "error_code": "LLM_NOT_AVAILABLE",
+            "message": "LLM service is not initialized",
+        })
+
+    # Get page screenshot PNG bytes
+    job_dir = Path(settings.job_data_dir) / str(job_id)
+    cache_path = job_dir / "screenshots" / f"page-{page_number}.png"
+    png_bytes: bytes | None = None
+
+    if cache_path.exists():
+        png_bytes = cache_path.read_bytes()
+    else:
+        source_pdf = job_dir / "source.pdf"
+        if not source_pdf.exists():
+            return JSONResponse(status_code=404, content={
+                "error_code": "SOURCE_PDF_MISSING",
+                "message": f"Source PDF not found for job {job_id}",
+            })
+        try:
+            import fitz
+            doc = fitz.open(source_pdf)
+            try:
+                if page_number < 1 or page_number > doc.page_count:
+                    return JSONResponse(status_code=404, content={
+                        "error_code": "PAGE_OUT_OF_RANGE",
+                        "message": f"Page {page_number} is out of range",
+                    })
+                zoom = 150 / 72
+                pix = doc[page_number - 1].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                png_bytes = pix.tobytes("png")
+            finally:
+                doc.close()
+        except Exception as e:
+            logger.exception("ocr_screenshot_failed", error=str(e))
+            return JSONResponse(status_code=500, content={
+                "error_code": "RENDER_FAILED",
+                "message": "Failed to render page for OCR",
+            })
+
+    # Crop bbox region using Pillow
+    try:
+        from PIL import Image as PILImage
+        import io
+
+        full_img = PILImage.open(io.BytesIO(png_bytes))
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        # Clamp to image bounds
+        x1 = max(0, min(x1, full_img.width))
+        y1 = max(0, min(y1, full_img.height))
+        x2 = max(0, min(x2, full_img.width))
+        y2 = max(0, min(y2, full_img.height))
+        cropped = full_img.crop((x1, y1, x2, y2))
+
+        # Resize if too large — LLM APIs have image size limits
+        MAX_LONG_EDGE = 2048
+        w, h = cropped.size
+        if max(w, h) > MAX_LONG_EDGE:
+            ratio = MAX_LONG_EDGE / max(w, h)
+            cropped = cropped.resize(
+                (int(w * ratio), int(h * ratio)),
+                PILImage.LANCZOS,
+            )
+            logger.info("ocr_crop_resized",
+                        original=f"{w}x{h}",
+                        resized=f"{cropped.size[0]}x{cropped.size[1]}")
+
+        buf = io.BytesIO()
+        cropped.save(buf, format="PNG")
+        crop_bytes = buf.getvalue()
+    except Exception as e:
+        logger.exception("ocr_crop_failed", error=str(e))
+        return JSONResponse(status_code=500, content={
+            "error_code": "CROP_FAILED",
+            "message": "Failed to crop image region",
+        })
+
+    # Call LLM for OCR
+    try:
+        import json as json_mod
+        resp = await llm_service._call_llm(
+            operation="ocr_region",
+            prompt=OCR_REGION_PROMPT,
+            images=[crop_bytes],
+        )
+        # Parse JSON from response
+        try:
+            result = json_mod.loads(resp.content)
+        except json_mod.JSONDecodeError:
+            # Try to extract JSON from markdown code block
+            import re
+            match = re.search(r"```(?:json)?\s*([\s\S]*?)```", resp.content)
+            if match:
+                result = json_mod.loads(match.group(1).strip())
+            else:
+                result = {"source_text": resp.content}
+
+        source_text = result.pop("source_text", "")
+        # Remove null values
+        attributes = {k: v for k, v in result.items() if v is not None}
+
+        return {"attributes": attributes, "source_text": source_text}
+
+    except Exception as e:
+        logger.exception("ocr_llm_failed", error=str(e))
+        return JSONResponse(status_code=500, content={
+            "error_code": "OCR_FAILED",
+            "message": f"OCR extraction failed: {str(e)}",
+        })
+
+
+# ───────────────────────── Pipeline Concurrency Rules ─────────────────────────
+
+from pdf_sku.pipeline.orchestrator import (
+    CONCURRENCY_RULES_KEY, DEFAULT_CONCURRENCY_RULES,
+)
+
+
+@router.get("/system/pipeline-concurrency")
+async def get_pipeline_concurrency(request: Request, _admin: AdminUser):
+    """获取 Pipeline 并发规则。"""
+    redis = getattr(request.app.state, "redis", None)
+    if redis:
+        try:
+            raw = await redis.get(CONCURRENCY_RULES_KEY)
+            if raw:
+                import json as json_mod
+                rules = json_mod.loads(raw)
+                return {"rules": rules}
+        except Exception:
+            pass
+    return {"rules": DEFAULT_CONCURRENCY_RULES}
+
+
+@router.put("/system/pipeline-concurrency")
+async def set_pipeline_concurrency(request: Request, _admin: AdminUser):
+    """设置 Pipeline 并发规则。"""
+    import json as json_mod
+
+    redis = getattr(request.app.state, "redis", None)
+    if not redis:
+        return JSONResponse(status_code=503, content={
+            "error_code": "REDIS_UNAVAILABLE",
+            "message": "Redis is not available, cannot persist rules",
+        })
+
+    body = await request.json()
+    rules = body.get("rules")
+    if not rules or not isinstance(rules, list):
+        return JSONResponse(status_code=400, content={
+            "error_code": "INVALID_RULES",
+            "message": "rules must be a non-empty array of {min_pages, concurrency}",
+        })
+    # Validate each rule
+    for rule in rules:
+        if not isinstance(rule.get("min_pages"), int) or rule["min_pages"] < 1:
+            return JSONResponse(status_code=400, content={
+                "error_code": "INVALID_RULE",
+                "message": f"min_pages must be a positive integer, got: {rule.get('min_pages')}",
+            })
+        if not isinstance(rule.get("concurrency"), int) or rule["concurrency"] < 1:
+            return JSONResponse(status_code=400, content={
+                "error_code": "INVALID_RULE",
+                "message": f"concurrency must be a positive integer, got: {rule.get('concurrency')}",
+            })
+
+    # Sort by min_pages ascending for consistency
+    rules = sorted(rules, key=lambda r: r["min_pages"])
+    await redis.set(CONCURRENCY_RULES_KEY, json_mod.dumps(rules))
+    logger.info("pipeline_concurrency_rules_updated", rules=rules)
+    return {"rules": rules}
+
+
+# ───────────────────────── LLM Provider Config ─────────────────────────
+
+from pdf_sku.llm_adapter.provider_config import (
+    LLMProviderConfig,
+    DEFAULT_PROVIDER_CONFIGS,
+    get_provider_config,
+    set_provider_config,
+    list_provider_configs,
+)
+
+
+@router.get("/system/llm-provider-configs")
+async def get_llm_provider_configs(request: Request, _admin: AdminUser):
+    """列出所有 LLM provider 的运行时配置。"""
+    redis = getattr(request.app.state, "redis", None)
+    configs = await list_provider_configs(redis)
+    return {"configs": configs}
+
+
+@router.put("/system/llm-provider-configs/{provider}")
+async def update_llm_provider_config(
+    request: Request,
+    provider: str,
+    _admin: AdminUser,
+):
+    """更新指定 LLM provider 的运行时配置。"""
+    if provider not in DEFAULT_PROVIDER_CONFIGS:
+        return JSONResponse(status_code=400, content={
+            "error_code": "UNKNOWN_PROVIDER",
+            "message": f"Unknown provider: {provider}. Known: {list(DEFAULT_PROVIDER_CONFIGS)}",
+        })
+
+    redis = getattr(request.app.state, "redis", None)
+    if not redis:
+        return JSONResponse(status_code=503, content={
+            "error_code": "REDIS_UNAVAILABLE",
+            "message": "Redis is not available, cannot persist config",
+        })
+
+    body = await request.json()
+    current = await get_provider_config(redis, provider)
+    updated = LLMProviderConfig(
+        timeout_seconds=body.get("timeout_seconds", current.timeout_seconds),
+        vlm_timeout_seconds=body.get("vlm_timeout_seconds", current.vlm_timeout_seconds),
+        max_retries=body.get("max_retries", current.max_retries),
+    )
+
+    # Basic validation
+    if updated.timeout_seconds < 1 or updated.vlm_timeout_seconds < 1:
+        return JSONResponse(status_code=400, content={
+            "error_code": "INVALID_VALUE",
+            "message": "timeout values must be >= 1",
+        })
+    if updated.max_retries < 0 or updated.max_retries > 10:
+        return JSONResponse(status_code=400, content={
+            "error_code": "INVALID_VALUE",
+            "message": "max_retries must be between 0 and 10",
+        })
+
+    await set_provider_config(redis, provider, updated)
+    logger.info("llm_provider_config_updated", provider=provider,
+                timeout=updated.timeout_seconds,
+                vlm_timeout=updated.vlm_timeout_seconds,
+                max_retries=updated.max_retries)
+
+    from dataclasses import asdict
+    return {"provider": provider, "config": asdict(updated)}
 
 
 # ───────────────────────── Helpers ─────────────────────────

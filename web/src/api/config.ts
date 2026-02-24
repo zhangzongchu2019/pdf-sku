@@ -35,4 +35,22 @@ export const configApi = {
 
   rejectCalibration: (id: string, reason: string) =>
     api.post<void>(`/calibrations/${id}/reject`, { reason }),
+
+  getPipelineConcurrency: () =>
+    api.get<{ rules: Array<{ min_pages: number; concurrency: number }> }>("/system/pipeline-concurrency"),
+
+  setPipelineConcurrency: (rules: Array<{ min_pages: number; concurrency: number }>) =>
+    api.put<{ rules: Array<{ min_pages: number; concurrency: number }> }>("/system/pipeline-concurrency", { rules }),
+
+  getLLMProviderConfigs: () =>
+    api.get<{ configs: Record<string, LLMProviderConfig> }>("/system/llm-provider-configs"),
+
+  setLLMProviderConfig: (provider: string, config: Partial<LLMProviderConfig>) =>
+    api.put<{ provider: string; config: LLMProviderConfig }>(`/system/llm-provider-configs/${provider}`, config),
 };
+
+export interface LLMProviderConfig {
+  timeout_seconds: number;
+  vlm_timeout_seconds: number;
+  max_retries: number;
+}

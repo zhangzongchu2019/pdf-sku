@@ -1,8 +1,8 @@
 # PDF-SKU 系统数据字典与状态机定义
 
-> **版本**: V1.0  
-> **权威源**: DDL V1.2（18 表）· OpenAPI V2.0（62 端点 / 34 schemas）· 接口契约 V1.2 · 前端详设 V1.1 · BA V1.1  
-> **定位**: 一站式开发参考，消除枚举、状态、字段定义的跨文档查阅痛点  
+> **版本**: V1.1 (2026-02-24)
+> **权威源**: DDL V1.2（18 表）· OpenAPI V2.0（62 端点 / 34 schemas）· 接口契约 V1.2 · 前端详设 V1.1 · BA V1.1
+> **定位**: 一站式开发参考，消除枚举、状态、字段定义的跨文档查阅痛点
 > **约定**: 所有枚举值均为**冻结版本**，变更需前后端+DB 同步发布
 
 ---
@@ -375,6 +375,7 @@ stateDiagram-v2
 |--------|---|-------|------|
 | **SKUValidity** | valid · invalid | skus.validity | valid=必要+充分条件均满足 · invalid=不满足 |
 | **AttributeSource** | AI_EXTRACTED · HUMAN_CORRECTED · CROSS_PAGE_MERGED · PROMOTED | skus.attribute_source | 属性来源追踪 |
+| **ExtractionMethod** | two_stage · two_stage_rule · single_stage · single_stage_rule · table_rule · final_fallback · human | skus.extraction_method | 提取方法：two_stage=两阶段提取 · two_stage_rule=两阶段规则兜底 · single_stage=单阶段提取 · single_stage_rule=单阶段规则兜底 · table_rule=表格规则 · final_fallback=最终兜底 · human=人工 |
 | **ImportConfirmation** | confirmed · assumed · failed · pending | skus.import_confirmation | 导入确认 4 态 |
 
 ## 2.6 人工协作
@@ -539,8 +540,11 @@ stateDiagram-v2
 | superseded | BOOLEAN | DEFAULT false | 是否被新 revision 取代 |
 | attributes | JSONB | NOT NULL | 标准属性 {model, name, size, material, color, price} |
 | custom_attributes | JSONB | DEFAULT '[]' | 非标属性 [{key, value}] |
+| product_id | TEXT | nullable | 所属产品组 ID。同一产品的多个 SKU 变体共享此 ID，格式：`{hash8}_{page}_P{seq}` |
+| variant_label | TEXT | nullable | 变体描述，如"双人位"、"1800mm"。无变体时为空 |
 | source_text | TEXT | nullable | 源文本 |
 | source_bbox | INT[] | nullable | 源区域坐标 [x, y, w, h] |
+| extraction_method | TEXT | nullable | §2.5 ExtractionMethod（7 值） |
 | attribute_source | TEXT | DEFAULT 'AI_EXTRACTED', IDX | §2.5 AttributeSource |
 | import_status | TEXT | DEFAULT 'pending' | 导入状态（旧字段，兼容） |
 | import_confirmation | TEXT | DEFAULT 'pending', IDX | §2.5 ImportConfirmation（4 值） |
@@ -548,7 +552,7 @@ stateDiagram-v2
 | created_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | — |
 | updated_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | — |
 
-**索引**: idx_skus_job · idx_skus_status · idx_skus_active (partial unique) · idx_skus_attribute_source · idx_skus_import_confirmation
+**索引**: idx_skus_job · idx_skus_status · idx_skus_active (partial unique) · idx_skus_attribute_source · idx_skus_import_confirmation · idx_skus_product(job_id, product_id) — 按产品分组查询
 
 ---
 
@@ -946,7 +950,7 @@ stateDiagram-v2
 | `PageType` | pages.page_type | 'A' \| 'B' \| 'C' \| 'D' |
 | `LayoutType` | pages.layout_type | 'L1' \| 'L2' \| 'L3' \| 'L4' |
 | `SKUStatus` | skus.status | 8 值 union type（含 PARTIAL / INVALID） |
-| `SKU` | skus / API SKU | +images 嵌套数组 |
+| `SKU` | skus / API SKU | +images 嵌套数组, +product_id, +variant_label |
 | `SKUImage` | images + sku_image_bindings / API SKUImage | 合并图片+绑定信息 |
 | `TaskDetail` | human_tasks / API TaskDetail | +elements, +ambiguous_bindings |
 | `AnnotationElement` | — (纯 API) | element_id + bbox(归一化) + ai_role |

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { useParams, Link } from "react-router-dom";
 import { useJobStore } from "../stores/jobStore";
 import { useSSEStore } from "../stores/sseStore";
@@ -14,16 +14,108 @@ import { TimelineDrawer } from "../components/dashboard/TimelineDrawer";
 import { formatDate, formatPercent } from "../utils/format";
 import type { PageHeatmapCell } from "../components/dashboard/PageHeatmap";
 
+// ── 实时活动面板 ──
+interface ActivityEntry {
+  id: number;
+  time: string;
+  event: string;
+  message: string;
+  level: "info" | "success" | "warning" | "error";
+}
+
+const EVENT_CONFIG: Record<string, { label: string; level: ActivityEntry["level"]; format: (d: any) => string }> = {
+  page_completed:     { label: "页面完成", level: "success", format: (d) => `第 ${d.page_no} 页处理完成${d.sku_count ? `，${d.sku_count} 个 SKU` : ""}` },
+  pages_batch_update: { label: "批量更新", level: "info",    format: (d) => `${d.completed ?? "?"} 页已完成` },
+  job_completed:      { label: "Job 完成", level: "success", format: (d) => `处理完成，共 ${d.total_skus} 个 SKU` },
+  job_failed:         { label: "Job 失败", level: "error",   format: (d) => d.error_message || "处理失败" },
+  human_needed:       { label: "需人工",   level: "warning", format: (d) => `${d.task_count} 个任务需要人工标注` },
+  sla_escalated:      { label: "SLA 升级", level: "warning", format: (d) => `任务 SLA 升级至 ${d.sla_level}` },
+  heartbeat:          { label: "心跳",     level: "info",    format: () => "连接正常" },
+};
+
+const LEVEL_COLORS: Record<string, string> = {
+  info: "#64748B", success: "#22C55E", warning: "#F59E0B", error: "#EF4444",
+};
+
+function LiveActivityPanel({ activities, sseStatus }: { activities: ActivityEntry[]; sseStatus: string }) {
+  const listRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
+  }, [activities.length]);
+
+  const statusDot = sseStatus === "connected" ? "#22C55E"
+    : sseStatus === "reconnecting" ? "#F59E0B"
+    : sseStatus === "polling" ? "#3B82F6" : "#EF4444";
+  const statusLabel = sseStatus === "connected" ? "已连接"
+    : sseStatus === "reconnecting" ? "重连中"
+    : sseStatus === "polling" ? "轮询中" : "未连接";
+
+  return (
+    <div style={{
+      backgroundColor: "#151C2C", border: "1px solid #2D3548", borderRadius: 8,
+      padding: 12, marginBottom: 16,
+    }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 13, fontWeight: 600, color: "#E2E8F0" }}>实时动态</span>
+          <span style={{
+            display: "inline-flex", alignItems: "center", gap: 4,
+            fontSize: 11, color: statusDot, padding: "1px 6px",
+            backgroundColor: `${statusDot}18`, border: `1px solid ${statusDot}33`,
+            borderRadius: 3,
+          }}>
+            <span style={{ width: 6, height: 6, borderRadius: "50%", backgroundColor: statusDot,
+              animation: sseStatus === "connected" ? "pulse 2s infinite" : undefined }} />
+            {statusLabel}
+          </span>
+        </div>
+        <span style={{ fontSize: 11, color: "#475569" }}>{activities.length} 条</span>
+      </div>
+      <div ref={listRef} style={{
+        maxHeight: 160, overflowY: "auto", fontSize: 12,
+        display: "flex", flexDirection: "column", gap: 2,
+      }}>
+        {activities.length === 0 && (
+          <div style={{ color: "#475569", textAlign: "center", padding: 16 }}>等待事件...</div>
+        )}
+        {activities.map((a) => (
+          <div key={a.id} style={{ display: "flex", gap: 8, padding: "3px 0", borderBottom: "1px solid #1E293B" }}>
+            <span style={{ color: "#475569", flexShrink: 0, fontFamily: "monospace" }}>{a.time}</span>
+            <span style={{ color: LEVEL_COLORS[a.level], flexShrink: 0, fontWeight: 500, minWidth: 60 }}>{EVENT_CONFIG[a.event]?.label ?? a.event}</span>
+            <span style={{ color: "#94A3B8" }}>{a.message}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function JobDetailPage() {
   const { jobId } = useParams<{ jobId: string }>();
   const { currentJob, pages, skus, fetchJob, fetchPages, fetchSkus, loading } = useJobStore();
-  const { connect, disconnect, onEvent } = useSSEStore();
+  const { connect, disconnect, onEvent, status: sseStatus } = useSSEStore();
   const [selectedPage, setSelectedPage] = useState<number | null>(null);
   const [expandedPage, setExpandedPage] = useState<number | null>(null);
   const [pageDetail, setPageDetail] = useState<PageDetail | null>(null);
   const [lightboxImg, setLightboxImg] = useState<string | null>(null);
   const [tab, setTab] = useState<"pages" | "skus" | "heatmap" | "eval">("pages");
   const [showTimeline, setShowTimeline] = useState(false);
+  const [activities, setActivities] = useState<ActivityEntry[]>([]);
+  const actIdRef = useRef(0);
+
+  const addActivity = useCallback((event: string, data: any) => {
+    // 心跳事件不记录，避免刷屏
+    if (event === "heartbeat") return;
+    const cfg = EVENT_CONFIG[event];
+    const entry: ActivityEntry = {
+      id: ++actIdRef.current,
+      time: new Date().toLocaleTimeString("zh-CN", { hour12: false }),
+      event,
+      message: cfg ? cfg.format(data) : JSON.stringify(data).slice(0, 80),
+      level: cfg?.level ?? "info",
+    };
+    setActivities((prev) => [...prev.slice(-99), entry]); // 最多保留 100 条
+  }, []);
 
   useEffect(() => {
     if (!jobId) return;
@@ -32,8 +124,7 @@ export default function JobDetailPage() {
     connect(jobId);
 
     const unsub = onEvent((e) => {
-      // SSE is per-job, so all events belong to this job.
-      // Some events (page_completed) don't have job_id field.
+      addActivity(e.event, e.data);
       if (!e.data.job_id || e.data.job_id === jobId) {
         fetchJob(jobId);
         fetchPages(jobId);
@@ -109,6 +200,9 @@ export default function JobDetailPage() {
           <div className="progress-fill" style={{ width: `${progress * 100}%` }} />
         </div>
       </div>
+
+      {/* 实时活动面板 */}
+      <LiveActivityPanel activities={activities} sseStatus={sseStatus} />
 
       <div className="tab-bar" style={{ display: "flex", gap: 4, marginBottom: 16 }}>
         <button className={`tab ${tab === "pages" ? "active" : ""}`} onClick={() => setTab("pages")}>
@@ -236,7 +330,7 @@ export default function JobDetailPage() {
       )}
 
       {tab === "skus" && (
-        <SKUList skus={skus} jobId={jobId} />
+        <SKUList skus={skus} jobId={jobId} onSkuUpdated={() => { if (jobId) fetchSkus(jobId); }} />
       )}
 
       {tab === "heatmap" && (

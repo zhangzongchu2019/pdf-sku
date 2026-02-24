@@ -4,6 +4,7 @@ LLM 统一服务入口。对齐: LLM Adapter 详设 §5.2
 调用链: check_budget → check_rate → check_circuit → render_prompt → client.complete → parse → record
 """
 from __future__ import annotations
+import asyncio
 import time
 from pdf_sku.llm_adapter.client.base import BaseLLMClient, LLMResponse
 from pdf_sku.llm_adapter.client.registry import get_client
@@ -13,13 +14,13 @@ from pdf_sku.llm_adapter.resilience.circuit_breaker import CircuitBreaker
 from pdf_sku.llm_adapter.resilience.budget_guard import BudgetGuard
 from pdf_sku.llm_adapter.resilience.rate_limiter import RateLimiter
 from pdf_sku.evaluator.scorer import PageScore
+from pdf_sku.llm_adapter.provider_config import get_provider_config
 from pdf_sku.common.exceptions import LLMCircuitOpenError, RetryableError
 import structlog
 
 logger = structlog.get_logger()
 
-MAX_RETRIES = 2
-EVAL_BATCH_SIZE = 5
+EVAL_BATCH_SIZE = 3
 
 
 class LLMService:
@@ -37,6 +38,7 @@ class LLMService:
         budget_guard: BudgetGuard | None = None,
         rate_limiter: RateLimiter | None = None,
         default_client_name: str = "gemini",
+        redis=None,
     ) -> None:
         self._prompt = prompt_engine
         self._parser = parser
@@ -44,6 +46,7 @@ class LLMService:
         self._budget = budget_guard
         self._rate_limiter = rate_limiter
         self._default_client = default_client_name
+        self._redis = redis
 
     @property
     def current_model_name(self) -> str:
@@ -151,15 +154,20 @@ class LLMService:
         prompt: str,
         images: list[bytes] | None = None,
         client_name: str | None = None,
-        timeout: float = 60.0,
+        timeout: float | None = None,
     ) -> LLMResponse:
         """
         核心调用链: circuit → rate_limit → budget → client.complete → record。
-        带重试 (最多 MAX_RETRIES 次)。
+        带重试 (次数从 provider config 动态读取)。
         """
         client_name = client_name or self._default_client
+        client = get_client(client_name)
 
-        for attempt in range(MAX_RETRIES + 1):
+        # Dynamic per-provider config from Redis (with code defaults fallback)
+        provider_cfg = await get_provider_config(self._redis, client.provider)
+        max_retries = provider_cfg.max_retries
+
+        for attempt in range(max_retries + 1):
             # 1. 熔断检查
             self._circuit.check()
 
@@ -172,12 +180,19 @@ class LLMService:
                 await self._budget.check(operation)
 
             try:
-                client = get_client(client_name)
+                # Determine effective timeout
+                if timeout is not None:
+                    effective_timeout = timeout
+                elif images:
+                    effective_timeout = float(provider_cfg.vlm_timeout_seconds)
+                else:
+                    effective_timeout = float(provider_cfg.timeout_seconds)
 
                 resp = await client.complete(
                     prompt=prompt,
                     images=images,
                     json_mode=True,
+                    timeout=effective_timeout,
                 )
 
                 # 成功
@@ -201,12 +216,14 @@ class LLMService:
                 raise  # 不重试
             except Exception as e:
                 self._circuit.record_failure()
-                if attempt < MAX_RETRIES:
+                if attempt < max_retries:
+                    backoff = 2 ** attempt * 3  # 3s, 6s
                     logger.warning("llm_call_retry",
                                     attempt=attempt + 1, error=repr(e),
-                                    operation=operation)
+                                    operation=operation, backoff_s=backoff)
+                    await asyncio.sleep(backoff)
                     continue
-                raise RetryableError(f"LLM call failed after {MAX_RETRIES + 1} attempts: {e}")
+                raise RetryableError(f"LLM call failed after {max_retries + 1} attempts: {e}")
 
         raise RetryableError("LLM call exhausted all retries")
 

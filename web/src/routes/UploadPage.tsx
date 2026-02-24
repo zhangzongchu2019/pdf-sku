@@ -5,7 +5,7 @@ import { useJobStore } from "../stores/jobStore";
 import { useNotificationStore } from "../stores/notificationStore";
 import { formatBytes } from "../utils/format";
 
-const MAX_SIZE = 100 * 1024 * 1024; // 100MB
+const MAX_SIZE = 16 * 1024 * 1024 * 1024; // 16GB
 
 export default function UploadPage() {
   const navigate = useNavigate();
@@ -26,7 +26,7 @@ export default function UploadPage() {
         continue;
       }
       if (file.size > MAX_SIZE) {
-        notify({ type: "error", message: `${file.name} 超过 100MB 限制` });
+        notify({ type: "error", message: `${file.name} 超过 16GB 限制` });
         continue;
       }
       addFile(file);
@@ -81,7 +81,7 @@ export default function UploadPage() {
         <div className="dropzone-content">
           <span className="dropzone-icon">📁</span>
           <p>拖拽 PDF 文件到此处，或点击选择</p>
-          <p className="dropzone-hint">支持批量上传，单文件最大 100MB</p>
+          <p className="dropzone-hint">支持批量上传，单文件最大 16GB</p>
         </div>
       </div>
 

@@ -11,6 +11,7 @@ from pdf_sku.gateway.prescanner import Prescanner
 from pdf_sku.gateway.job_factory import JobFactory
 from pdf_sku.gateway.sse_manager import SSEManager
 from pdf_sku.gateway.orphan_scanner import OrphanScanner
+from pdf_sku.llm_adapter.service import LLMService
 
 # 这些在 lifespan 中初始化，此处先声明类型
 tus_store: TusStore
@@ -18,3 +19,4 @@ tus_handler: TusHandler
 job_factory: JobFactory
 sse_manager: SSEManager
 orphan_scanner: OrphanScanner
+llm_service: LLMService | None = None

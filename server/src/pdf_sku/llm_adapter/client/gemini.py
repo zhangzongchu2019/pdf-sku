@@ -1,11 +1,15 @@
 """
-Google Gemini LLM 客户端。对齐: LLM Adapter 详设
+Google Gemini LLM 客户端（原生 API 直连）。
 
-- Gemini 2.0 Flash / Pro
+- Gemini 2.0 Flash / 2.5 Flash / Pro
 - 视觉支持 (图片 base64)
 - JSON mode
+
+注意：如需通过中转服务（laozhang.ai / OpenRouter）调用 Gemini，
+请使用 OpenAICompatClient 而非此客户端。
 """
 from __future__ import annotations
+import asyncio
 import base64
 import time
 import httpx
@@ -19,7 +23,7 @@ GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
 class GeminiClient(BaseLLMClient):
-    """Google Gemini 客户端。"""
+    """Google Gemini 原生 API 客户端（直连 Google）。"""
 
     def __init__(
         self,
@@ -40,20 +44,15 @@ class GeminiClient(BaseLLMClient):
         max_tokens: int = 4096,
         json_mode: bool = False,
         images: list[bytes] | None = None,
+        timeout: float | None = None,
     ) -> LLMResponse:
         parts = []
-
-        # 图片 (vision)
         if images:
             for img_bytes in images:
                 b64 = base64.b64encode(img_bytes).decode()
                 parts.append({
-                    "inline_data": {
-                        "mime_type": "image/jpeg",
-                        "data": b64,
-                    }
+                    "inline_data": {"mime_type": "image/jpeg", "data": b64}
                 })
-
         parts.append({"text": prompt})
 
         body = {
@@ -70,7 +69,8 @@ class GeminiClient(BaseLLMClient):
 
         url = f"{GEMINI_API_BASE}/{self._model}:generateContent?key={self._api_key}"
         start = time.monotonic()
-        resp = await self._client.post(url, json=body)
+        effective_timeout = httpx.Timeout(timeout) if timeout else None
+        resp = await self._client.post(url, json=body, timeout=effective_timeout)
         latency = (time.monotonic() - start) * 1000
         resp.raise_for_status()
         data = resp.json()
@@ -82,7 +82,6 @@ class GeminiClient(BaseLLMClient):
             content = "".join(p.get("text", "") for p in parts_out)
 
         usage_meta = data.get("usageMetadata", {})
-
         return LLMResponse(
             content=content,
             model=self._model,
@@ -109,7 +108,6 @@ class GeminiClient(BaseLLMClient):
             except Exception as e:
                 last_error = e
                 if attempt < max_retries:
-                    import asyncio
                     await asyncio.sleep(1.5 * (attempt + 1))
                     logger.warning("gemini_retry",
                                    attempt=attempt + 1, error=str(e))

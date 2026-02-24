@@ -1,9 +1,10 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { useAnnotationStore } from "../stores/annotationStore";
 import { useJobStore } from "../stores/jobStore";
 import { useNotificationStore } from "../stores/notificationStore";
 import { useSettingsStore } from "../stores/settingsStore";
+import { jobsApi } from "../api/jobs";
 import StatusBadge from "../components/common/StatusBadge";
 import CanvasEngine from "../components/canvas/CanvasEngine";
 import GroupPanel from "../components/annotation/GroupPanel";
@@ -27,7 +28,17 @@ export default function AnnotationPage() {
 
   const [pageImageUrl, setPageImageUrl] = useState<string | null>(null);
   const [showSubmitConfirm, setShowSubmitConfirm] = useState(false);
+  const [drawingMode, setDrawingMode] = useState(false);
   const skipSubmitConfirm = useSettingsStore((s) => s.skipSubmitConfirm);
+
+  // OCR + multi-bbox state
+  const [appendToSkuId, setAppendToSkuId] = useState<string | null>(null);
+  const [extraBboxes, setExtraBboxes] = useState<Record<string, number[][]>>({});
+  const [ocrLoadingSkuIds, setOcrLoadingSkuIds] = useState<Set<string>>(new Set());
+  const [skuSourceTexts, setSkuSourceTexts] = useState<Record<string, string>>({});
+  // Ref to always access latest skus in async callbacks
+  const skusRef = useRef(skus);
+  skusRef.current = skus;
 
   // Load task from URL param if store is empty
   useEffect(() => {
@@ -53,14 +64,21 @@ export default function AnnotationPage() {
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.key === "Enter") handleSubmit();
-      if (e.key === "Escape") handleSkip();
+      if (e.key === "Escape") {
+        if (drawingMode) {
+          setDrawingMode(false);
+          setAppendToSkuId(null);
+        } else {
+          handleSkip();
+        }
+      }
       if (e.ctrlKey && e.key === "z" && annotations.length > 0) {
         removeAnnotation(annotations.length - 1);
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [annotations]);
+  }, [annotations, drawingMode]);
 
   const handleSkuEdit = useCallback((skuId: string, field: string, value: string) => {
     const idx = annotations.findIndex((a) => a.payload?.sku_id === skuId && a.payload?.field === field);
@@ -85,12 +103,94 @@ export default function AnnotationPage() {
   }, [currentTask, addAnnotation]);
 
   const handleAddSku = useCallback(() => {
+    setAppendToSkuId(null);
+    setDrawingMode((prev) => !prev);
+  }, []);
+
+  const handleAppendBox = useCallback(() => {
+    if (!selectedSkuId) return;
+    setAppendToSkuId(selectedSkuId);
+    setDrawingMode(true);
+  }, [selectedSkuId]);
+
+  // Run OCR on a bbox region and update SKU attributes
+  const runOcr = useCallback(async (skuId: string, bbox: number[]) => {
+    if (!currentTask) return;
+    setOcrLoadingSkuIds((prev) => new Set(prev).add(skuId));
+    try {
+      const result = await jobsApi.ocrRegion(currentTask.job_id, currentTask.page_number, bbox);
+      // Merge attributes into the SKU
+      const currentSkus = skusRef.current;
+      const sku = currentSkus.find((s) => s.sku_id === skuId);
+      if (sku) {
+        const merged = { ...sku.attributes, ...result.attributes };
+        const updated = currentSkus.map((s) =>
+          s.sku_id === skuId ? { ...s, attributes: merged } : s
+        );
+        setSkus(updated as any);
+        // Update the annotation payload with OCR attributes
+        addAnnotation({
+          type: "SKU_ATTRIBUTE_CORRECTION",
+          annotator: currentTask.assigned_to || "",
+          payload: { sku_id: skuId, action: "ocr_fill", attributes: merged },
+        });
+      }
+      if (result.source_text) {
+        setSkuSourceTexts((prev) => ({
+          ...prev,
+          [skuId]: prev[skuId] ? `${prev[skuId]}\n---\n${result.source_text}` : result.source_text,
+        }));
+      }
+    } catch (e) {
+      console.error("OCR failed:", e);
+      notify({ type: "warning", message: "OCR 识别失败，可手动填写属性" });
+    } finally {
+      setOcrLoadingSkuIds((prev) => {
+        const next = new Set(prev);
+        next.delete(skuId);
+        return next;
+      });
+    }
+  }, [currentTask, setSkus, addAnnotation, notify]);
+
+  const handleBoxDrawn = useCallback((bbox: number[]) => {
+    setDrawingMode(false);
+
+    if (appendToSkuId) {
+      // Append bbox to existing SKU
+      setExtraBboxes((prev) => ({
+        ...prev,
+        [appendToSkuId]: [...(prev[appendToSkuId] || []), bbox],
+      }));
+      addAnnotation({
+        type: "SKU_ADD",
+        annotator: currentTask?.assigned_to || "",
+        payload: { action: "append_bbox", sku_id: appendToSkuId, bbox },
+      });
+      // Run OCR on new region
+      runOcr(appendToSkuId, bbox);
+      setAppendToSkuId(null);
+      return;
+    }
+
+    // Create new SKU
+    const skuId = `manual_${Date.now()}`;
+    const newSku = {
+      sku_id: skuId,
+      source_bbox: bbox,
+      validity: "valid",
+      attributes: {},
+    };
+    setSkus([...skus, newSku] as any);
     addAnnotation({
       type: "SKU_ADD",
       annotator: currentTask?.assigned_to || "",
-      payload: { action: "add", attributes: {} },
+      payload: { action: "add", bbox, sku_id: skuId, attributes: {} },
     });
-  }, [currentTask, addAnnotation]);
+    selectSku(skuId);
+    // Auto OCR
+    runOcr(skuId, bbox);
+  }, [skus, currentTask, addAnnotation, selectSku, setSkus, appendToSkuId, runOcr]);
 
   const handleSubmit = async () => {
     if (!skipSubmitConfirm) {
@@ -161,6 +261,9 @@ export default function AnnotationPage() {
           onSkip={handleSkip}
           onAddSku={handleAddSku}
           annotationCount={annotations.length}
+          drawingMode={drawingMode}
+          onAppendBox={handleAppendBox}
+          canAppendBox={!!selectedSkuId}
         />
       </div>
 
@@ -172,6 +275,9 @@ export default function AnnotationPage() {
             selectedSkuId={selectedSkuId}
             onSelectSku={selectSku}
             annotations={annotations}
+            drawingMode={drawingMode}
+            onBoxDrawn={handleBoxDrawn}
+            extraBboxes={extraBboxes}
           />
         </div>
 
@@ -184,6 +290,9 @@ export default function AnnotationPage() {
             onEditSku={handleSkuEdit}
             onToggleValidity={handleSkuValidityToggle}
             onRemoveAnnotation={removeAnnotation}
+            ocrLoadingSkuIds={ocrLoadingSkuIds}
+            skuSourceTexts={skuSourceTexts}
+            extraBboxes={extraBboxes}
           />
         </div>
       </div>

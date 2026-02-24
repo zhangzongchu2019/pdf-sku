@@ -28,6 +28,7 @@ from pdf_sku.common.models import (
 from pdf_sku.llm_adapter.client.registry import register as register_client
 from pdf_sku.llm_adapter.client.qwen import QwenClient
 from pdf_sku.llm_adapter.client.gemini import GeminiClient
+from pdf_sku.llm_adapter.client.openai_compat import OpenAICompatClient
 from pdf_sku.llm_adapter.service import LLMService
 from pdf_sku.llm_adapter.prompt.engine import PromptEngine
 from pdf_sku.llm_adapter.parser.response_parser import ResponseParser
@@ -40,20 +41,46 @@ from pdf_sku.pipeline.orchestrator import Orchestrator
 
 
 async def main() -> None:
-    os.environ.setdefault("JOB_DATA_DIR", str(ROOT / "data" / "jobs"))
+    os.environ.setdefault("JOB_DATA_DIR", "/data/jobs")
 
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
 
     if settings.gemini_api_key:
-        register_client("gemini", GeminiClient(
-            api_key=settings.gemini_api_key,
-            model=settings.gemini_model,
-            timeout=settings.llm_timeout_seconds,
-        ))
+        if settings.gemini_api_base:
+            register_client("gemini", OpenAICompatClient(
+                api_key=settings.gemini_api_key,
+                api_base=settings.gemini_api_base,
+                model=settings.gemini_model,
+                provider_name="laozhang.ai",
+                timeout=settings.llm_timeout_seconds,
+            ))
+        else:
+            register_client("gemini", GeminiClient(
+                api_key=settings.gemini_api_key,
+                model=settings.gemini_model,
+                timeout=settings.llm_timeout_seconds,
+            ))
     if settings.qwen_api_key:
-        register_client("qwen", QwenClient(
-            api_key=settings.qwen_api_key,
-            model=settings.qwen_model,
+        if settings.qwen_api_base:
+            register_client("qwen", OpenAICompatClient(
+                api_key=settings.qwen_api_key,
+                api_base=settings.qwen_api_base,
+                model=settings.qwen_model,
+                provider_name="laozhang.ai",
+                timeout=settings.llm_timeout_seconds,
+            ))
+        else:
+            register_client("qwen", QwenClient(
+                api_key=settings.qwen_api_key,
+                model=settings.qwen_model,
+                timeout=settings.llm_timeout_seconds,
+            ))
+    if settings.openrouter_api_key and settings.openrouter_model:
+        register_client("openrouter", OpenAICompatClient(
+            api_key=settings.openrouter_api_key,
+            api_base="https://openrouter.ai/api",
+            model=settings.openrouter_model,
+            provider_name="openrouter.ai",
             timeout=settings.llm_timeout_seconds,
         ))
 
@@ -63,7 +90,8 @@ async def main() -> None:
         circuit_breaker=CircuitBreaker(),
         budget_guard=BudgetGuard(redis),
         rate_limiter=RateLimiter(redis),
-        default_client_name="gemini" if settings.gemini_api_key else "qwen",
+        default_client_name=settings.default_llm_client or ("gemini" if settings.gemini_api_key else "qwen"),
+        redis=redis,
     )
 
     engine = create_async_engine(settings.database_url, pool_size=5, max_overflow=10, echo=False)

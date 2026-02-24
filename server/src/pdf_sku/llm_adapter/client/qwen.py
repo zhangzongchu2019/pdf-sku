@@ -40,6 +40,7 @@ class QwenClient(BaseLLMClient):
         max_tokens: int = 4096,
         json_mode: bool = False,
         images: list[bytes] | None = None,
+        timeout: float | None = None,
     ) -> LLMResponse:
         is_vl = "vl" in self._model.lower()
         messages = []
@@ -82,7 +83,9 @@ class QwenClient(BaseLLMClient):
 
         api_url = QWEN_VL_BASE if is_vl else QWEN_API_BASE
         start = time.monotonic()
-        resp = await self._client.post(api_url, json=params, headers=headers)
+        effective_timeout = httpx.Timeout(timeout) if timeout else None
+        resp = await self._client.post(api_url, json=params, headers=headers,
+                                       timeout=effective_timeout)
         latency = (time.monotonic() - start) * 1000
         resp.raise_for_status()
         data = resp.json()

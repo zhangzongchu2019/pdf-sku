@@ -1,8 +1,18 @@
 # PDF-SKU 系统模块间接口契约总表
 
-> **版本**: V1.2（对齐 OpenAPI V2.0 + 前端详设 V1.1）  
-> **来源**: TA V1.6 §2.4 Protocol 定义 + 各模块详设 V1.1/V1.2 + OpenAPI V2.0  
+> **版本**: V1.3（对齐 OpenAPI V2.0 + 前端详设 V1.1）
+> **日期**: 2026-02-24
+> **来源**: TA V1.6 §2.4 Protocol 定义 + 各模块详设 V1.1/V1.2 + OpenAPI V2.0
 > **原则**: 模块间仅通过 Protocol 接口交互，不直接依赖实现类
+
+---
+
+## V1.3 变更记录
+
+| 变更 | 来源 |
+|------|------|
+| §2.7 新增 OpenAICompatClient Protocol（通用 OpenAI 兼容客户端）| LLM Adapter V1.3 |
+| §2.3 SKUResult +product_id/variant_label 字段 | Pipeline IR V1.3 |
 
 ---
 
@@ -162,6 +172,8 @@ class SKUResult(BaseModel):
     validity: str           # valid | invalid
     source_bbox: list[float]
     confidence: float
+    product_id: str = ""    # [V1.3] 所属产品组 ID（同一产品的多个 SKU 变体共享）
+    variant_label: str = "" # [V1.3] 变体描述（如 "双人位"、"红色"）
 
 class ImageResult(BaseModel):
     image_id: str
@@ -317,6 +329,43 @@ class LLMService(Protocol):
 ```
 
 （签名与 V1.1 一致，内部行为变更见 LLM Adapter V1.2 详设）
+
+#### [V1.3 新增] OpenAICompatClient（通用 OpenAI 兼容客户端）
+
+```python
+class OpenAICompatClient(BaseLLMClient):
+    """通用 OpenAI 兼容客户端 Protocol。适用于 laozhang.ai / OpenRouter 等中转服务。"""
+
+    def __init__(
+        self,
+        api_key: str,
+        api_base: str,           # 服务基础 URL
+        model: str,              # 模型名（如 gemini-2.5-flash 或 google/gemini-2.5-flash）
+        provider_name: str = "", # 提供商后缀（如 laozhang.ai, openrouter.ai）
+        timeout: float = 60.0,
+    ): ...
+
+    async def complete(
+        self,
+        prompt: str,
+        system: str = "",
+        temperature: float = 0.1,
+        max_tokens: int = 4096,
+        json_mode: bool = False,
+        images: list[bytes] | None = None,
+        timeout: float | None = None,
+    ) -> LLMResponse: ...
+
+    @property
+    def model_id(self) -> str:
+        """返回 '{model}-{provider_name}' 格式，如 'gemini-2.5-flash-laozhang.ai'"""
+        ...
+
+    @property
+    def provider(self) -> str:
+        """返回 '{base_provider}-{provider_name}' 格式，如 'gemini-laozhang.ai'"""
+        ...
+```
 
 ### 2.8 FeedbackCollector（Feedback 模块）
 

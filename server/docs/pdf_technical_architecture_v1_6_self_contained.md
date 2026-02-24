@@ -1,16 +1,17 @@
 # PDF 自动分类与 SKU 提取系统 — 技术架构文档
 
-> **文档版本**: V1.7
+> **文档版本**: V1.8
 > **基线输入**: BRD V2.1 + 业务架构 V1.1
 > **文档目的**: 定义系统的技术架构、模块划分、数据存储、接口协议和部署方案，指导开发实施
 > **架构阶段**: V1（行业开拓期，预计 3-6 个月）
-> **自包含性**: V1.7 为完全独立可读文档，所有技术细节均已内联展开，无需查阅 V1.2 或更早版本。
+> **自包含性**: V1.8 为完全独立可读文档，所有技术细节均已内联展开，无需查阅 V1.2 或更早版本。
+> **V1.7→V1.8 变更**: 新增 OpenAI 兼容客户端（支持 laozhang.ai / OpenRouter 中转）；Product→SKU 两级层级模型；图片锚点空间聚类。
 > **V1.6→V1.7 变更**: Pipeline 并行化重构（删除串行/分片双模式，统一 Semaphore 并行）；Gateway 新增图片服务和页面详情端点；前端新增商品导入配置 UI + Job 详情增强（缩略图、SKU 图片预览、属性展开）。
 > **V1.5→V1.6 变更**: 综合 Cross Review + ChatGPT5.2 + Gemini3 + Kimi2.5 四份交叉审查反馈（34 项），修正 BRD/BA 一致性缺口。主要变更：
 > - **P0×8**：DEGRADED_HUMAN 终态修正；新增 images/sku_image_bindings/annotations/threshold_profiles/calibration_records 5 张表；新增 SKU/Image 状态机；不变式工程化；解析器许可证合规 Gate  
 > - **P1×18**：页级评估数据复用；预筛配置化+可解释；Fallback SKU 强制校验；对账轮询强化；Route/Status 一致性；评估报告可解释性；图片去重显性化；StorageProvider→OSS 优先级提升等  
 > - **P2×8**：BR/INV 编号交叉引用；ParsedPageIR 覆盖度；Shadow Mode；不变式自动审计等  
-> **变更记录**: 见附录 A（V1.0→V1.3 修订）、附录 B（V1.3→V1.5 修订）、附录 C（V1.5→V1.6 修订）
+> **变更记录**: 见附录 A（V1.0→V1.3 修订）、附录 B（V1.3→V1.5 修订）、附录 C（V1.5→V1.6 修订）、附录 D（V1.7→V1.8 修订）
 
 ---
 
@@ -203,12 +204,12 @@ flowchart LR
 |------|---------|-----------|--------------|
 | **Gateway** | 文件接收、安全检查、预筛、Job 创建（含 worker_id）、**心跳上报、孤儿任务重提** | PDFJob | T52 心跳+重提 |
 | **Evaluator** | 采样、评估、路由、缓存 | Evaluation | — |
-| **Pipeline** | 解析(PaddleOCR)、分类、两阶段SKU(含fallback)、绑定(歧义topK)、校验(规则可配置) | Page, SKU, **Image, SKUImageBinding** `[V1.6]` | T72,T74,T78,T84 |
+| **Pipeline** | 解析(PaddleOCR)、分类、两阶段SKU(含fallback)、绑定(歧义topK)、校验(规则可配置)、**图片锚点空间聚类+Product→SKU层级** `[V1.8]` | Page, SKU, **Image, SKUImageBinding** `[V1.6]` | T72,T74,T78,T84 |
 | **Collaboration** | 任务管理(**智能派单**)、状态+审计、锁+心跳、**回退/撤销、SLA自动升级** | HumanTask, **Annotation** `[V1.6]` | T73,T76,T79 |
 | **Output** | JSON 生成、图片导出、增量导入、对账 | — | T78 quality_warning |
 | **Feedback** | 标注采集、校准、属性升级 | **CalibrationRecord** `[V1.6:P1-2]` | — |
 | **Config** | 阈值/关键词/正则(**品类schema**)、**版本回溯**、PubSub广播 | **ThresholdProfile** `[V1.6:P1-1]` | T55,T81 |
-| **LLM Adapter** | 模型适配+熔断、Prompt(版本化+A/B+Few-shot+Anchoring)、防注入、**json_repair解析、Langfuse追踪** | — | T45↑,T71 |
+| **LLM Adapter** | 模型适配+熔断、Prompt(版本化+A/B+Few-shot+Anchoring)、防注入、**json_repair解析、Langfuse追踪**、**OpenAI 兼容中转（laozhang.ai/OpenRouter）** `[V1.8]` | — | T45↑,T71 |
 | **Auth** | JWT 签发/验证、密码哈希（pbkdf2_hmac）、RBAC 三角色权限（UploaderUser/AnnotatorUser/AdminUser） | User | V1.2 新增 |
 
 ### 2.3 模块间通信协议
@@ -1338,9 +1339,11 @@ async def process_page(job: PDFJob, page_no: int, attempt_no: int) -> PageResult
     needs_review = cls_result.confidence < profile.classification_thresholds.page_type_min_confidence
     
     # Phase 6: 两阶段 SKU 提取 + 单阶段 Fallback [T72:Kimi3]
+    # [V1.8] 图片锚点空间聚类：利用图片 bbox 坐标进行空间聚类，识别 Product 边界
+    # [V1.8] Product→SKU 层级：提取结果按 product_id 分组，每个 Product 下包含多个 SKU（variant_label 区分）
     if page_type == PageType.D and not needs_review:
         return PageResult(status=SKIPPED, page_type=PageType.D)
-    
+
     skus = []
     if page_type == PageType.A:
         skus = await table_parser.parse_and_extract(raw.tables, profile)
@@ -1348,8 +1351,10 @@ async def process_page(job: PDFJob, page_no: int, attempt_no: int) -> PageResult
         text_roles = await llm_adapter.classify_text(raw.text_blocks, screenshot, profile)
         image_roles = await llm_adapter.classify_images(processed_images, screenshot, profile)
         layout = await llm_adapter.classify_layout(screenshot, features, profile)
-        
+
         # 两阶段提取，失败率过高或结果为空时自动回退单阶段
+        # [V1.8] 阶段1 边界识别现支持图片锚点空间聚类：基于图片 bbox 的 y 坐标
+        # 进行层次聚类（阈值自适应），将页面划分为多个 Product 区域
         try:
             sku_boundaries = await sku_list_extractor.identify_boundaries(
                 raw.text_blocks, text_roles, screenshot, profile)
@@ -1679,15 +1684,42 @@ class CrossPageMerger:
 
 ```
 llm_adapter/
-├── client.py           # LLM Client + Fallback + 熔断器 [T42]
-├── prompt_engine.py    # Prompt（版本化+A/B+Few-shot+Anchoring）
-├── anchor_builder.py   # Document-Anchoring [T33]
-├── response_parser.py  # json_repair 优先 + 正则兜底 [T45↑:GLM-5]
-├── input_guard.py      # 防注入
-├── retry.py            # 指数退避重试
-├── langfuse_tracer.py  # Langfuse 全链路追踪 [T71:Kimi3]
+├── client/
+│   ├── base.py             # LLM Client 抽象基类 + Fallback + 熔断器 [T42]
+│   ├── gemini.py           # Gemini Native API 客户端
+│   ├── qwen.py             # Qwen Native API 客户端
+│   └── openai_compat.py    # 通用 OpenAI 兼容客户端，支持 laozhang.ai、OpenRouter 等中转服务 [V1.8]
+├── service.py              # LLM 服务编排（模型选择、fallback 链）
+├── provider_config.py      # Redis 后端的提供商运行时配置（超时、重试等）[V1.8]
+├── prompt_engine.py        # Prompt（版本化+A/B+Few-shot+Anchoring）
+├── anchor_builder.py       # Document-Anchoring [T33]
+├── response_parser.py      # json_repair 优先 + 正则兜底 [T45↑:GLM-5]
+├── input_guard.py          # 防注入
+├── retry.py                # 指数退避重试
+├── langfuse_tracer.py      # Langfuse 全链路追踪 [T71:Kimi3]
 └── prompts/
 ```
+
+**LLM 接入模式** `[V1.8]`：
+
+系统支持三种模型接入模式，通过 `*_API_BASE` 环境变量和 `provider_config.py` 统一管理：
+
+| 模式 | 说明 | 示例 |
+|------|------|------|
+| **直连（Native API）** | 直接调用模型厂商官方 API | `gemini.py` → Google AI、`qwen.py` → 阿里云 DashScope |
+| **中转（laozhang.ai）** | 通过 laozhang.ai 中转服务访问多种模型，使用 OpenAI 兼容协议 | `openai_compat.py` + `GEMINI_API_BASE=https://api.laozhang.ai/v1` |
+| **聚合（OpenRouter）** | 通过 OpenRouter 统一接入多模型，自动负载均衡 | `openai_compat.py` + `OPENROUTER_API_KEY` + `OPENROUTER_MODEL` |
+
+**模型命名约定**：带提供商后缀以区分接入路径，例如 `gemini-2.5-flash-laozhang.ai` 表示通过 laozhang.ai 中转调用 Gemini 2.5 Flash。
+
+**新增环境变量** `[V1.8]`：
+
+| 变量名 | 用途 | 示例值 |
+|--------|------|--------|
+| `GEMINI_API_BASE` | Gemini API 基础 URL（留空则使用官方直连） | `https://api.laozhang.ai/v1` |
+| `QWEN_API_BASE` | Qwen API 基础 URL（留空则使用 DashScope 直连） | `https://api.laozhang.ai/v1` |
+| `OPENROUTER_API_KEY` | OpenRouter API 密钥 | `sk-or-...` |
+| `OPENROUTER_MODEL` | OpenRouter 默认模型 | `google/gemini-2.5-flash` |
 
 **Langfuse 集成** `[T71:Kimi3 + GLM-5]`：
 
@@ -2621,6 +2653,8 @@ CREATE TABLE skus (
     sku_id              TEXT NOT NULL,
     job_id              UUID NOT NULL REFERENCES pdf_jobs(job_id),
     page_number         INT NOT NULL,
+    product_id          TEXT,                              -- [V1.8] Product→SKU 层级：商品 ID，同一商品下多个 SKU 共享
+    variant_label       TEXT,                              -- [V1.8] SKU 变体标签（如颜色/尺寸），用于 Product 内区分
     attempt_no          INT NOT NULL DEFAULT 1,
     revision            INT NOT NULL DEFAULT 1,
     validity            TEXT NOT NULL,
@@ -2639,6 +2673,7 @@ CREATE TABLE skus (
 CREATE INDEX idx_skus_job ON skus(job_id);
 CREATE INDEX idx_skus_status ON skus(status);
 CREATE UNIQUE INDEX idx_skus_active ON skus(sku_id) WHERE superseded = false;
+CREATE INDEX idx_skus_product ON skus(job_id, product_id);  -- [V1.8] Product→SKU 层级查询
 
 -- ========================================
 -- HumanTask: 人工任务
@@ -4321,3 +4356,23 @@ tech_debt_check:
 | GPT | ChatGPT 5.2 | 不变式工程化闭环、可观测性、端到端一致性 |
 | Gemini | Gemini 3 | 宏观架构确认、扩展瓶颈识别 |
 | Kimi | Kimi 2.5 | 成本风险分析、Fallback 校验、SLA 保障 |
+
+---
+
+## 附录 D：V1.7 → V1.8 修订历史
+
+> **版本**: V1.8（2026-02-24）
+> **主要变更**: 新增 OpenAI 兼容客户端（支持 laozhang.ai / OpenRouter 中转）；Product→SKU 两级层级模型；图片锚点空间聚类
+
+| # | 修订内容 | 章节 |
+|---|---------|------|
+| **D-1** | LLM Adapter 重构：`client.py` 拆分为 `client/` 子包（`base.py`、`gemini.py`、`qwen.py`、`openai_compat.py`）；新增 `service.py` 编排层 | §3.4 |
+| **D-2** | 新增 `openai_compat.py`：通用 OpenAI 兼容客户端，支持 laozhang.ai、OpenRouter 等中转服务 | §3.4 |
+| **D-3** | 新增 `provider_config.py`：Redis 后端的提供商运行时配置（超时、重试等） | §3.4 |
+| **D-4** | 文档化三种 LLM 接入模式：直连（Native API）、中转（laozhang.ai）、聚合（OpenRouter） | §3.4 |
+| **D-5** | 模型命名约定：带提供商后缀（如 `gemini-2.5-flash-laozhang.ai`） | §3.4 |
+| **D-6** | 新增环境变量：`GEMINI_API_BASE`、`QWEN_API_BASE`、`OPENROUTER_API_KEY`、`OPENROUTER_MODEL` | §3.4 |
+| **D-7** | skus 表新增 `product_id`、`variant_label` 列，支持 Product→SKU 两级层级模型 | §4.2 |
+| **D-8** | 新增复合索引 `idx_skus_product(job_id, product_id)` | §4.2 |
+| **D-9** | Pipeline 阶段1 边界识别支持图片锚点空间聚类（基于图片 bbox y 坐标层次聚类） | §3.3 |
+| **D-10** | Pipeline 提取输出支持 Product→SKU 层级分组 | §3.3 |

@@ -1,9 +1,13 @@
 # LLM Adapter 模块详细设计
 
-> **文档版本**: V1.2  
-> **上游依赖**: TA V1.6 §3.4 + §2.4 + §2.5 | BRD V2.1 §12 (Token 预算) | BA V1.1  
-> **模块定位**: 防腐层 — 隔离大模型供应商差异，提供统一调用接口 + 熔断 + 限流 + Prompt 管理 + 响应修复 + 可观测  
-> **设计原则**: 模型无关性（T60）、快速降级（宁可转人工也不卡住）、全链路可追踪  
+> **文档版本**: V1.3
+> **更新日期**: 2026-02-24
+> **上游依赖**: TA V1.6 §3.4 + §2.4 + §2.5 | BRD V2.1 §12 (Token 预算) | BA V1.1
+> **模块定位**: 防腐层 — 隔离大模型供应商差异，提供统一调用接口 + 熔断 + 限流 + Prompt 管理 + 响应修复 + 可观测
+> **设计原则**: 模型无关性（T60）、快速降级（宁可转人工也不卡住）、全链路可追踪
+> **V1.2→V1.3 变更摘要**:
+> - 新增 OpenAI 兼容客户端架构，支持 laozhang.ai / OpenRouter 等中转服务；新增 Provider Config 动态配置模块
+>
 > **V1.1→V1.2 变更摘要**（来源：六方模型交叉评审 — ChatGPT 5.2 / Kimi 2.5 / Gemini 3 / QWen3 / DeepSeek / GLM-5）:
 > - **P0×2**: 熔断器 HALF_OPEN 探测 +1 边界修复; regex_fallback 强制 `needs_review` 防伪成功
 > - **P1×7**: HALF_OPEN 超时兜底; Redis 不可用本地降级; `force_model` 预算校验; 预算 reserve→commit/rollback; 注入 risk_score 分级响应; 单页 LLM 调用硬上限; Few-shot quality_score 过滤
@@ -17,7 +21,7 @@
 
 | 职责 | 说明 | 对齐 |
 |------|------|------|
-| **统一调用接口** | 屏蔽 Gemini / Qwen API 差异，提供 7 个业务方法 | TA §2.4 LLMService Protocol |
+| **统一调用接口** | 屏蔽 Gemini / Qwen / OpenAI 兼容 API 差异，提供 7 个业务方法；支持直连/中转/聚合三种接入模式 `[V1.3:D1/D2]` | TA §2.4 LLMService Protocol |
 | **动态模型路由** | 按 operation × 页面类型 × 复杂度选择模型，预算超限强制降级，**语义失败计数影响路由** `[V1.2:C10/G1]` | TA Q1 LLMRouter |
 | **熔断器** | 主力模型连续失败 → fallback → 全熔断 → 渐进恢复。Redis Lua 原子操作，跨实例同步；**HALF_OPEN 超时兜底 + Redis 不可用本地降级** `[V1.2:C3/C4]` | TA T42 |
 | **全局限流** | Redis Lua 原子 QPM/TPM 限流，**合并 Lua 脚本失败不记数** `[V1.2:C8]` | TA D5 |
@@ -52,13 +56,18 @@ graph LR
     LA --> Redis[(Redis<br/>限流/熔断/预算<br/>Few-shot缓存)]
     LA --> DB[(PostgreSQL<br/>Few-shot 示例)]
     LA --> Langfuse[(Langfuse<br/>Trace 存储)]
-    LA --> Gemini([Gemini 2.5 Pro])
-    LA --> Qwen([Qwen-VL Max])
+    LA --> Gemini([Gemini 2.5 Pro<br/>直连])
+    LA --> Qwen([Qwen-VL Max<br/>直连])
+    LA --> Relay([laozhang.ai<br/>OpenAI 兼容中转])
+    LA --> Agg([OpenRouter<br/>OpenAI 兼容聚合])
     LA --> Config[ConfigProvider<br/>Secret Manager]
+    LA --> ProvCfg[(Redis<br/>ProviderConfig)]
 
     style LA fill:#1a1f2c,stroke:#FF8C42,color:#E2E8F4
     style Gemini fill:#2d3748,stroke:#00D4AA,color:#E2E8F4
     style Qwen fill:#2d3748,stroke:#5B8DEF,color:#E2E8F4
+    style Relay fill:#2d3748,stroke:#FFD700,color:#E2E8F4
+    style Agg fill:#2d3748,stroke:#FF6B6B,color:#E2E8F4
 ```
 
 ---
@@ -74,9 +83,12 @@ app/
 │   ├── client/
 │   │   ├── __init__.py
 │   │   ├── base.py            # BaseLLMClient ABC
-│   │   ├── gemini_client.py   # Gemini 2.5 Pro 适配
+│   │   ├── gemini_client.py   # Gemini 2.5 Pro 原生直连适配（代理/中转使用 OpenAICompatClient）
 │   │   ├── qwen_client.py     # Qwen-VL Max 适配
+│   │   ├── openai_compat.py   # 通用 OpenAI 兼容客户端（laozhang.ai / OpenRouter 等）[V1.3]
 │   │   └── model_registry.py  # 模型注册表（含定价元数据）
+│   │
+│   ├── provider_config.py       # LLMProviderConfig 动态配置（Redis 持久化）[V1.3]
 │   │
 │   ├── router.py              # 动态模型路由（含语义失败感知）[V1.2: G1]
 │   ├── circuit_breaker.py     # 熔断器（+1 修复 + HALF_OPEN 超时 + Redis 降级）[V1.2: C1/C3/C4]
@@ -1839,6 +1851,145 @@ class DocumentAnchorBuilder:
         return "\n".join(anchored)
 ```
 
+### 5.13 OpenAICompatClient — 通用 OpenAI 兼容客户端 `[V1.3]`
+
+`client/openai_compat.py` — 支持任意实现了 `/v1/chat/completions` 的 API 服务（如 laozhang.ai、OpenRouter 等中转/聚合平台）。
+
+**构造参数：**
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `api_key` | `str` | API 密钥 |
+| `api_base` | `str` | 服务端点（如 `https://api.laozhang.ai/v1`） |
+| `model` | `str` | 模型标识（如 `gemini-2.5-flash`） |
+| `provider_name` | `str` | 日志/监控后缀标识（如 `laozhang.ai`、`openrouter.ai`） |
+| `timeout` | `int` | 请求超时秒数 |
+
+**关键属性/行为：**
+
+- `model_id` 属性自动附加 `provider_name` 后缀，用于区分来源（如 `gemini-2.5-flash-laozhang.ai`）
+- `provider` 属性根据模型名推断基础 provider（`gemini` / `qwen` / `claude`）并附加后缀（如 `gemini-laozhang.ai`）
+- 支持 vision：图片 base64 自动转换为 `image_url` 格式（`data:image/png;base64,...`）
+- 支持 JSON mode：通过 `response_format: {"type": "json_object"}` 启用
+- 自动重试：继承 `BaseLLMClient` 的重试策略
+
+```python
+# client/openai_compat.py
+
+class OpenAICompatClient(BaseLLMClient):
+    """通用 OpenAI 兼容客户端，适配中转/聚合服务。"""
+
+    def __init__(
+        self,
+        api_key: str,
+        api_base: str,
+        model: str,
+        provider_name: str = "",
+        timeout: int = 120,
+    ):
+        self._api_key = api_key
+        self._api_base = api_base.rstrip("/")
+        self._model = model
+        self._provider_name = provider_name
+        self._timeout = timeout
+
+    @property
+    def model_id(self) -> str:
+        suffix = f"-{self._provider_name}" if self._provider_name else ""
+        return f"{self._model}{suffix}"
+
+    @property
+    def provider(self) -> str:
+        # 根据模型名推断基础 provider
+        base = "unknown"
+        if "gemini" in self._model:
+            base = "gemini"
+        elif "qwen" in self._model:
+            base = "qwen"
+        elif "claude" in self._model:
+            base = "claude"
+        suffix = f"-{self._provider_name}" if self._provider_name else ""
+        return f"{base}{suffix}"
+
+    async def generate(self, prompt, images=None, json_mode=False, ...) -> RawResponse:
+        messages = self._build_messages(prompt, images)
+        payload = {
+            "model": self._model,
+            "messages": messages,
+            "temperature": 0.2,
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        # POST → {api_base}/chat/completions
+        ...
+```
+
+### 5.14 多 Provider 接入架构 `[V1.3]`
+
+系统支持三种接入模式，按需选择：
+
+| 模式 | 实现类 | 典型场景 | 示例 |
+|------|--------|---------|------|
+| **直连** | `GeminiClient` / `QwenClient` | 已有原生 API Key，直接调用供应商 API | Google AI / 阿里云 |
+| **中转** | `OpenAICompatClient` via laozhang.ai | 通过中转服务调用，统一付费和配额管理 | laozhang.ai |
+| **聚合** | `OpenAICompatClient` via OpenRouter | 通过聚合平台动态选择模型 | OpenRouter |
+
+**注册逻辑**（`main.py`）：
+
+```python
+# 注册模型客户端时的判断逻辑
+# 有 api_base → 使用 OpenAICompatClient（中转/聚合模式）
+# 无 api_base → 使用原生客户端（直连模式）
+
+if settings.GEMINI_API_BASE:
+    client = OpenAICompatClient(
+        api_key=settings.GEMINI_API_KEY,
+        api_base=settings.GEMINI_API_BASE,
+        model=settings.GEMINI_MODEL,
+        provider_name=_extract_provider(settings.GEMINI_API_BASE),
+    )
+else:
+    client = GeminiClient(api_key=settings.GEMINI_API_KEY, ...)
+```
+
+**相关环境变量**（`settings.py`）：
+
+| 环境变量 | 说明 | 示例 |
+|---------|------|------|
+| `GEMINI_API_BASE` | Gemini 中转端点（留空则直连） | `https://api.laozhang.ai/v1` |
+| `QWEN_API_BASE` | Qwen 中转端点（留空则直连） | `https://api.laozhang.ai/v1` |
+| `OPENROUTER_API_KEY` | OpenRouter API Key | `sk-or-...` |
+| `OPENROUTER_MODEL` | OpenRouter 模型标识 | `google/gemini-2.5-flash` |
+
+### 5.15 ProviderConfig — 动态配置模块 `[V1.3]`
+
+`provider_config.py` — 提供 LLM Provider 级别的运行时动态配置，支持不重启服务热更新。
+
+**数据类：**
+
+```python
+# provider_config.py
+
+@dataclass
+class LLMProviderConfig:
+    timeout_seconds: int          # 常规请求超时
+    vlm_timeout_seconds: int      # VLM（视觉）请求超时
+    max_retries: int              # 最大重试次数
+```
+
+**存储后端：**
+
+- **主存储**: Redis（Hash 结构），Key 格式 `pdf_sku:provider_config:{provider_name}`
+- **兜底**: 代码内置默认值，Redis 不可用或无配置时自动降级
+
+**API：**
+
+| 方法 | 说明 |
+|------|------|
+| `get_provider_config(provider_name) -> LLMProviderConfig` | 获取指定 Provider 配置，Redis 未命中时返回代码默认值 |
+| `set_provider_config(provider_name, config)` | 写入/更新 Provider 配置到 Redis |
+| `list_provider_configs() -> dict[str, LLMProviderConfig]` | 列出所有已配置的 Provider |
+
 ---
 
 ## 6. 数据流 — 请求/响应 DTO
@@ -2027,6 +2178,12 @@ class LLMAdapterConfig(BaseSettings):
     qwen_timeout_sec: int = 90
     qwen_max_images: int = 8
 
+    # OpenAI 兼容中转/聚合 [V1.3]
+    gemini_api_base: str = ""               # 留空则直连 Google API
+    qwen_api_base: str = ""                 # 留空则直连阿里云 API
+    openrouter_api_key: SecretStr = SecretStr("")
+    openrouter_model: str = ""
+
     # 熔断器 [V1.2:C1/C3/C4]
     circuit_failure_threshold: int = 5
     circuit_recovery_timeout_sec: int = 60
@@ -2099,6 +2256,7 @@ class LLMAdapterConfig(BaseSettings):
 | `pdf_sku:budget:merchant:{id}:{date}` | TokenBudgetGuard | 2d | [C14] 整数(micro) |
 | `pdf_sku:circuit:{model}` | CircuitBreaker | 7d | [C1/C3] +half_open_since |
 | `pdf_sku:fewshot:{template}:{category}` | PromptEngine | 300s | — |
+| `pdf_sku:provider_config:{provider_name}` | ProviderConfig | 永久 | [V1.3:D3] 新增 |
 
 ---
 
@@ -2200,9 +2358,11 @@ experiments:
 |------|---------|--------|----------|
 | `service.py` | ~400 | P0 | +硬上限 + force_model 预算 + reserve/commit + 注入分级 + 截断标记 |
 | `client/base.py` | ~40 | P0 | — |
-| `client/gemini_client.py` | ~130 | P0 | — |
+| `client/gemini_client.py` | ~130 | P0 | 仅原生直连；代理/中转改用 OpenAICompatClient `[V1.3]` |
 | `client/qwen_client.py` | ~130 | P0 | — |
+| `client/openai_compat.py` | ~150 | P0 | **[V1.3] 新增** |
 | `client/model_registry.py` | ~80 | P0 | — |
+| `provider_config.py` | ~100 | P1 | **[V1.3] 新增** |
 | `router.py` | ~150 | P0 | +semantic_failure_count + force_model 预算约束 |
 | `circuit_breaker.py` | ~220 | P0 | **Lua +1 修复 + HALF_OPEN 超时 + Redis 降级** |
 | `rate_limiter.py` | ~100 | P0 | **合并 Lua + 分钟分桶** |
@@ -2221,7 +2381,7 @@ experiments:
 | `constants.py` | ~90 | P0 | +硬上限 + 语义阈值 + 注入阈值 + quality_score |
 | `templates/v1/*.j2` (×7) | ~350 | P0 | — |
 | `templates/experiment.yaml` | ~25 | P1 | +Job 级分桶说明 |
-| **总计** | **~2900** | — | 较 V1.1 增加 ~260 行 |
+| **总计** | **~3150** | — | 较 V1.2 增加 ~250 行（OpenAICompatClient + ProviderConfig） |
 
 ---
 
@@ -2259,3 +2419,15 @@ experiments:
 | DeepSeek | 1 | 0 | 0 | 1 |
 | Gemini 3 | 1 | 0 | 1 | 0 |
 | **合计** | **18** | **2** | **7** | **9** |
+
+---
+
+## 附录 B：V1.2→V1.3 变更追踪
+
+| # | 优先级 | 变更 | 位置 |
+|---|--------|------|------|
+| D1 | **P0** | 新增 `OpenAICompatClient` 通用 OpenAI 兼容客户端 | §5.13 |
+| D2 | **P0** | 多 Provider 接入架构（直连/中转/聚合三模式） | §5.14 |
+| D3 | P1 | `provider_config.py` 动态配置模块（Redis 持久化 + 代码兜底） | §5.15 |
+| D4 | P1 | `GeminiClient` 定位调整：仅用于原生 Google API 直连 | §2 目录结构 + §13 交付清单 |
+| D5 | P1 | 新增中转/聚合相关环境变量配置 | §9 配置项 |

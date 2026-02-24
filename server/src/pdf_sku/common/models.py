@@ -197,11 +197,17 @@ class SKU(Base):
     attribute_source: Mapped[str] = mapped_column(Text, default="AI_EXTRACTED")
     import_status: Mapped[str] = mapped_column(Text, default="pending")
     import_confirmation: Mapped[str] = mapped_column(Text, default="pending")
+    product_id: Mapped[str | None] = mapped_column(Text)
+    variant_label: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(Text, nullable=False, default="EXTRACTED")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
-    __table_args__ = (Index("idx_skus_job", "job_id"), Index("idx_skus_status", "status"))
+    __table_args__ = (
+        Index("idx_skus_job", "job_id"),
+        Index("idx_skus_status", "status"),
+        Index("idx_skus_product", "job_id", "product_id"),
+    )
 
 
 class Image(Base):

@@ -85,6 +85,8 @@ class SKUImageBinder:
                 ))
                 logger.debug("binding_ambiguous",
                              sku_id=sku.sku_id, top_k=len(candidates[:TOP_K]))
+        # 同一 product_id 的 SKU 统一绑定到组内最高置信度图片
+        self._unify_product_bindings(skus, results)
         return results
 
     @staticmethod
@@ -99,6 +101,41 @@ class SKUImageBinder:
         cx2 = (bbox2[0] + bbox2[2]) / 2
         cy2 = (bbox2[1] + bbox2[3]) / 2
         return math.sqrt((cx1 - cx2) ** 2 + (cy1 - cy2) ** 2)
+
+    @staticmethod
+    def _unify_product_bindings(
+        skus: list[SKUResult],
+        results: list[BindingResult],
+    ) -> None:
+        """同一 product_id 的 SKU 统一使用组内置信度最高的绑定图片。"""
+        # 建立 sku_id → product_id 映射
+        pid_map: dict[str, str] = {}
+        for sku in skus:
+            if sku.product_id and sku.sku_id:
+                pid_map[sku.sku_id] = sku.product_id
+
+        # 按 product_id 分组，找最高置信度的绑定
+        from collections import defaultdict
+        groups: dict[str, list[BindingResult]] = defaultdict(list)
+        for br in results:
+            pid = pid_map.get(br.sku_id)
+            if pid:
+                groups[pid].append(br)
+
+        for pid, bindings in groups.items():
+            # 找组内有图片且置信度最高的绑定
+            best = max(
+                (b for b in bindings if b.image_id),
+                key=lambda b: b.confidence,
+                default=None,
+            )
+            if best:
+                for b in bindings:
+                    if not b.image_id:
+                        b.image_id = best.image_id
+                        b.confidence = best.confidence * 0.9
+                        b.method = "product_group"
+                        b.is_ambiguous = False
 
     @staticmethod
     def _infer_method(sku: SKUResult, img: ImageInfo, layout_type: str) -> str:

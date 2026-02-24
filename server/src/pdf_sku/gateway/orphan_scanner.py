@@ -4,9 +4,11 @@
 运行方式: APScheduler interval=60s
 流程:
 1. SCAN Redis worker:heartbeat:* → 存活集合
-2. 查 DB: status IN (EVALUATING, PROCESSING) AND worker_id NOT IN alive_set → 孤儿
+2. 查 DB: status IN (UPLOADED, EVALUATING, PROCESSING) AND worker_id NOT IN alive_set → 孤儿
 3. 标记 ORPHANED + state_transition
 4. 冷却 5min 后自动 requeue (最多 3 次)
+   - UPLOADED 来源的孤儿 → 重新触发评估 (发布 JobCreated 事件)
+   - 其他来源的孤儿 → 恢复到 PROCESSING 继续处理
 """
 from __future__ import annotations
 import asyncio
@@ -90,8 +92,9 @@ class OrphanScanner:
         return alive
 
     async def _find_orphans(self, db: AsyncSession, alive_workers: set[str]) -> list[PDFJob]:
-        """查询 worker 已失联的活跃 Job。"""
+        """查询 worker 已失联的活跃 Job（含 UPLOADED 未触发评估的情况）。"""
         active_statuses = [
+            JobInternalStatus.UPLOADED.value,
             JobInternalStatus.EVALUATING.value,
             JobInternalStatus.PROCESSING.value,
         ]
@@ -141,29 +144,67 @@ class OrphanScanner:
                     # 选择负载最低的 Worker (简化: 随机选)
                     new_worker = next(iter(current_alive))
                     old_status = job.status
-                    job.status = JobInternalStatus.PROCESSING.value
-                    job.worker_id = new_worker
-                    db.add(StateTransition(
-                        entity_type="job",
-                        entity_id=str(job.job_id),
-                        from_status=old_status,
-                        to_status=JobInternalStatus.PROCESSING.value,
-                        trigger="auto_requeue",
-                    ))
 
-                    # 更新 Redis 路由
-                    await self._redis.set(
-                        f"job_worker:{job.job_id}", new_worker, ex=86400 * 7
-                    )
-
-                    await event_bus.publish("JobRequeued", {
-                        "job_id": str(job.job_id),
-                        "new_worker": new_worker,
-                        "checkpoint_page": job.checkpoint_page,
-                    })
-
-                    logger.info("orphan_requeued",
-                                job_id=job_id, new_worker=new_worker)
+                    # UPLOADED 阶段的孤儿：重新触发评估流程
+                    # 其他阶段：恢复到 PROCESSING 继续处理
+                    orphan_origin = await self._get_orphan_origin(db, job_id)
+                    if orphan_origin == JobInternalStatus.UPLOADED.value:
+                        job.status = JobInternalStatus.UPLOADED.value
+                        job.worker_id = new_worker
+                        db.add(StateTransition(
+                            entity_type="job",
+                            entity_id=str(job.job_id),
+                            from_status=old_status,
+                            to_status=JobInternalStatus.UPLOADED.value,
+                            trigger="auto_requeue_eval",
+                        ))
+                        # 更新 Redis 路由
+                        await self._redis.set(
+                            f"job_worker:{job.job_id}", new_worker, ex=86400 * 7
+                        )
+                        # 重新触发评估
+                        await event_bus.publish("JobCreated", {
+                            "job_id": str(job.job_id),
+                            "prescan": job.processing_trace.get("prescan", {}) if job.processing_trace else {},
+                        })
+                        logger.info("orphan_requeued_to_eval",
+                                    job_id=job_id, new_worker=new_worker)
+                    else:
+                        job.status = JobInternalStatus.PROCESSING.value
+                        job.worker_id = new_worker
+                        db.add(StateTransition(
+                            entity_type="job",
+                            entity_id=str(job.job_id),
+                            from_status=old_status,
+                            to_status=JobInternalStatus.PROCESSING.value,
+                            trigger="auto_requeue",
+                        ))
+                        # 更新 Redis 路由
+                        await self._redis.set(
+                            f"job_worker:{job.job_id}", new_worker, ex=86400 * 7
+                        )
+                        await event_bus.publish("JobRequeued", {
+                            "job_id": str(job.job_id),
+                            "new_worker": new_worker,
+                            "checkpoint_page": job.checkpoint_page,
+                        })
+                        logger.info("orphan_requeued",
+                                    job_id=job_id, new_worker=new_worker)
 
         except Exception:
             logger.exception("auto_requeue_failed", job_id=job_id)
+
+    async def _get_orphan_origin(self, db: AsyncSession, job_id: str) -> str | None:
+        """查询孤儿 Job 被标记前的原始状态。"""
+        result = await db.execute(
+            select(StateTransition.from_status)
+            .where(
+                StateTransition.entity_type == "job",
+                StateTransition.entity_id == job_id,
+                StateTransition.to_status == JobInternalStatus.ORPHANED.value,
+            )
+            .order_by(StateTransition.transitioned_at.desc())
+            .limit(1)
+        )
+        row = result.scalar_one_or_none()
+        return row

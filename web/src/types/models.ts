@@ -123,6 +123,8 @@ export interface SKU {
   attribute_source: "AI_EXTRACTED" | "HUMAN_CORRECTED" | "CROSS_PAGE_MERGED" | "PROMOTED";
   status: SKUStatus;
   images: SKUImage[];
+  product_id?: string;
+  variant_label?: string;
 }
 
 /* ======== Task ======== */

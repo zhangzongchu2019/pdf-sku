@@ -43,6 +43,7 @@ class BaseLLMClient(ABC):
         max_tokens: int = 4096,
         json_mode: bool = False,
         images: list[bytes] | None = None,
+        timeout: float | None = None,
     ) -> LLMResponse:
         """发送 completion 请求。"""
         ...

@@ -133,21 +133,54 @@ async def lifespan(app: FastAPI):
             # LLM Clients
             from pdf_sku.llm_adapter.client.registry import register as register_client
             if settings.gemini_api_key:
-                from pdf_sku.llm_adapter.client.gemini import GeminiClient
-                register_client("gemini", GeminiClient(
-                    api_key=settings.gemini_api_key,
-                    model=settings.gemini_model,
-                    timeout=settings.llm_timeout_seconds,
-                ))
-                log.info("llm_registered", client="gemini")
+                if settings.gemini_api_base:
+                    from pdf_sku.llm_adapter.client.openai_compat import OpenAICompatClient
+                    register_client("gemini", OpenAICompatClient(
+                        api_key=settings.gemini_api_key,
+                        api_base=settings.gemini_api_base,
+                        model=settings.gemini_model,
+                        provider_name="laozhang.ai",
+                        timeout=settings.llm_timeout_seconds,
+                    ))
+                else:
+                    from pdf_sku.llm_adapter.client.gemini import GeminiClient
+                    register_client("gemini", GeminiClient(
+                        api_key=settings.gemini_api_key,
+                        model=settings.gemini_model,
+                        timeout=settings.llm_timeout_seconds,
+                    ))
+                log.info("llm_registered", client="gemini",
+                         via=settings.gemini_api_base or "native")
             if settings.qwen_api_key:
-                from pdf_sku.llm_adapter.client.qwen import QwenClient
-                register_client("qwen", QwenClient(
-                    api_key=settings.qwen_api_key,
-                    model=settings.qwen_model,
+                if settings.qwen_api_base:
+                    from pdf_sku.llm_adapter.client.openai_compat import OpenAICompatClient as _OAC
+                    register_client("qwen", _OAC(
+                        api_key=settings.qwen_api_key,
+                        api_base=settings.qwen_api_base,
+                        model=settings.qwen_model,
+                        provider_name="laozhang.ai",
+                        timeout=settings.llm_timeout_seconds,
+                    ))
+                else:
+                    from pdf_sku.llm_adapter.client.qwen import QwenClient
+                    register_client("qwen", QwenClient(
+                        api_key=settings.qwen_api_key,
+                        model=settings.qwen_model,
+                        timeout=settings.llm_timeout_seconds,
+                    ))
+                log.info("llm_registered", client="qwen",
+                         via=settings.qwen_api_base or "native")
+            if settings.openrouter_api_key and settings.openrouter_model:
+                from pdf_sku.llm_adapter.client.openai_compat import OpenAICompatClient as _OAC2
+                register_client("openrouter", _OAC2(
+                    api_key=settings.openrouter_api_key,
+                    api_base="https://openrouter.ai/api",
+                    model=settings.openrouter_model,
+                    provider_name="openrouter.ai",
                     timeout=settings.llm_timeout_seconds,
                 ))
-                log.info("llm_registered", client="qwen")
+                log.info("llm_registered", client="openrouter",
+                         model=settings.openrouter_model)
 
             # LLM Service
             from pdf_sku.llm_adapter.service import LLMService
@@ -163,8 +196,10 @@ async def lifespan(app: FastAPI):
                 circuit_breaker=CircuitBreaker(),
                 budget_guard=BudgetGuard(redis) if settings.gemini_api_key else None,
                 rate_limiter=RateLimiter(redis) if settings.gemini_api_key else None,
-                default_client_name="gemini" if settings.gemini_api_key else "qwen",
+                default_client_name=settings.default_llm_client or ("gemini" if settings.gemini_api_key else "qwen"),
+                redis=redis,
             )
+            deps.llm_service = llm_service
 
             # Evaluator
             from pdf_sku.evaluator.eval_cache import EvalCache
@@ -193,6 +228,7 @@ async def lifespan(app: FastAPI):
                     config_provider=ConfigProvider(),
                 ),
                 db_session_factory=session_factory,
+                redis=app.state.redis,
             )
 
             from pdf_sku.pipeline._handler import init_handler as init_pipeline_handler

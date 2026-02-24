@@ -23,7 +23,7 @@ import structlog
 
 logger = structlog.get_logger()
 
-REVERTABLE_STATUSES = {"COMPLETED", "SKIPPED"}
+REVERTABLE_STATUSES = {"COMPLETED", "SKIPPED", "PROCESSING"}
 MAX_REWORK_COUNT = 5
 
 # 合法状态转换
@@ -136,12 +136,12 @@ class TaskManager:
             trigger="complete", operator=operator,
         ))
 
-        # 更新 Page 状态
+        # 更新 Page 状态（人工完成 → HUMAN_COMPLETED）
         await db.execute(
             update(Page).where(
                 Page.job_id == task.job_id,
                 Page.page_number == task.page_number,
-            ).values(status=PageStatus.AI_COMPLETED.value)
+            ).values(status=PageStatus.HUMAN_COMPLETED.value)
         )
 
         logger.info("task_completed", task_id=task_id, operator=operator)
@@ -205,19 +205,25 @@ class TaskManager:
                 f"Cannot revert task in status '{task.status}', "
                 f"allowed: {REVERTABLE_STATUSES}")
 
-        if (task.rework_count or 0) >= MAX_REWORK_COUNT:
+        # PROCESSING → CREATED 是释放锁（不算 rework），其它状态才是真正的返工
+        is_release = task.status == "PROCESSING"
+
+        if not is_release and (task.rework_count or 0) >= MAX_REWORK_COUNT:
             raise ValueError(
                 f"Max rework count ({MAX_REWORK_COUNT}) exceeded")
 
+        values: dict = {
+            "status": "CREATED",
+            "locked_by": None,
+            "locked_at": None,
+            "result": None,
+        }
+        if not is_release:
+            values["rework_count"] = HumanTask.rework_count + 1
+
         await db.execute(
             update(HumanTask).where(HumanTask.task_id == UUID(task_id))
-            .values(
-                status="CREATED",
-                locked_by=None,
-                locked_at=None,
-                result=None,
-                rework_count=HumanTask.rework_count + 1,
-            )
+            .values(**values)
         )
 
         db.add(StateTransition(

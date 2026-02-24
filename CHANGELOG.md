@@ -1,5 +1,31 @@
 # Changelog
 
+## V0.3.0 (2026-02-24)
+
+### 新功能
+- **Product→SKU 两级层级模型**: SKU 按产品分组，支持 `product_id` 和 `variant_label`
+- **OpenAI 兼容客户端**: 通用 `OpenAICompatClient`（`openai_compat.py`）支持 laozhang.ai / OpenRouter 等中转服务
+- **OpenRouter 集成**: 可通过 OpenRouter 访问 400+ 模型
+- **图片锚点空间聚类**: 使用图片 bbox 作为锚点，改进文字块分组
+- **模型号 pattern 分割**: 按型号标记（如 858B#）自动拆分 SKU 边界
+- **系列共有属性识别**: 材质/颜色作为系列级属性，不按颜色拆分变体
+
+### 改进
+- **SKUList 按产品分组显示**: 可折叠/展开产品组
+- **LLM Prompt 产品分组格式**: 提升多产品页面识别准确率
+- **Exporter 自动分配正式 product_id**: 格式化产品 ID 分配
+- **Binder 同产品组绑定优化**: 同产品组 SKU 统一绑定到最高置信度图片
+
+### 数据库变更
+- `skus` 表新增 `product_id` (TEXT) 和 `variant_label` (TEXT) 列
+- 新增索引 `idx_skus_product(job_id, product_id)`
+- 新增 Alembic 迁移 `003_add_product_grouping`
+
+### 配置
+- 新增环境变量：`GEMINI_API_BASE`, `QWEN_API_BASE`, `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`
+
+---
+
 ## V0.2.0 (2026-02-21)
 
 ### Pipeline 并行化

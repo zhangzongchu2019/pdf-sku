@@ -33,8 +33,18 @@ class SKUIdGenerator:
             return (round(y, 2), round(x, 2))
 
         skus.sort(key=sort_key)
+        # 分配 SKU ID 和正式 product_id
+        product_seq: dict[str, str] = {}  # temp_id → formal_id
+        p_counter = 0
         for i, sku in enumerate(skus, 1):
             sku.sku_id = f"{hash_prefix}_{page_no:03d}_{i:03d}"
+            if sku.product_id:
+                if sku.product_id not in product_seq:
+                    p_counter += 1
+                    product_seq[sku.product_id] = (
+                        f"{hash_prefix}_{page_no:03d}_P{p_counter}"
+                    )
+                sku.product_id = product_seq[sku.product_id]
         return skus
 
 
@@ -52,14 +62,19 @@ class SKUExporter:
         exported = []
         for sku in skus:
             if sku.validity == "valid":
-                exported.append({
+                entry = {
                     "sku_id": sku.sku_id,
                     "job_id": job_id,
                     "page_no": page_no,
                     "attributes": sku.attributes,
                     "confidence": sku.confidence,
                     "extraction_method": sku.extraction_method,
-                })
+                }
+                if sku.product_id:
+                    entry["product_id"] = sku.product_id
+                if sku.variant_label:
+                    entry["variant_label"] = sku.variant_label
+                exported.append(entry)
         logger.info("sku_exported",
                      job_id=job_id, page_no=page_no,
                      total=len(skus), exported=len(exported))

@@ -1,6 +1,6 @@
 # Pipeline 模块详细设计
 
-> **文档版本**: V1.2
+> **文档版本**: V1.3
 > **上游依赖**: TA V1.6 §3.3 + §2.4 + §2.5 | BRD V2.1 | BA V1.1 §4
 > **模块定位**: 系统核心 — 9 阶段处理链 + Semaphore 并行编排，承接单页解析→分类→SKU提取→绑定→校验→导出
 > **设计原则**: 路由准确率 > SKU 召回率 > 图片质量 > 人工成本 > 速度（BRD §1.4）
@@ -38,6 +38,22 @@
 | P2 | CrossPageMerger 并发安全 | cache_page/find_continuation 改为 async def + per-job asyncio.Lock；前页未缓存时优雅降级返回 None |
 | P3 | Orchestrator 简化 | 删除 _process_sequential/_process_chunked，新增 _process_parallel；每页独立 DB session；finalize/error 用新 session |
 | P4 | ChunkingStrategy 解耦 | Orchestrator 不再依赖 ChunkingStrategy（保留模块但不使用） |
+
+### V1.3 修订说明 (2026-02-24)
+
+V1.3 (2026-02-24): Product→SKU 两级层级模型，图片锚点空间聚类，模型号 pattern 分割，ATTR_PROMPT 产品分组格式
+
+| 编号 | 变更 | 说明 |
+|------|------|------|
+| H1 | Product→SKU 层级模型 | SKUResult 新增 `product_id`（产品组 ID）和 `variant_label`（变体描述）字段，同一产品多个 SKU 变体共享 product_id |
+| H2 | ATTR_PROMPT 产品分组格式 | LLM 返回格式变更为按 products 分组的 JSON；新增 `_parse_products()` 方法；向后兼容旧格式 |
+| H3 | 系列共有属性规则 | 材质/颜色为系列级属性放入 common_attrs，仅按尺寸/规格拆分变体 |
+| H4 | 图片锚点聚类 | 新增 `_image_anchor_boundaries()` 方法，≥2 张锚点图片时按空间亲和度聚类文字块 |
+| H5 | 模型号 pattern 分割 | 新增 `_split_by_model_pattern()` 方法，正则匹配型号标记拆分 boundary |
+| H6 | identify_boundaries 优先级 | 图片锚点法优先，Y-gap + 模型号分割作为 fallback |
+| H7 | 单阶段提取更新 | `extract()` 新增 `screenshot` 参数；Prompt 改为产品分组格式；`_parse_product_item()` 兼容新旧格式 |
+| H8 | Exporter ID 正式化 | `assign_ids()` 将临时 product_id 替换为正式格式 `{hash}_{page}_P{seq}` |
+| H9 | Binder 产品组统一绑定 | 新增 `_unify_product_bindings()` — 同一 product_id 的 SKU 统一绑定到该组中置信度最高的图片 |
 
 ---
 
@@ -203,14 +219,19 @@ classDiagram
 
     class SKUListExtractor {
         +identify_boundaries(text, roles, screenshot, profile) list~SKUBoundary~
+        -_image_anchor_boundaries(text_blocks, images, roles) list~SKUBoundary~
+        -_ygap_boundaries(text_blocks, roles) list~SKUBoundary~
+        -_split_by_model_pattern(boundary) list~SKUBoundary~
     }
 
     class SKUAttrExtractor {
         +extract_batch(boundaries, raw, profile) list~SKUResult~
+        -_parse_products(json_data) list~SKUResult~
     }
 
     class SKUSingleStage {
-        +extract(raw, text_roles, profile) list~SKUResult~
+        +extract(raw, text_roles, screenshot, profile) list~SKUResult~
+        -_parse_product_item(item) list~SKUResult~
     }
 
     class SKUImageBinder {
@@ -220,6 +241,7 @@ classDiagram
         -_bbox_distance(a, b) float
         -_infer_method(sku, img, layout) str
         -_resolve_conflicts(candidates) list
+        -_unify_product_bindings(bindings, skus) list~BindingResult~
     }
 
     class ConsistencyValidator {
@@ -1459,6 +1481,393 @@ class CrossPageMerger:
         return await self._repo.get_pages_in_range(
             job_id, start_page, current_page - 1,
             status_filter=["AI_COMPLETED"])
+```
+
+### 5.8 SKUListExtractor — 边界识别（V1.3 更新）
+
+```python
+# sku/sku_list_extractor.py
+
+class SKUListExtractor:
+    """
+    SKU 边界识别（TA T27）：
+
+    [H4] 图片锚点聚类 + [H5] 模型号 pattern 分割 + [H6] 优先级策略
+
+    identify_boundaries() 优先级：
+    1. 图片锚点法（≥2 anchors）→ _image_anchor_boundaries()
+    2. Y-gap + 模型号分割（fallback）→ _ygap_boundaries() + _split_by_model_pattern()
+    """
+
+    MODEL_PATTERN = re.compile(r'[A-Za-z0-9]*\d[A-Za-z0-9]*[#＃]')
+    Y_GAP_THRESHOLD = 30  # pt
+
+    def identify_boundaries(
+        self, text_blocks, roles, screenshot, images, profile
+    ) -> list[SKUBoundary]:
+        """
+        [H6] 优先级路由：
+        1. 筛选锚点图片：search_eligible and not is_duplicate
+        2. ≥2 张锚点图片 → 图片锚点法
+        3. 否则 → Y-gap 分组 + 模型号 pattern 再分割
+        """
+        anchors = [
+            img for img in images
+            if getattr(img, 'search_eligible', False)
+            and not getattr(img, 'is_duplicate', False)
+        ]
+
+        if len(anchors) >= 2:
+            return self._image_anchor_boundaries(text_blocks, anchors, roles)
+        else:
+            return self._ygap_boundaries(text_blocks, roles)
+
+    def _image_anchor_boundaries(
+        self, text_blocks, anchors, roles
+    ) -> list[SKUBoundary]:
+        """
+        [H4] 图片锚点空间聚类：
+        - 对每个 text_block 计算到各锚点图片的亲和度（正下方优先）
+        - 同一图片的文字块合并为一个 SKUBoundary
+        - 孤儿文字（距离所有图片 > 阈值）单独用 Y-gap 分组
+
+        亲和度计算：文字块 bbox 中心到图片 bbox 下边缘的距离，
+        正下方（x 重叠）给予额外权重。
+        """
+        assignments = {}  # image_id -> [text_blocks]
+        orphans = []
+
+        for tb in text_blocks:
+            best_img = None
+            best_affinity = float('inf')
+            for img in anchors:
+                affinity = self._compute_affinity(tb, img)
+                if affinity < best_affinity:
+                    best_affinity = affinity
+                    best_img = img
+            if best_img and best_affinity < self.ORPHAN_DISTANCE_THRESHOLD:
+                assignments.setdefault(best_img.image_id, []).append(tb)
+            else:
+                orphans.append(tb)
+
+        boundaries = []
+        for img_id, blocks in assignments.items():
+            boundaries.append(SKUBoundary(
+                text_blocks=blocks,
+                anchor_image_id=img_id,
+            ))
+
+        # 孤儿文字用 Y-gap 分组
+        if orphans:
+            boundaries.extend(self._ygap_group(orphans))
+
+        return boundaries
+
+    def _ygap_boundaries(self, text_blocks, roles) -> list[SKUBoundary]:
+        """
+        [H5/H6] Y-gap 分组 + 模型号 pattern 再分割：
+        1. 按 Y 轴间距 > Y_GAP_THRESHOLD(30pt) 切分
+        2. 切分后对每个 boundary 尝试模型号 pattern 再分割
+        """
+        sorted_blocks = sorted(text_blocks, key=lambda b: b.bbox[1])
+        groups = []
+        current = [sorted_blocks[0]] if sorted_blocks else []
+
+        for i in range(1, len(sorted_blocks)):
+            prev_bottom = sorted_blocks[i - 1].bbox[3]
+            curr_top = sorted_blocks[i].bbox[1]
+            if curr_top - prev_bottom > self.Y_GAP_THRESHOLD:
+                groups.append(current)
+                current = []
+            current.append(sorted_blocks[i])
+        if current:
+            groups.append(current)
+
+        # 对每个 Y-gap 分组尝试模型号 pattern 再分割
+        boundaries = []
+        for group in groups:
+            boundary = SKUBoundary(text_blocks=group)
+            sub_boundaries = self._split_by_model_pattern(boundary)
+            boundaries.extend(sub_boundaries)
+
+        return boundaries
+
+    def _split_by_model_pattern(self, boundary: SKUBoundary) -> list[SKUBoundary]:
+        """
+        [H5] 模型号 pattern 分割：
+        - 正则：[A-Za-z0-9]*\\d[A-Za-z0-9]*[#＃]
+        - 匹配如 858B#、07#、887# 等型号标记
+        - 单个 boundary 内含多个型号时拆分为多个子 boundary
+        - 仅含 0 或 1 个型号时原样返回
+        """
+        blocks = boundary.text_blocks
+        split_indices = []
+
+        for i, tb in enumerate(blocks):
+            if self.MODEL_PATTERN.search(tb.content):
+                split_indices.append(i)
+
+        if len(split_indices) <= 1:
+            return [boundary]
+
+        # 按型号位置拆分
+        sub_boundaries = []
+        for j, idx in enumerate(split_indices):
+            end = split_indices[j + 1] if j + 1 < len(split_indices) else len(blocks)
+            sub_boundaries.append(SKUBoundary(
+                text_blocks=blocks[idx:end],
+            ))
+
+        # 型号前的文字块归入第一个子 boundary
+        if split_indices[0] > 0:
+            sub_boundaries[0].text_blocks = blocks[:split_indices[0]] + sub_boundaries[0].text_blocks
+
+        return sub_boundaries
+```
+
+### 5.9 SKUAttrExtractor — 属性提取（V1.3 更新）
+
+```python
+# sku/sku_attr_extractor.py
+
+class SKUAttrExtractor:
+    """
+    [H1/H2/H3] 两阶段属性提取 — Product→SKU 层级模型
+
+    ATTR_PROMPT 返回产品分组格式（V1.3）：
+    [
+      {
+        "boundary_id": 1,
+        "products": [
+          {
+            "product_name": "...",
+            "model_number": "...",
+            "common_attrs": {"material": "...", "color": "..."},
+            "skus": [
+              {"variant_label": "单人位", "size": "..."},
+              {"variant_label": "双人位", "size": "..."}
+            ]
+          }
+        ]
+      }
+    ]
+
+    [H3] 系列共有属性规则：材质/颜色是系列级属性（放入 common_attrs），
+    不按颜色/材质拆分变体。仅按尺寸/规格拆分。
+
+    SKUResult 新增字段：
+    - product_id: str — 产品组 ID，同一产品多个 SKU 变体共享
+    - variant_label: str — 变体描述（如"双人位"、"三人位"）
+    """
+
+    async def extract_batch(
+        self, boundaries: list[SKUBoundary], raw: ParsedPageIR, profile
+    ) -> list[SKUResult]:
+        """按 boundary 批量调用 LLM 提取属性，返回 SKUResult 列表"""
+        prompt = self._build_attr_prompt(boundaries, profile)
+        response = await self._llm.call(prompt)
+        json_data = self._parse_json(response)
+
+        # [H2] 向后兼容：检测 products 键走新路径，否则走旧路径
+        results = []
+        for item in json_data:
+            if "products" in item:
+                results.extend(self._parse_products(item))
+            else:
+                results.extend(self._parse_legacy(item))
+        return results
+
+    def _parse_products(self, item: dict) -> list[SKUResult]:
+        """
+        [H2] 解析产品分组 JSON：
+        - 为每个 product 生成临时 product_id
+        - 将 common_attrs 合并到每个 SKU 的属性中
+        - 每个 SKU 携带 variant_label
+        """
+        results = []
+        boundary_id = item.get("boundary_id")
+
+        for p_idx, product in enumerate(item.get("products", [])):
+            temp_product_id = f"tmp_{boundary_id}_P{p_idx}"
+            common_attrs = product.get("common_attrs", {})
+
+            for sku_data in product.get("skus", []):
+                # [H3] 合并系列共有属性（common_attrs）到每个 SKU
+                attrs = {**common_attrs, **sku_data}
+                variant_label = attrs.pop("variant_label", None)
+
+                results.append(SKUResult(
+                    product_id=temp_product_id,
+                    variant_label=variant_label,
+                    attributes={
+                        "product_name": product.get("product_name"),
+                        "model": product.get("model_number"),
+                        **attrs,
+                    },
+                    boundary_id=boundary_id,
+                ))
+
+        return results
+```
+
+### 5.10 SKUSingleStage — 单阶段 Fallback（V1.3 更新）
+
+```python
+# sku/sku_single_stage.py
+
+class SKUSingleStage:
+    """
+    单阶段 SKU 提取 Fallback。
+
+    [H7] V1.3 更新：
+    - extract() 新增 screenshot 参数，传入页面截图给 LLM
+    - Prompt 改为产品分组格式（与两阶段 ATTR_PROMPT 一致）
+    - _parse_product_item() 支持新格式（products/skus）和旧格式（扁平属性）
+    """
+
+    async def extract(
+        self, raw: ParsedPageIR, text_roles, screenshot: bytes, profile
+    ) -> list[SKUResult]:
+        """
+        单阶段提取：将整页文本+截图发送 LLM，一次性返回所有 SKU。
+
+        Args:
+            raw: 页面解析结果
+            text_roles: 文本角色分类结果
+            screenshot: 页面截图（V1.3 新增）
+            profile: 品类配置
+        """
+        prompt = self._build_prompt(raw, text_roles, profile)
+        response = await self._llm.call(
+            prompt, images=[screenshot] if screenshot else [])
+        json_data = self._parse_json(response)
+
+        results = []
+        for item in json_data:
+            results.extend(self._parse_product_item(item))
+        return results
+
+    def _parse_product_item(self, item: dict) -> list[SKUResult]:
+        """
+        [H7] 兼容新旧格式：
+        - 新格式：检测到 products 键 → 按产品分组解析（同 SKUAttrExtractor._parse_products）
+        - 旧格式：扁平属性字典 → 单个 SKUResult
+        """
+        if "products" in item:
+            # 新格式：产品分组
+            results = []
+            for p_idx, product in enumerate(item.get("products", [])):
+                temp_product_id = f"tmp_single_{p_idx}"
+                common_attrs = product.get("common_attrs", {})
+
+                for sku_data in product.get("skus", []):
+                    attrs = {**common_attrs, **sku_data}
+                    variant_label = attrs.pop("variant_label", None)
+                    results.append(SKUResult(
+                        product_id=temp_product_id,
+                        variant_label=variant_label,
+                        attributes={
+                            "product_name": product.get("product_name"),
+                            "model": product.get("model_number"),
+                            **attrs,
+                        },
+                    ))
+            return results
+        else:
+            # 旧格式：扁平属性
+            return [SKUResult(attributes=item)]
+```
+
+### 5.11 SKUExporter — ID 正式化（V1.3 更新）
+
+```python
+# sku/sku_exporter.py（部分）
+
+class SKUExporter:
+    """
+    [H8] assign_ids() 在生成 SKU ID 的同时，将临时 product_id 替换为正式格式。
+
+    正式 product_id 格式：{hash}_{page}_P{seq}
+    其中 seq 为该页内产品组的出现顺序。
+    """
+
+    def assign_ids(self, skus: list[SKUResult], file_hash: str,
+                   page_no: int, page_height: float) -> list[SKUResult]:
+        # 收集临时 product_id → 按出现顺序分配正式 ID
+        seen_products = {}
+        product_seq = 0
+        for sku in skus:
+            tmp_pid = getattr(sku, 'product_id', None)
+            if tmp_pid and tmp_pid not in seen_products:
+                product_seq += 1
+                seen_products[tmp_pid] = f"{file_hash}_{page_no}_P{product_seq}"
+
+        # 替换临时 ID + 生成 SKU ID
+        for idx, sku in enumerate(skus):
+            tmp_pid = getattr(sku, 'product_id', None)
+            if tmp_pid and tmp_pid in seen_products:
+                sku.product_id = seen_products[tmp_pid]
+
+            # 原有 SKU ID 逻辑（坐标归一化 + 排序）
+            sku.sku_id = f"{file_hash}_p{page_no}_{idx + 1}"
+
+        return skus
+```
+
+### 5.12 SKUImageBinder — 产品组统一绑定（V1.3 更新）
+
+```python
+# sku/sku_image_binder.py（V1.3 追加方法）
+
+class SKUImageBinder:
+    # ... 原有 bind() 方法不变 ...
+
+    def bind(self, skus, images, layout, profile=None) -> list[BindingResult]:
+        """原有绑定逻辑（见 5.4）"""
+        results = self._bind_individual(skus, images, layout, profile)
+        # [H9] 产品组统一绑定后处理
+        results = self._unify_product_bindings(results, skus)
+        return results
+
+    def _unify_product_bindings(
+        self, bindings: list[BindingResult], skus: list[SKUResult]
+    ) -> list[BindingResult]:
+        """
+        [H9] 同一 product_id 的 SKU 统一绑定到该组中置信度最高的图片。
+
+        逻辑：
+        1. 按 product_id 分组所有 binding
+        2. 每组内找到 confidence 最高且 image_id 非 None 的 binding
+        3. 将该组所有 binding 的 image_id 统一为最高置信度的图片
+        4. 无 product_id 的 SKU 保持原有绑定不变
+        """
+        # 建立 sku_id → product_id 映射
+        sku_product_map = {}
+        for sku in skus:
+            pid = getattr(sku, 'product_id', None)
+            if pid:
+                sku_product_map[sku.sku_id] = pid
+
+        # 按 product_id 分组
+        product_groups = {}  # product_id -> [binding_index]
+        for i, b in enumerate(bindings):
+            pid = sku_product_map.get(b.sku_id)
+            if pid:
+                product_groups.setdefault(pid, []).append(i)
+
+        # 每组统一绑定到最高置信度的图片
+        for pid, indices in product_groups.items():
+            best_idx = max(
+                indices,
+                key=lambda i: bindings[i].confidence if bindings[i].image_id else -1,
+            )
+            best_binding = bindings[best_idx]
+            if best_binding.image_id:
+                for i in indices:
+                    bindings[i].image_id = best_binding.image_id
+                    bindings[i].is_ambiguous = False
+
+        return bindings
 ```
 
 ---

@@ -41,9 +41,14 @@ class Settings(BaseSettings):
 
     # === LLM ===
     gemini_api_key: str = ""
+    gemini_api_base: str = ""  # 留空用官方，填写则走中转（如 https://api.laozhang.ai）
     gemini_model: str = "gemini-2.0-flash"
     qwen_api_key: str = ""
+    qwen_api_base: str = ""  # 留空用官方，填写则走中转
     qwen_model: str = "qwen-vl-max"
+    openrouter_api_key: str = ""
+    openrouter_model: str = ""  # 如 google/gemini-2.5-flash
+    default_llm_client: str = ""  # 留空则自动选择: gemini > qwen > openrouter
     llm_daily_budget_usd: float = 50.0
     llm_timeout_seconds: int = 60
 

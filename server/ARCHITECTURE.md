@@ -136,3 +136,15 @@ Pipeline needs_review → TaskCreated
 | SKU 图片绑定 | GET /jobs/{id}/skus 返回 images 数组（JOIN sku_image_bindings） |
 | 商品导入配置 UI | 前端新增 /config/import 页面 + importConfigStore (localStorage 持久化) |
 | SKU 属性展示 | SKUList 组件支持点击展开全部属性，兼容 model_number/product_name 字段名 |
+
+## V0.3.0 变更摘要 (2026-02-24)
+
+| 变更 | 说明 |
+|------|------|
+| OpenAI 兼容客户端 | LLM Adapter 新增 `openai_compat.py`（`OpenAICompatClient`），支持 laozhang.ai / OpenRouter 等中转服务 |
+| 新增环境变量 | `GEMINI_API_BASE`, `QWEN_API_BASE`（自定义 API 端点）；`OPENROUTER_API_KEY`, `OPENROUTER_MODEL`（OpenRouter 集成） |
+| Product→SKU 两级层级模型 | SKU 新增 `product_id`（产品组 ID）和 `variant_label`（变体标签）字段，支持按产品分组 |
+| 图片锚点空间聚类 | Pipeline 使用图片 bbox 作为锚点，改进多产品页面文字块分组准确率 |
+| 模型号 pattern 分割 | 按型号标记（如 858B#）自动拆分 SKU 边界，提升密集型号页面识别 |
+| SKU 表结构变更 | `skus` 表新增 `product_id` (TEXT)、`variant_label` (TEXT) 列；新增索引 `idx_skus_product(job_id, product_id)` |
+| 前端 SKUList 分组 | SKUList 按产品分组显示（可折叠/展开），LLM Prompt 改为产品分组格式 |
