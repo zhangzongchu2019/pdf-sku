@@ -39,10 +39,13 @@ class Settings(BaseSettings):
     minio_bucket: str = "pdf-sku"
     minio_secure: bool = False
 
+    # === Auth / Crypto ===
+    jwt_secret_key: str = ""  # used for JWT + Fernet encryption of LLM keys
+
     # === LLM ===
     gemini_api_key: str = ""
     gemini_api_base: str = ""  # 留空用官方，填写则走中转（如 https://api.laozhang.ai）
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_model: str = "gemini-2.5-flash"
     qwen_api_key: str = ""
     qwen_api_base: str = ""  # 留空用官方，填写则走中转
     qwen_model: str = "qwen-vl-max"

@@ -12,8 +12,9 @@ import asyncio
 import time
 from collections import defaultdict
 from typing import AsyncGenerator
-from datetime import datetime
+from datetime import datetime, timezone
 
+from sse_starlette.sse import ServerSentEvent
 from pdf_sku.gateway.event_bus import event_bus
 from pdf_sku.common.enums import SSEEventType, JobInternalStatus
 import structlog
@@ -67,12 +68,10 @@ class SSEManager:
             except asyncio.QueueFull:
                 pass
 
-    async def subscribe_job(self, job_id: str) -> AsyncGenerator[str, None]:
+    async def subscribe_job(self, job_id: str) -> AsyncGenerator[ServerSentEvent, None]:
         """
         生成 SSE 事件流。调用方通过 async for 消费。
-
-        产出格式:
-            event: {event_type}\ndata: {json}\n\n
+        产出 ServerSentEvent 对象，由 EventSourceResponse 正确序列化。
         """
         import orjson
 
@@ -83,9 +82,7 @@ class SSEManager:
 
         try:
             # 初始心跳
-            yield self._format_sse(SSEEventType.HEARTBEAT, {"ts": _now_iso()})
-
-            last_heartbeat = time.monotonic()
+            yield self._make_sse(SSEEventType.HEARTBEAT, {"ts": _now_iso()})
 
             while True:
                 try:
@@ -94,12 +91,12 @@ class SSEManager:
 
                     # 映射事件类型
                     sse_event = self._map_event_type(data)
-                    yield self._format_sse(sse_event, data)
+                    yield self._make_sse(sse_event, data)
 
                     # 检查终态
                     status = data.get("status", "")
                     if status in TERMINAL_STATUSES:
-                        yield self._format_sse(
+                        yield self._make_sse(
                             SSEEventType.JOB_COMPLETED if status == JobInternalStatus.FULL_IMPORTED.value
                             else SSEEventType.JOB_FAILED,
                             data,
@@ -108,8 +105,7 @@ class SSEManager:
 
                 except asyncio.TimeoutError:
                     # 心跳
-                    yield self._format_sse(SSEEventType.HEARTBEAT, {"ts": _now_iso()})
-                    last_heartbeat = time.monotonic()
+                    yield self._make_sse(SSEEventType.HEARTBEAT, {"ts": _now_iso()})
 
         except asyncio.CancelledError:
             logger.info("sse_cancelled", job_id=job_id)
@@ -132,12 +128,12 @@ class SSEManager:
         return mapping.get(evt, SSEEventType.HEARTBEAT)
 
     @staticmethod
-    def _format_sse(event_type: str, data: dict) -> str:
+    def _make_sse(event_type: str, data: dict) -> ServerSentEvent:
         import orjson
         # 剔除内部字段
         clean = {k: v for k, v in data.items() if not k.startswith("_")}
         json_str = orjson.dumps(clean).decode()
-        return f"event: {event_type}\ndata: {json_str}\n\n"
+        return ServerSentEvent(data=json_str, event=event_type)
 
     @property
     def active_connections(self) -> int:
@@ -145,4 +141,4 @@ class SSEManager:
 
 
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat() + "Z"
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")

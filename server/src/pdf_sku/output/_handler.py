@@ -96,11 +96,11 @@ async def _on_task_completed(event: dict) -> None:
             page_result = PageResult(
                 status="AI_COMPLETED",
                 skus=[SKUResult(
-                    sku_id=s.sku_external_id or str(s.sku_id),
+                    sku_id=s.sku_id or "",
                     attributes=s.attributes or {},
-                    confidence=s.confidence or 0,
+                    confidence=0.0,
                     validity=s.validity or "valid",
-                    extraction_method=s.extraction_method or "human",
+                    extraction_method="human",
                 ) for s in db_skus],
             )
 

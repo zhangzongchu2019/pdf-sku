@@ -14,7 +14,7 @@ from pdf_sku.llm_adapter.resilience.circuit_breaker import CircuitBreaker
 from pdf_sku.llm_adapter.resilience.budget_guard import BudgetGuard
 from pdf_sku.llm_adapter.resilience.rate_limiter import RateLimiter
 from pdf_sku.evaluator.scorer import PageScore
-from pdf_sku.llm_adapter.provider_config import get_provider_config
+from pdf_sku.llm_adapter.provider_config import get_provider_config, get_provider_entries
 from pdf_sku.common.exceptions import LLMCircuitOpenError, RetryableError
 import structlog
 
@@ -47,13 +47,16 @@ class LLMService:
         self._rate_limiter = rate_limiter
         self._default_client = default_client_name
         self._redis = redis
+        self._last_used_provider: str | None = None
 
     @property
     def current_model_name(self) -> str:
+        name = self._last_used_provider or self._default_client
         try:
-            return get_client(self._default_client).model_id
-        except KeyError:
-            return self._default_client
+            client = get_client(name)
+            return client.model_id if client else name
+        except (KeyError, AttributeError):
+            return name
 
     async def evaluate_document(
         self,
@@ -148,6 +151,20 @@ class LLMService:
             logger.warning("lightweight_eval_failed", error=str(e))
             return 0.5
 
+    async def call_llm(
+        self,
+        operation: str,
+        prompt: str,
+        images: list[bytes] | None = None,
+        client_name: str | None = None,
+        timeout: float | None = None,
+    ) -> LLMResponse:
+        """Public interface for _call_llm. Use this from external callers."""
+        return await self._call_llm(
+            operation=operation, prompt=prompt, images=images,
+            client_name=client_name, timeout=timeout,
+        )
+
     async def _call_llm(
         self,
         operation: str,
@@ -158,9 +175,72 @@ class LLMService:
     ) -> LLMResponse:
         """
         核心调用链: circuit → rate_limit → budget → client.complete → record。
-        带重试 (次数从 provider config 动态读取)。
+        带重试 + fallback 到下一个 enabled provider。
         """
-        client_name = client_name or self._default_client
+        # Build ordered list of providers to try
+        providers_to_try = await self._build_fallback_chain(client_name)
+
+        last_error: Exception | None = None
+        for provider_name in providers_to_try:
+            try:
+                resp = await self._call_single_provider(
+                    provider_name, operation, prompt, images, timeout,
+                )
+                self._last_used_provider = provider_name
+                return resp
+            except LLMCircuitOpenError:
+                raise  # 不 fallback
+            except Exception as e:
+                last_error = e
+                logger.warning("llm_provider_failed",
+                               provider=provider_name, operation=operation,
+                               error=repr(e))
+                continue
+
+        raise RetryableError(
+            f"All LLM providers failed for '{operation}': {last_error}")
+
+    async def _build_fallback_chain(self, client_name: str | None) -> list[str]:
+        """Build ordered list of enabled provider names to try.
+
+        优先级来源: Redis provider entries (用户可在前端调整顺序)。
+        若指定了 client_name 则将其提到最前，其余按 Redis 顺序追加。
+        """
+        # Get enabled providers from Redis (source of truth for priority & enabled)
+        entries: list | None = None
+        try:
+            entries = await get_provider_entries(self._redis)
+        except Exception:
+            pass  # Redis unavailable — skip filtering
+
+        if entries:
+            # 按 Redis 优先级构建链（已按 priority 排序）
+            chain: list[str] = []
+            if client_name:
+                # 指定的 client 优先
+                chain.append(client_name)
+            for entry in entries:
+                if entry.enabled and entry.name not in chain:
+                    chain.append(entry.name)
+        else:
+            # Redis 不可用，回退到 default
+            chain = [client_name or self._default_client]
+
+        # Fallback: if everything is disabled, use the default client anyway
+        if not chain:
+            chain = [client_name or self._default_client]
+
+        return chain
+
+    async def _call_single_provider(
+        self,
+        client_name: str,
+        operation: str,
+        prompt: str,
+        images: list[bytes] | None = None,
+        timeout: float | None = None,
+    ) -> LLMResponse:
+        """Call a single provider with retries."""
         client = get_client(client_name)
 
         # Dynamic per-provider config from Redis (with code defaults fallback)
@@ -171,9 +251,9 @@ class LLMService:
             # 1. 熔断检查
             self._circuit.check()
 
-            # 2. 限流检查
+            # 2. 限流检查 (per-provider)
             if self._rate_limiter:
-                await self._rate_limiter.check_and_acquire()
+                await self._rate_limiter.check_and_acquire(provider_name=client_name)
 
             # 3. 预算检查
             if self._budget:
@@ -208,7 +288,7 @@ class LLMService:
 
                 if self._rate_limiter:
                     await self._rate_limiter.record_tokens(
-                        input_tokens + output_tokens)
+                        input_tokens + output_tokens, provider_name=client_name)
 
                 return resp
 
@@ -220,12 +300,14 @@ class LLMService:
                     backoff = 2 ** attempt * 3  # 3s, 6s
                     logger.warning("llm_call_retry",
                                     attempt=attempt + 1, error=repr(e),
-                                    operation=operation, backoff_s=backoff)
+                                    operation=operation, backoff_s=backoff,
+                                    provider=client_name)
                     await asyncio.sleep(backoff)
                     continue
-                raise RetryableError(f"LLM call failed after {max_retries + 1} attempts: {e}")
+                raise RetryableError(
+                    f"LLM call to {client_name} failed after {max_retries + 1} attempts: {e}")
 
-        raise RetryableError("LLM call exhausted all retries")
+        raise RetryableError(f"LLM call to {client_name} exhausted all retries")
 
     @staticmethod
     def _estimate_cost(provider: str, input_tokens: int, output_tokens: int) -> float:

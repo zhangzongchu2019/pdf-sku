@@ -126,18 +126,22 @@ class EvalCache:
             # 锁超时或其他 worker 完成，尝试获取
             acquired = await self._redis.set(lock_key, "1", nx=True, ex=timeout)
 
-        # 启动续约协程
-        renew_task = asyncio.create_task(self._renew_lock(lock_key, timeout))
+        # 仅 acquired 时启动续约
+        renew_task = None
+        if acquired:
+            renew_task = asyncio.create_task(self._renew_lock(lock_key, timeout))
 
         try:
             yield bool(acquired)
         finally:
-            renew_task.cancel()
-            try:
-                await renew_task
-            except asyncio.CancelledError:
-                pass
-            await self._redis.delete(lock_key)
+            if renew_task:
+                renew_task.cancel()
+                try:
+                    await renew_task
+                except asyncio.CancelledError:
+                    pass
+            if acquired:
+                await self._redis.delete(lock_key)
 
     async def _renew_lock(self, lock_key: str, timeout: int) -> None:
         """每 30s 续约锁 TTL。"""

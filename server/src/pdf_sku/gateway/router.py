@@ -280,6 +280,17 @@ async def requeue_job(job_id: uuid.UUID, db: DBSession, redis: RedisClient):
         db, str(job_id), JobInternalStatus.UPLOADED.value, trigger="manual_requeue"
     )
     await db.commit()
+
+    # 重新触发评估流程
+    await event_bus.publish("JobCreated", {
+        "job_id": str(job_id),
+        "file_hash": job.file_hash,
+        "total_pages": job.total_pages,
+        "status": JobInternalStatus.UPLOADED.value,
+        "prescan": (job.processing_trace or {}).get("prescan", {}),
+        "config_version": job.frozen_config_version or "default",
+    })
+
     return {"job_id": str(job_id), "status": job.status, "user_status": job.user_status}
 
 
@@ -355,22 +366,16 @@ async def reprocess_job_ai(job_id: uuid.UUID, db: DBSession):
     await db.execute(delete(SKU).where(SKU.job_id == job_id))
     await db.execute(delete(Image).where(Image.job_id == job_id))
 
-    # 重置 Job 级计数
+    # 重置 Job 级计数，清空旧的 blank_pages
     job.total_skus = 0
     job.total_images = 0
+    job.blank_pages = []
 
-    blank_pages = set(job.blank_pages or [])
     await db.execute(
         update(Page)
         .where(Page.job_id == job_id)
         .values(status="PENDING", needs_review=False, sku_count=0)
     )
-    if blank_pages:
-        await db.execute(
-            update(Page)
-            .where(Page.job_id == job_id, Page.page_number.in_(list(blank_pages)))
-            .values(status="BLANK")
-        )
 
     await db.commit()
 
@@ -378,7 +383,7 @@ async def reprocess_job_ai(job_id: uuid.UUID, db: DBSession):
         "job_id": str(job_id),
         "route": "AI_ONLY",
         "degrade_reason": None,
-        "prescan": {"blank_pages": sorted(blank_pages)},
+        "prescan": {"blank_pages": []},
     }
     await event_bus.publish("EvaluationCompleted", eval_data)
 
@@ -387,6 +392,60 @@ async def reprocess_job_ai(job_id: uuid.UUID, db: DBSession):
         "queued": True,
         "route": "AI_ONLY",
         "deleted_human_tasks": deleted_tasks,
+    }
+
+
+@router.post("/ops/jobs/{job_id}/reprocess-page/{page_number}")
+async def reprocess_single_page(
+    job_id: uuid.UUID,
+    page_number: int,
+    db: DBSession,
+    request: Request,
+):
+    """单页重处理: 仅重跑指定页面的 AI 处理。"""
+    result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise JobNotFoundError(f"Job {job_id} not found")
+
+    if page_number < 1 or page_number > job.total_pages:
+        return JSONResponse({"error": f"page_number must be 1-{job.total_pages}"}, 400)
+
+    # 清理该页旧数据
+    old_skus = (await db.execute(
+        select(SKU.sku_id).where(SKU.job_id == job_id, SKU.page_number == page_number)
+    )).scalars().all()
+    if old_skus:
+        await db.execute(delete(SKUImageBinding).where(
+            SKUImageBinding.job_id == job_id,
+            SKUImageBinding.sku_id.in_(old_skus),
+        ))
+    await db.execute(delete(SKU).where(
+        SKU.job_id == job_id, SKU.page_number == page_number))
+    await db.execute(delete(Image).where(
+        Image.job_id == job_id, Image.page_number == page_number))
+    await db.execute(
+        update(Page).where(
+            Page.job_id == job_id, Page.page_number == page_number,
+        ).values(status="PENDING", needs_review=False, sku_count=0)
+    )
+    await db.commit()
+
+    # 直接调用 orchestrator 单页处理
+    orchestrator = request.app.state.orchestrator
+    file_path = orchestrator._resolve_file_path(job)
+
+    async with orchestrator._db_factory() as page_db:
+        result = await orchestrator._process_single_page(
+            page_db, job, page_number, file_path)
+        await orchestrator._on_page_done(page_db, job, page_number, result)
+        await page_db.commit()
+
+    return {
+        "job_id": str(job_id),
+        "page_number": page_number,
+        "status": result.status,
+        "sku_count": len(result.skus),
     }
 
 
@@ -513,7 +572,7 @@ async def get_job_image(
     result = await db.execute(
         select(Image).where(Image.job_id == job_id, Image.image_id == image_id)
     )
-    img = result.scalar_one_or_none()
+    img = result.scalars().first()
     if not img or not img.extracted_path:
         return JSONResponse(status_code=404, content={
             "error_code": "IMAGE_NOT_FOUND",
@@ -917,7 +976,7 @@ async def ocr_region(
     # Call LLM for OCR
     try:
         import json as json_mod
-        resp = await llm_service._call_llm(
+        resp = await llm_service.call_llm(
             operation="ocr_region",
             prompt=OCR_REGION_PROMPT,
             images=[crop_bytes],
@@ -946,6 +1005,65 @@ async def ocr_region(
             "error_code": "OCR_FAILED",
             "message": f"OCR extraction failed: {str(e)}",
         })
+
+
+# ───────────────────────── LLM Accounts ─────────────────────────
+
+@router.get("/system/llm-accounts")
+async def list_llm_accounts(db: DBSession, _admin: AdminUser):
+    """列出所有 LLM 账号（key 脱敏）。"""
+    from pdf_sku.llm_adapter.account_service import list_accounts
+    accounts = await list_accounts(db)
+    return {"accounts": accounts}
+
+
+@router.post("/system/llm-accounts")
+async def create_llm_account(request: Request, db: DBSession, _admin: AdminUser):
+    """创建 LLM 账号。"""
+    from pdf_sku.llm_adapter.account_service import create_account
+
+    body = await request.json()
+    name = body.get("name", "").strip()
+    provider_type = body.get("provider_type", "").strip()
+    api_base = body.get("api_base", "").strip()
+    api_key = body.get("api_key", "").strip()
+
+    if not name or not provider_type or not api_key:
+        return JSONResponse(status_code=400, content={
+            "error_code": "MISSING_FIELDS",
+            "message": "name, provider_type, and api_key are required",
+        })
+
+    jwt_secret = settings.jwt_secret_key
+    if not jwt_secret:
+        return JSONResponse(status_code=500, content={
+            "error_code": "NO_SECRET",
+            "message": "JWT_SECRET_KEY not configured, cannot encrypt",
+        })
+
+    try:
+        account = await create_account(db, name, provider_type, api_base, api_key, jwt_secret)
+        return {"account": account}
+    except Exception as e:
+        if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+            return JSONResponse(status_code=409, content={
+                "error_code": "DUPLICATE_NAME",
+                "message": f"Account name '{name}' already exists",
+            })
+        raise
+
+
+@router.delete("/system/llm-accounts/{account_id}")
+async def delete_llm_account(account_id: int, db: DBSession, _admin: AdminUser):
+    """删除 LLM 账号。"""
+    from pdf_sku.llm_adapter.account_service import delete_account
+    deleted = await delete_account(db, account_id)
+    if not deleted:
+        return JSONResponse(status_code=404, content={
+            "error_code": "ACCOUNT_NOT_FOUND",
+            "message": f"Account {account_id} not found",
+        })
+    return Response(status_code=204)
 
 
 # ───────────────────────── Pipeline Concurrency Rules ─────────────────────────
@@ -1002,6 +1120,12 @@ async def set_pipeline_concurrency(request: Request, _admin: AdminUser):
                 "error_code": "INVALID_RULE",
                 "message": f"concurrency must be a positive integer, got: {rule.get('concurrency')}",
             })
+        # provider_name is optional (empty string = global default)
+        if "provider_name" in rule and not isinstance(rule["provider_name"], str):
+            return JSONResponse(status_code=400, content={
+                "error_code": "INVALID_RULE",
+                "message": "provider_name must be a string",
+            })
 
     # Sort by min_pages ascending for consistency
     rules = sorted(rules, key=lambda r: r["min_pages"])
@@ -1018,7 +1142,12 @@ from pdf_sku.llm_adapter.provider_config import (
     get_provider_config,
     set_provider_config,
     list_provider_configs,
+    get_provider_entries,
+    reorder_providers,
+    toggle_provider,
+    update_provider_entry,
 )
+from dataclasses import asdict as _asdict
 
 
 @router.get("/system/llm-provider-configs")
@@ -1075,8 +1204,86 @@ async def update_llm_provider_config(
                 vlm_timeout=updated.vlm_timeout_seconds,
                 max_retries=updated.max_retries)
 
-    from dataclasses import asdict
-    return {"provider": provider, "config": asdict(updated)}
+    return {"provider": provider, "config": _asdict(updated)}
+
+
+# ───────────────────────── LLM Providers (Multi-source Priority) ─────────────────────────
+
+@router.get("/system/llm-providers")
+async def list_llm_providers(request: Request, _admin: AdminUser):
+    """列出所有 LLM provider（含 priority、enabled）。"""
+    redis = getattr(request.app.state, "redis", None)
+    entries = await get_provider_entries(redis)
+    return {"providers": [_asdict(e) for e in entries]}
+
+
+@router.put("/system/llm-providers/reorder")
+async def reorder_llm_providers(request: Request, _admin: AdminUser):
+    """更新 LLM provider 优先级排序。"""
+    redis = getattr(request.app.state, "redis", None)
+    if not redis:
+        return JSONResponse(status_code=503, content={
+            "error_code": "REDIS_UNAVAILABLE",
+            "message": "Redis is not available",
+        })
+    body = await request.json()
+    ordered_names = body.get("ordered_names", [])
+    if not ordered_names or not isinstance(ordered_names, list):
+        return JSONResponse(status_code=400, content={
+            "error_code": "INVALID_INPUT",
+            "message": "ordered_names must be a non-empty array of provider names",
+        })
+    entries = await reorder_providers(redis, ordered_names)
+    logger.info("llm_providers_reordered", names=ordered_names)
+    return {"providers": [_asdict(e) for e in entries]}
+
+
+@router.put("/system/llm-providers/{name}/toggle")
+async def toggle_llm_provider(request: Request, name: str, _admin: AdminUser):
+    """启用/禁用指定 LLM provider。"""
+    redis = getattr(request.app.state, "redis", None)
+    if not redis:
+        return JSONResponse(status_code=503, content={
+            "error_code": "REDIS_UNAVAILABLE",
+            "message": "Redis is not available",
+        })
+    body = await request.json()
+    enabled = body.get("enabled", True)
+    entry = await toggle_provider(redis, name, enabled)
+    if not entry:
+        return JSONResponse(status_code=404, content={
+            "error_code": "PROVIDER_NOT_FOUND",
+            "message": f"Provider '{name}' not found",
+        })
+    logger.info("llm_provider_toggled", name=name, enabled=enabled)
+    return {"provider": _asdict(entry)}
+
+
+@router.put("/system/llm-providers/{name}")
+async def update_llm_provider(request: Request, name: str, _admin: AdminUser):
+    """更新指定 LLM provider 的超时/重试参数。"""
+    redis = getattr(request.app.state, "redis", None)
+    if not redis:
+        return JSONResponse(status_code=503, content={
+            "error_code": "REDIS_UNAVAILABLE",
+            "message": "Redis is not available",
+        })
+    body = await request.json()
+    allowed_fields = {"timeout_seconds", "vlm_timeout_seconds", "max_retries", "qpm_limit", "tpm_limit"}
+    updates = {k: v for k, v in body.items() if k in allowed_fields}
+    if not updates:
+        return JSONResponse(status_code=400, content={
+            "error_code": "NO_UPDATES",
+            "message": f"No valid fields to update. Allowed: {allowed_fields}",
+        })
+    entry = await update_provider_entry(redis, name, updates)
+    if not entry:
+        return JSONResponse(status_code=404, content={
+            "error_code": "PROVIDER_NOT_FOUND",
+            "message": f"Provider '{name}' not found",
+        })
+    logger.info("llm_provider_updated", name=name, updates=updates)
+    return {"provider": _asdict(entry)}
 
 
 # ───────────────────────── Helpers ─────────────────────────

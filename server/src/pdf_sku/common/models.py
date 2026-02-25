@@ -420,6 +420,22 @@ class CustomAttrUpgrade(Base):
     __table_args__ = (Index("idx_upgrades_status", "status"),)
 
 
+class LLMAccount(Base):
+    """LLM API 账号（加密存储 key，只增删不改）。"""
+    __tablename__ = "llm_accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    provider_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    api_base: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    encrypted_api_key: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_llm_accounts_provider_type", "provider_type"),
+    )
+
+
 class WorkerHeartbeat(Base):
     __tablename__ = "worker_heartbeats"
 

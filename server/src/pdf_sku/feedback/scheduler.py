@@ -10,7 +10,7 @@
 """
 from __future__ import annotations
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import structlog
 
@@ -156,6 +156,6 @@ class ScheduledTaskRunner:
         now = datetime.now(timezone.utc)
         target = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
         if target <= now:
-            target = target.replace(day=target.day + 1)
+            target += timedelta(days=1)
         delta = (target - now).total_seconds()
         await asyncio.sleep(max(60, delta))
