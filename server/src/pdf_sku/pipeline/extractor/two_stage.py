@@ -52,6 +52,19 @@ Respond with ONLY a JSON array:
 }}]"""
 
 
+def _compute_iou(bbox1: tuple, bbox2: tuple) -> float:
+    """计算两个 bbox 的 IoU。"""
+    x0 = max(bbox1[0], bbox2[0])
+    y0 = max(bbox1[1], bbox2[1])
+    x1 = min(bbox1[2], bbox2[2])
+    y1 = min(bbox1[3], bbox2[3])
+    inter = max(0, x1 - x0) * max(0, y1 - y0)
+    area1 = max(0, bbox1[2] - bbox1[0]) * max(0, bbox1[3] - bbox1[1])
+    area2 = max(0, bbox2[2] - bbox2[0]) * max(0, bbox2[3] - bbox2[1])
+    union = area1 + area2 - inter
+    return inter / union if union > 0 else 0.0
+
+
 class TwoStageExtractor:
     def __init__(self, llm_service=None):
         self._llm = llm_service
@@ -79,7 +92,7 @@ class TwoStageExtractor:
                 img_w=img_w or "unknown",
                 img_h=img_h or "unknown",
             )
-            resp = await self._llm._call_llm(
+            resp = await self._llm.call_llm(
                 operation="identify_boundaries",
                 prompt=prompt,
                 images=[screenshot] if screenshot else None,
@@ -98,6 +111,9 @@ class TwoStageExtractor:
                         text_content=item.get("text_content", ""),
                         confidence=float(item.get("confidence", 0.5)),
                     ))
+                boundaries = self._nms_boundaries(boundaries)
+                boundaries = self._penalize_fullpage_boundaries(
+                    boundaries, img_w, img_h)
                 return boundaries
         except Exception as e:
             logger.warning("boundary_identify_failed", error=str(e))
@@ -125,7 +141,7 @@ class TwoStageExtractor:
 
         try:
             prompt = ATTR_PROMPT.format(boundaries=str(boundary_desc))
-            resp = await self._llm._call_llm(
+            resp = await self._llm.call_llm(
                 operation="extract_sku_attrs",
                 prompt=prompt,
                 images=[screenshot] if screenshot else None,
@@ -202,6 +218,35 @@ class TwoStageExtractor:
                     variant_label=variant_label,
                 ))
         return results
+
+    @staticmethod
+    def _nms_boundaries(
+        boundaries: list[SKUBoundary], iou_threshold: float = 0.5,
+    ) -> list[SKUBoundary]:
+        """IoU > threshold 的 boundary 保留 confidence 更高的。"""
+        sorted_b = sorted(boundaries, key=lambda b: b.confidence, reverse=True)
+        keep: list[SKUBoundary] = []
+        for b in sorted_b:
+            if not any(_compute_iou(b.bbox, k.bbox) > iou_threshold for k in keep):
+                keep.append(b)
+        for i, b in enumerate(keep):
+            b.boundary_id = i + 1
+        return keep
+
+    @staticmethod
+    def _penalize_fullpage_boundaries(
+        boundaries: list[SKUBoundary],
+        img_w: int, img_h: int,
+    ) -> list[SKUBoundary]:
+        """覆盖 >80% 页面的 boundary 降低 confidence。"""
+        page_area = img_w * img_h
+        if page_area <= 0:
+            return boundaries
+        for b in boundaries:
+            b_area = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1])
+            if b_area > page_area * 0.8:
+                b.confidence = min(b.confidence, 0.3)
+        return boundaries
 
     @staticmethod
     def _get_image_size(data: bytes) -> tuple[int, int]:

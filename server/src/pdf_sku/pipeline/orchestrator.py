@@ -41,8 +41,14 @@ DEFAULT_CONCURRENCY_RULES = [
 ]
 
 
-async def get_concurrency_for_pages(total_pages: int, redis=None) -> int:
-    """Determine pipeline concurrency based on page count and stored rules."""
+async def get_concurrency_for_pages(total_pages: int, redis=None, provider_name: str = "") -> int:
+    """Determine pipeline concurrency based on page count and (optionally) provider.
+
+    Two-dimensional matching:
+    1. First try provider-specific rules (provider_name matches exactly).
+    2. If none found, fall back to global rules (provider_name is empty).
+    3. Within matched rules, pick the highest min_pages that total_pages >= min_pages.
+    """
     rules = DEFAULT_CONCURRENCY_RULES
     if redis:
         try:
@@ -52,9 +58,19 @@ async def get_concurrency_for_pages(total_pages: int, redis=None) -> int:
         except Exception:
             logger.warning("concurrency_rules_read_failed, using defaults")
 
-    # Sort by min_pages desc, pick the first rule where total_pages >= min_pages
+    # 1. Filter provider-specific rules
+    if provider_name:
+        provider_rules = [r for r in rules if r.get("provider_name") == provider_name]
+    else:
+        provider_rules = []
+
+    if not provider_rules:
+        # 2. Fall back to global rules (no provider_name or empty)
+        provider_rules = [r for r in rules if not r.get("provider_name")]
+
+    # 3. Sort by min_pages desc, pick the first rule where total_pages >= min_pages
     concurrency = PIPELINE_CONCURRENCY_FALLBACK
-    for rule in sorted(rules, key=lambda r: r["min_pages"], reverse=True):
+    for rule in sorted(provider_rules, key=lambda r: r["min_pages"], reverse=True):
         if total_pages >= rule["min_pages"]:
             concurrency = rule["concurrency"]
             break
@@ -111,6 +127,13 @@ class Orchestrator:
         try:
             non_blank = [p for p in range(1, job.total_pages + 1)
                          if p not in blank_pages]
+
+            if not non_blank:
+                logger.warning("all_pages_blank", job_id=job_id, total_pages=job.total_pages)
+                async with self._db_factory() as final_db:
+                    await update_job_status(final_db, job_id, "FULL_IMPORTED", trigger="all_blank")
+                    await final_db.commit()
+                return
 
             await self._process_parallel(job, non_blank, file_path)
 
@@ -303,7 +326,7 @@ class Orchestrator:
                 ))
 
         for binding in result.bindings:
-            if binding.image_id and not binding.is_ambiguous:
+            if binding.image_id:
                 db.add(SKUImageBinding(
                     sku_id=binding.sku_id,
                     image_id=binding.image_id,

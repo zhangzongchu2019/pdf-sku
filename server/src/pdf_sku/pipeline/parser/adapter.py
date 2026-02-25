@@ -26,7 +26,7 @@ class PDFExtractor:
         # Level 1: pdfplumber
         try:
             result = self._extract_pdfplumber(file_path, page_no)
-            if result.text_coverage > TEXT_COVERAGE_THRESHOLD:
+            if result.text_coverage > TEXT_COVERAGE_THRESHOLD or result.images:
                 result.parser_backend = "pdfplumber"
                 return result
         except Exception as e:
@@ -35,7 +35,7 @@ class PDFExtractor:
         # Level 2: PyMuPDF
         try:
             result = self._extract_pymupdf(file_path, page_no)
-            if result.text_coverage > TEXT_COVERAGE_THRESHOLD:
+            if result.text_coverage > TEXT_COVERAGE_THRESHOLD or result.images:
                 result.parser_backend = "pymupdf"
                 return result
         except Exception as e:
@@ -57,6 +57,10 @@ class PDFExtractor:
             tables = self._plumber_tables(page)
             images = self._plumber_images(page, path, page_no)
             area = max(1.0, float(page.width) * float(page.height))
+
+        # pdfplumber 不提取图片字节，用 PyMuPDF 补充
+        if images:
+            self._fill_image_data_pymupdf(path, page_no, images)
 
         return ParsedPageIR(
             page_no=page_no,
@@ -100,11 +104,21 @@ class PDFExtractor:
                 xref = img_info[0]
                 try:
                     pix = fitz.Pixmap(doc, xref)
-                    img_data = pix.tobytes("png") if pix.n < 5 else b""
+                    img_data = self._pixmap_to_png(fitz, pix)
                     short_edge = min(pix.width, pix.height)
                     img_hash = hashlib.md5(img_data[:1024]).hexdigest()[:12] if img_data else ""
+                    # 获取图片在页面上的位置 (PDF points)
+                    img_bbox = (0, 0, 0, 0)
+                    try:
+                        rects = page.get_image_rects(xref)
+                        if rects:
+                            r = rects[0]
+                            img_bbox = (r.x0, r.y0, r.x1, r.y1)
+                    except Exception:
+                        pass
                     images.append(ImageInfo(
                         image_id=f"p{page_no}_img{i}",
+                        bbox=img_bbox,
                         data=img_data,
                         width=pix.width,
                         height=pix.height,
@@ -148,6 +162,45 @@ class PDFExtractor:
             )
         finally:
             doc.close()
+
+    @staticmethod
+    def _pixmap_to_png(fitz, pix) -> bytes:
+        """将 Pixmap 转为 PNG bytes，处理 CMYK 等非 RGB 色彩空间。"""
+        if pix.n >= 5:  # CMYK with alpha or beyond
+            return b""
+        if pix.n == 4:  # CMYK → RGB
+            pix = fitz.Pixmap(fitz.csRGB, pix)
+        return pix.tobytes("png")
+
+    @staticmethod
+    def _fill_image_data_pymupdf(path: str, page_no: int, images: list[ImageInfo]) -> None:
+        """用 PyMuPDF 为 pdfplumber 提取的图片补充像素数据。"""
+        try:
+            import fitz
+            doc = fitz.open(path)
+            try:
+                page = doc[page_no - 1]
+                fitz_images = page.get_images(full=True)
+                for i, img_info in enumerate(fitz_images):
+                    if i >= len(images):
+                        break
+                    xref = img_info[0]
+                    try:
+                        pix = fitz.Pixmap(doc, xref)
+                        img_data = PDFExtractor._pixmap_to_png(fitz, pix)
+                        if img_data:
+                            images[i].data = img_data
+                            images[i].width = pix.width
+                            images[i].height = pix.height
+                            images[i].short_edge = min(pix.width, pix.height)
+                            images[i].search_eligible = images[i].short_edge >= 200
+                            images[i].image_hash = hashlib.md5(img_data[:1024]).hexdigest()[:12]
+                    except Exception:
+                        pass
+            finally:
+                doc.close()
+        except Exception as e:
+            logger.debug("fill_image_data_failed", page=page_no, error=str(e))
 
     @staticmethod
     def _plumber_text_blocks(page) -> list[TextBlock]:

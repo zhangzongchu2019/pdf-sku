@@ -35,7 +35,7 @@ class PageClassifier:
         # LLM 分类
         if self._llm:
             try:
-                resp = await self._llm._call_llm(
+                resp = await self._llm.call_llm(
                     operation="classify_page",
                     prompt=f"Classify this PDF page. Features: {features.to_prompt_context()}",
                     images=[screenshot] if screenshot else None,
@@ -61,7 +61,7 @@ class PageClassifier:
         if features.table_count > 0 and features.table_area_ratio > 0.3:
             return ClassifyResult(page_type="A", layout_type="table", confidence=0.88)
 
-        # D: 空白页
+        # D: 空白页（无文字、无图片、无表格）
         if features.text_block_count == 0 and features.image_count == 0 and features.table_count == 0:
             return ClassifyResult(page_type="D", layout_type="freeform", confidence=0.95)
 
@@ -69,6 +69,24 @@ class PageClassifier:
         toc_kw = {"目录", "contents", "table of contents", "index"}
         if features.image_count == 0 and any(kw in raw_text.lower() for kw in toc_kw):
             return ClassifyResult(page_type="D", layout_type="freeform", confidence=0.90)
+
+        # D: 封面/扉页 — 文字很少且无价格/型号模式，含封面关键词
+        cover_kw = {"封面", "扉页", "cover", "catalogue", "catalog", "画册", "产品目录", "品牌"}
+        text_lower = raw_text.lower()
+        if (features.text_block_count <= 10
+            and not features.has_price_pattern
+            and not features.has_model_pattern
+            and (features.image_count <= 2 or features.text_block_count <= 3)
+            and any(kw in text_lower for kw in cover_kw)):
+            return ClassifyResult(page_type="D", layout_type="freeform", confidence=0.90)
+
+        # D: 文字极少的纯装饰页（无价格、无型号、文字块 ≤ 3、无表格、无图片）
+        if (features.text_block_count <= 3
+            and features.image_count == 0
+            and not features.has_price_pattern
+            and not features.has_model_pattern
+            and features.table_count == 0):
+            return ClassifyResult(page_type="D", layout_type="freeform", confidence=0.85)
 
         # C: 图片为主
         if features.image_count >= 3 and features.text_block_count < 5:

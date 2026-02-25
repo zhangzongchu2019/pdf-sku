@@ -72,6 +72,24 @@ class ConsistencyValidator:
             issues=issues, has_errors=has_errors, has_warnings=has_warnings)
 
     @staticmethod
+    def deduplicate_skus(skus: list[SKUResult]) -> list[SKUResult]:
+        """按 (product_name, model_number, size) 去重，保留 confidence 最高的。"""
+        seen: dict[tuple, SKUResult] = {}
+        for sku in skus:
+            attrs = sku.attributes
+            key = (
+                attrs.get("product_name", ""),
+                attrs.get("model_number", ""),
+                attrs.get("size", ""),
+            )
+            if key == ("", "", ""):
+                # 无法判断重复，保留
+                seen[id(sku)] = sku
+            elif key not in seen or sku.confidence > seen[key].confidence:
+                seen[key] = sku
+        return list(seen.values())
+
+    @staticmethod
     def enforce_sku_validity(
         skus: list[SKUResult], profile: dict | None = None
     ) -> list[SKUResult]:
@@ -84,7 +102,10 @@ class ConsistencyValidator:
             attrs = sku.attributes
             if mode == "strict":
                 has_name = bool(attrs.get("product_name"))
-                sku.validity = "valid" if has_name else "invalid"
+                has_model = bool(attrs.get("model_number"))
+                has_size = bool(attrs.get("size"))
+                # 仅有 product_name 不够，至少还需要 model_number 或 size
+                sku.validity = "valid" if (has_name and (has_model or has_size)) else "invalid"
             else:
                 sku.validity = "valid" if any(attrs.values()) else "invalid"
         return skus

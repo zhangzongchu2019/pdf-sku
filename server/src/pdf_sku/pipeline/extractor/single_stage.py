@@ -56,7 +56,7 @@ class SingleStageExtractor:
         try:
             page_text = raw.raw_text[:2000] if raw.raw_text else ""
             prompt = SINGLE_STAGE_PROMPT.format(page_text=page_text)
-            resp = await self._llm._call_llm(
+            resp = await self._llm.call_llm(
                 operation="extract_sku_single",
                 prompt=prompt,
                 images=[screenshot] if screenshot else None,

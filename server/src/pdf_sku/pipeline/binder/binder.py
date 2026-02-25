@@ -17,11 +17,11 @@ import structlog
 logger = structlog.get_logger()
 
 DISTANCE_THRESHOLDS = {
-    "grid": 100,
-    "table": 150,
-    "list": 200,
-    "freeform": 150,
-    "single_product": 300,
+    "grid": 300,
+    "table": 400,
+    "list": 500,
+    "freeform": 500,
+    "single_product": 800,
 }
 AMBIGUITY_GAP = 0.2
 TOP_K = 3
@@ -44,24 +44,74 @@ class SKUImageBinder:
         # 筛选可交付图片
         deliverable = [
             img for img in images
-            if (not img.role or img.role in DELIVERABLE_ROLES)
+            if (not img.role or img.role in DELIVERABLE_ROLES or img.role == "unknown")
             and not img.is_duplicate
         ]
 
         for sku in skus:
+            # 大 bbox (覆盖 >50% 页面): 用包含关系匹配，取 bbox 内最大图片
+            is_large = self._is_fullpage_bbox(
+                sku.source_bbox, [img.bbox for img in deliverable]
+            ) if deliverable else False
+
             candidates = []
-            for img in deliverable:
-                dist = self._bbox_distance(sku.source_bbox, img.bbox)
-                if dist <= threshold:
-                    conf = max(0.01, 1.0 - (dist / threshold))
-                    method = self._infer_method(sku, img, layout_type)
+            if is_large:
+                # 找 SKU bbox 内包含的图片，按面积降序
+                contained = self._find_contained_images(
+                    sku.source_bbox, deliverable)
+                if contained:
+                    best = contained[0]
                     candidates.append(BindingCandidate(
-                        image_id=img.image_id,
-                        confidence=round(conf, 3),
-                        method=method,
+                        image_id=best.image_id,
+                        confidence=0.6,
+                        method="containment",
                     ))
 
+            if not candidates:
+                # 预计算 SKU bbox 内图片的 overlap ratio
+                overlap_map = self._compute_overlap_ratios(
+                    sku.source_bbox, deliverable)
+                # 预计算图片面积，用于面积加分
+                max_area = max(
+                    (self._bbox_area(img.bbox) for img in deliverable),
+                    default=1,
+                ) or 1
+                for img in deliverable:
+                    dist = self._bbox_distance(sku.source_bbox, img.bbox)
+                    if dist <= threshold:
+                        conf = max(0.01, 1.0 - (dist / threshold))
+                        # 图片 >50% 面积在 SKU bbox 内 → containment bonus
+                        if overlap_map.get(img.image_id, 0) > 0.5:
+                            conf = min(1.0, conf + 0.3)
+                        # 面积加分: 大图更可能是产品主图 (最大 +0.15)
+                        area_ratio = self._bbox_area(img.bbox) / max_area
+                        conf = min(1.0, conf + area_ratio * 0.15)
+                        method = self._infer_method(sku, img, layout_type)
+                        candidates.append(BindingCandidate(
+                            image_id=img.image_id,
+                            confidence=round(conf, 3),
+                            method=method,
+                        ))
+
             candidates.sort(key=lambda c: c.confidence, reverse=True)
+
+            if not candidates:
+                # Fallback: 放宽阈值到 threshold * 3，取最近邻
+                fallback_threshold = threshold * 3
+                nearest_img = None
+                nearest_dist = float("inf")
+                for img in deliverable:
+                    dist = self._bbox_distance(sku.source_bbox, img.bbox)
+                    if dist < nearest_dist and dist <= fallback_threshold:
+                        nearest_dist = dist
+                        nearest_img = img
+                if nearest_img:
+                    conf = max(0.01, 1.0 - (nearest_dist / fallback_threshold))
+                    candidates.append(BindingCandidate(
+                        image_id=nearest_img.image_id,
+                        confidence=round(conf * 0.5, 3),  # 降低置信度
+                        method="fallback_nearest",
+                    ))
 
             if not candidates:
                 results.append(BindingResult(
@@ -77,17 +127,79 @@ class SKUImageBinder:
                     is_ambiguous=False,
                 ))
             else:
+                # 歧义时仍绑定 top1（降低置信度），避免完全丢失绑定
                 results.append(BindingResult(
-                    sku_id=sku.sku_id, image_id=None,
-                    confidence=candidates[0].confidence,
+                    sku_id=sku.sku_id,
+                    image_id=candidates[0].image_id,
+                    confidence=round(candidates[0].confidence * 0.7, 3),
+                    method=candidates[0].method,
                     is_ambiguous=True,
                     candidates=candidates[:TOP_K],
                 ))
-                logger.debug("binding_ambiguous",
+                logger.debug("binding_ambiguous_assigned",
                              sku_id=sku.sku_id, top_k=len(candidates[:TOP_K]))
         # 同一 product_id 的 SKU 统一绑定到组内最高置信度图片
         self._unify_product_bindings(skus, results)
         return results
+
+    @staticmethod
+    def _find_contained_images(
+        bbox: tuple[float, ...], images: list[ImageInfo],
+    ) -> list[ImageInfo]:
+        """找 bbox 内包含（或大部分重叠）的图片，按面积降序返回。"""
+        result = []
+        if len(bbox) < 4:
+            return result
+        bx0, by0, bx1, by1 = bbox[:4]
+        for img in images:
+            if len(img.bbox) < 4:
+                continue
+            ix0, iy0, ix1, iy1 = img.bbox[:4]
+            # 计算重叠区域
+            ox0 = max(bx0, ix0)
+            oy0 = max(by0, iy0)
+            ox1 = min(bx1, ix1)
+            oy1 = min(by1, iy1)
+            overlap = max(0, ox1 - ox0) * max(0, oy1 - oy0)
+            img_area = max(1, (ix1 - ix0) * (iy1 - iy0))
+            # 图片 >50% 面积在 SKU bbox 内
+            if overlap > img_area * 0.5:
+                result.append(img)
+        result.sort(
+            key=lambda i: (i.bbox[2] - i.bbox[0]) * (i.bbox[3] - i.bbox[1]),
+            reverse=True,
+        )
+        return result
+
+    @staticmethod
+    def _is_fullpage_bbox(
+        bbox: tuple[float, ...], img_bboxes: list[tuple[float, ...]],
+    ) -> bool:
+        """检测 bbox 是否覆盖几乎整个页面（>85% 的图片区域外接矩形）。
+
+        阈值设为 85%：只有真正的整页 bbox 才会触发退化处理，
+        避免误伤跨越半页的合理产品区域。
+        """
+        if len(bbox) < 4 or not img_bboxes:
+            return False
+        valid = [b for b in img_bboxes if len(b) >= 4]
+        if not valid:
+            return False
+        all_x0 = min(b[0] for b in valid)
+        all_y0 = min(b[1] for b in valid)
+        all_x1 = max(b[2] for b in valid)
+        all_y1 = max(b[3] for b in valid)
+        page_area = (all_x1 - all_x0) * (all_y1 - all_y0)
+        if page_area <= 0:
+            return False
+        sku_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+        return sku_area > page_area * 0.85
+
+    @staticmethod
+    def _bbox_area(bbox: tuple[float, ...]) -> float:
+        if len(bbox) < 4:
+            return 0
+        return max(0, (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
 
     @staticmethod
     def _bbox_distance(
@@ -136,6 +248,28 @@ class SKUImageBinder:
                         b.confidence = best.confidence * 0.9
                         b.method = "product_group"
                         b.is_ambiguous = False
+
+    @staticmethod
+    def _compute_overlap_ratios(
+        bbox: tuple[float, ...], images: list[ImageInfo],
+    ) -> dict[str, float]:
+        """计算每个图片与 SKU bbox 的重叠比例 (overlap_area / img_area)。"""
+        result = {}
+        if len(bbox) < 4:
+            return result
+        bx0, by0, bx1, by1 = bbox[:4]
+        for img in images:
+            if len(img.bbox) < 4:
+                continue
+            ix0, iy0, ix1, iy1 = img.bbox[:4]
+            ox0 = max(bx0, ix0)
+            oy0 = max(by0, iy0)
+            ox1 = min(bx1, ix1)
+            oy1 = min(by1, iy1)
+            overlap = max(0, ox1 - ox0) * max(0, oy1 - oy0)
+            img_area = max(1, (ix1 - ix0) * (iy1 - iy0))
+            result[img.image_id] = overlap / img_area
+        return result
 
     @staticmethod
     def _infer_method(sku: SKUResult, img: ImageInfo, layout_type: str) -> str:
