@@ -144,18 +144,24 @@ export const useJobStore = create<JobState>()(
     },
 
     cancelJob: async (jobId) => {
-      await jobsApi.cancel(jobId);
+      const result = await jobsApi.cancel(jobId);
       set((s) => {
         const job = s.jobs.find((j) => j.job_id === jobId);
-        if (job) job.user_status = "failed" as any;
+        if (job) {
+          job.user_status = result?.user_status ?? "failed";
+          job.status = result?.status ?? job.status;
+        }
       });
     },
 
     retryJob: async (jobId) => {
-      await jobsApi.retry(jobId);
+      const result = await jobsApi.retry(jobId);
       set((s) => {
         const job = s.jobs.find((j) => j.job_id === jobId);
-        if (job) job.user_status = "processing" as any;
+        if (job) {
+          job.user_status = result?.user_status ?? "processing";
+          job.status = result?.status ?? job.status;
+        }
       });
     },
 

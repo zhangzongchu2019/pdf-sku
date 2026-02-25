@@ -3,6 +3,7 @@ import { immer } from "zustand/middleware/immer";
 import { jobsApi } from "../api/jobs";
 import { useJobStore } from "./jobStore";
 import { useNotificationStore } from "./notificationStore";
+import type { Job } from "../types/models";
 import type {
   SSEPageCompleted,
   SSEJobCompleted,
@@ -82,7 +83,7 @@ export const useSSEStore = create<SSEState>()(
       es.addEventListener("job_completed", (e: MessageEvent) => {
         try {
           const data: SSEJobCompleted = JSON.parse(e.data);
-          useJobStore.getState().updateJobFromSSE(data.job_id, { status: data.status as any });
+          useJobStore.getState().updateJobFromSSE(data.job_id, { status: data.status as Job["status"] });
           useNotificationStore.getState().add({
             level: "info",
             message: `Job 处理完成，共 ${data.total_skus} 个 SKU`,
@@ -95,7 +96,7 @@ export const useSSEStore = create<SSEState>()(
       es.addEventListener("job_failed", (e: MessageEvent) => {
         try {
           const data: SSEJobFailed = JSON.parse(e.data);
-          useJobStore.getState().updateJobFromSSE(data.job_id, { status: "EVAL_FAILED" as any });
+          useJobStore.getState().updateJobFromSSE(data.job_id, { status: "EVAL_FAILED" as Job["status"] });
           useNotificationStore.getState().add({
             level: "urgent",
             message: `Job 处理失败：${data.error_message}`,
@@ -165,7 +166,7 @@ export const useSSEStore = create<SSEState>()(
       };
 
       set((s) => {
-        s.eventSource = es as any;
+        s.eventSource = es as unknown as EventSource;
         s.status = "reconnecting";
       });
     },

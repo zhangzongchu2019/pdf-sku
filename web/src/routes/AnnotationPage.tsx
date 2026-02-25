@@ -240,7 +240,7 @@ export default function AnnotationPage() {
       {/* Lock indicator */}
       <LockStatusIndicator
         lockedBy={currentTask.locked_by ?? null}
-        lockedAt={currentTask.timeout_at ?? null}
+        lockedAt={currentTask.locked_at ?? null}
         timeoutAt={currentTask.timeout_at ?? null}
         currentUserId=""
       />

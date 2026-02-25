@@ -30,7 +30,7 @@ interface NotificationState {
   notifications: NotificationItem[];
 
   addNotification: (n: Partial<NotificationItem> & { message: string }) => void;
-  add: (n: Omit<NotificationItem, "id" | "timestamp" | "read"> | { message: string; type?: string; level?: string }) => void;
+  add: (n: { message: string; level?: NotificationItem["level"]; type?: string; duration?: number; jobId?: string; taskId?: string }) => void;
   remove: (id: string) => void;
   markRead: (id: string) => void;
   markAllRead: () => void;
@@ -80,14 +80,16 @@ export const useNotificationStore = create<NotificationState>()(
 
       add: (n) => {
         const id = `n_${++seq}`;
-        const level = (n as any).level ?? ((n as any).type === "error" ? "urgent" : (n as any).type === "warning" ? "warning" : "info") as NotificationItem["level"];
+        const level: NotificationItem["level"] = n.level ?? (n.type === "error" ? "urgent" : n.type === "warning" ? "warning" : "info");
         const item: NotificationItem = {
           id,
           level,
           message: n.message,
           timestamp: Date.now(),
           read: false,
-          type: (n as any).type,
+          type: n.type as NotificationItem["type"],
+          jobId: n.jobId,
+          taskId: n.taskId,
         };
         set((s) => {
           s.items.unshift(item);
@@ -102,7 +104,7 @@ export const useNotificationStore = create<NotificationState>()(
             set((s) => {
               s.notifications = s.notifications.filter((x) => x.id !== id);
             });
-          }, (n as any).duration ?? duration);
+          }, n.duration ?? duration);
         }
       },
 

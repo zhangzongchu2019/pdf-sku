@@ -17,6 +17,10 @@ export interface UploadItem {
 
 interface UploadState {
   uploads: UploadItem[];
+  merchantId: string;
+  category: string;
+  setMerchantId: (v: string) => void;
+  setCategory: (v: string) => void;
   addFile: (file: File, profileId?: string) => void;
   startUpload: (id: string) => Promise<string>;
   updateProgress: (uploadId: string, progress: number) => void;
@@ -31,6 +35,10 @@ export const useUploadStore = create<UploadState>()(
   persist(
     immer((set, get) => ({
       uploads: [],
+      merchantId: "",
+      category: "",
+      setMerchantId: (v) => set((s) => { s.merchantId = v; }),
+      setCategory: (v) => set((s) => { s.category = v; }),
 
       addFile: (file, profileId) => {
         const id = `upload_${++counter}_${Date.now()}`;
@@ -105,7 +113,7 @@ export const useUploadStore = create<UploadState>()(
     })),
     {
       name: "pdf-sku-uploads",
-      partialize: (_s) => ({ uploads: [] } as any), // Don't persist File objects
+      partialize: (s) => ({ uploads: [], merchantId: s.merchantId, category: s.category } as any), // Don't persist File objects
     },
   ),
 );

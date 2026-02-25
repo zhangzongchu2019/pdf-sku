@@ -10,12 +10,9 @@ const MAX_SIZE = 16 * 1024 * 1024 * 1024; // 16GB
 export default function UploadPage() {
   const navigate = useNavigate();
   const fileRef = useRef<HTMLInputElement>(null);
-  const { uploads, addFile, startUpload, removeUpload, clearCompleted } = useUploadStore();
+  const { uploads, addFile, startUpload, removeUpload, clearCompleted, merchantId, category, setMerchantId, setCategory } = useUploadStore();
   const createJob = useJobStore((s) => s.createJob);
   const notify = useNotificationStore((s) => s.add);
-
-  const [merchantId, setMerchantId] = useState("");
-  const [category, setCategory] = useState("");
   const [dragActive, setDragActive] = useState(false);
 
   const handleFiles = useCallback((files: FileList | File[]) => {
@@ -48,7 +45,13 @@ export default function UploadPage() {
       const fileId = await startUpload(uploadId);
       const job = await createJob(fileId, merchantId, category || undefined);
       notify({ type: "success", message: `Job 创建成功: ${job.job_id.slice(0, 8)}...` });
-      navigate(`/jobs/${job.job_id}`);
+      // 有其他待上传文件时留在当前页，否则跳转到 Job 详情
+      const pending = useUploadStore.getState().uploads.filter(
+        (u) => u.id !== uploadId && u.status === "pending"
+      );
+      if (pending.length === 0) {
+        navigate(`/jobs/${job.job_id}`);
+      }
     } catch (e: any) {
       notify({ type: "error", message: e.message });
     }

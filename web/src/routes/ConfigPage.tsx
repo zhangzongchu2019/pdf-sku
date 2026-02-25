@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { configApi } from "../api/config";
-import type { LLMProviderConfig } from "../api/config";
+import type { LLMProviderEntry, LLMAccount } from "../api/config";
 import { useNotificationStore } from "../stores/notificationStore";
 import StatusBadge from "../components/common/StatusBadge";
 import { formatPercent, formatDate } from "../utils/format";
@@ -10,9 +10,10 @@ import type { ThresholdProfile, CalibrationRecord } from "../types/models";
 interface ConcurrencyRule {
   min_pages: number;
   concurrency: number;
+  provider_name?: string;
 }
 
-function PipelineConcurrencyCard() {
+function PipelineConcurrencyCard({ providerNames }: { providerNames: string[] }) {
   const notify = useNotificationStore((s) => s.add);
   const [rules, setRules] = useState<ConcurrencyRule[]>([]);
   const [saving, setSaving] = useState(false);
@@ -24,13 +25,13 @@ function PipelineConcurrencyCard() {
       .catch((e: any) => notify({ type: "error", message: "加载并发规则失败: " + e.message }));
   }, []);
 
-  const updateRule = (idx: number, field: "min_pages" | "concurrency", value: number) => {
+  const updateRule = (idx: number, field: keyof ConcurrencyRule, value: number | string) => {
     setRules((prev) => prev.map((r, i) => i === idx ? { ...r, [field]: value } : r));
   };
 
   const addRule = () => {
     const maxPages = rules.length > 0 ? Math.max(...rules.map((r) => r.min_pages)) : 0;
-    setRules([...rules, { min_pages: maxPages + 10, concurrency: 5 }]);
+    setRules([...rules, { min_pages: maxPages + 10, concurrency: 5, provider_name: "" }]);
   };
 
   const removeRule = (idx: number) => {
@@ -39,17 +40,11 @@ function PipelineConcurrencyCard() {
   };
 
   const handleSave = async () => {
-    // Validate
     for (const r of rules) {
       if (r.min_pages < 1 || r.concurrency < 1) {
         notify({ type: "error", message: "页数阈值和并发数必须 >= 1" });
         return;
       }
-    }
-    const pages = rules.map((r) => r.min_pages);
-    if (new Set(pages).size !== pages.length) {
-      notify({ type: "error", message: "页数阈值不能重复" });
-      return;
     }
     setSaving(true);
     try {
@@ -64,17 +59,38 @@ function PipelineConcurrencyCard() {
 
   if (!loaded) return null;
 
+  const selectStyle: React.CSSProperties = {
+    padding: "4px 8px",
+    backgroundColor: "#0F172A",
+    border: "1px solid #2D3548",
+    borderRadius: 4,
+    color: "#E2E8F4",
+    fontSize: 13,
+  };
+
+  const numInputStyle: React.CSSProperties = {
+    width: 80,
+    padding: "4px 8px",
+    backgroundColor: "#0F172A",
+    border: "1px solid #2D3548",
+    borderRadius: 4,
+    color: "#E2E8F4",
+    fontSize: 13,
+    textAlign: "center",
+  };
+
   return (
     <div className="card" style={{ marginBottom: 24 }}>
       <h3>Pipeline 并行处理</h3>
       <p style={{ fontSize: 12, color: "#94A3B8", marginBottom: 12 }}>
-        根据 PDF 页数自动调整并行任务数。匹配规则：取页数 &ge; 阈值的最高一条。
+        根据 PDF 页数和 Provider 自动调整并行任务数。Provider 专属规则优先，无匹配则回退到全局默认。
       </p>
 
       <table className="data-table" style={{ marginBottom: 12 }}>
         <thead>
           <tr>
-            <th style={{ width: 60 }}>#</th>
+            <th style={{ width: 40 }}>#</th>
+            <th>Provider</th>
             <th>页数阈值 (&ge;)</th>
             <th>并行任务数</th>
             <th style={{ width: 60 }}>操作</th>
@@ -83,10 +99,25 @@ function PipelineConcurrencyCard() {
         <tbody>
           {rules
             .slice()
-            .sort((a, b) => a.min_pages - b.min_pages)
+            .sort((a, b) => (a.provider_name || "").localeCompare(b.provider_name || "") || a.min_pages - b.min_pages)
             .map((rule, idx) => (
             <tr key={idx}>
               <td style={{ color: "#64748B" }}>{idx + 1}</td>
+              <td>
+                <select
+                  value={rule.provider_name || ""}
+                  onChange={(e) => {
+                    const realIdx = rules.indexOf(rule);
+                    updateRule(realIdx, "provider_name", e.target.value);
+                  }}
+                  style={selectStyle}
+                >
+                  <option value="">全局默认</option>
+                  {providerNames.map((n) => (
+                    <option key={n} value={n}>{n}</option>
+                  ))}
+                </select>
+              </td>
               <td>
                 <input
                   type="number"
@@ -96,16 +127,7 @@ function PipelineConcurrencyCard() {
                     const realIdx = rules.indexOf(rule);
                     updateRule(realIdx, "min_pages", parseInt(e.target.value) || 1);
                   }}
-                  style={{
-                    width: 80,
-                    padding: "4px 8px",
-                    backgroundColor: "#0F172A",
-                    border: "1px solid #2D3548",
-                    borderRadius: 4,
-                    color: "#E2E8F4",
-                    fontSize: 13,
-                    textAlign: "center",
-                  }}
+                  style={numInputStyle}
                 />
                 <span style={{ fontSize: 12, color: "#64748B", marginLeft: 6 }}>页</span>
               </td>
@@ -119,16 +141,7 @@ function PipelineConcurrencyCard() {
                     const realIdx = rules.indexOf(rule);
                     updateRule(realIdx, "concurrency", parseInt(e.target.value) || 1);
                   }}
-                  style={{
-                    width: 80,
-                    padding: "4px 8px",
-                    backgroundColor: "#0F172A",
-                    border: "1px solid #2D3548",
-                    borderRadius: 4,
-                    color: "#E2E8F4",
-                    fontSize: 13,
-                    textAlign: "center",
-                  }}
+                  style={numInputStyle}
                 />
                 <span style={{ fontSize: 12, color: "#64748B", marginLeft: 6 }}>个并行</span>
               </td>
@@ -158,44 +171,257 @@ function PipelineConcurrencyCard() {
   );
 }
 
-/* ─── LLM Provider 配置卡片 ─── */
-function LLMProviderConfigCard() {
+/* ─── LLM 账号管理卡片 ─── */
+function LLMAccountCard() {
   const notify = useNotificationStore((s) => s.add);
-  const [draft, setDraft] = useState<Record<string, LLMProviderConfig>>({});
+  const [accounts, setAccounts] = useState<LLMAccount[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState({ name: "", provider_type: "gemini", api_base: "", api_key: "" });
+  const [creating, setCreating] = useState(false);
+
+  const loadAccounts = useCallback(async () => {
+    try {
+      const res = await configApi.getLLMAccounts();
+      setAccounts(res.accounts);
+      setLoaded(true);
+    } catch (e: any) {
+      notify({ type: "error", message: "加载账号失败: " + e.message });
+    }
+  }, [notify]);
+
+  useEffect(() => { loadAccounts(); }, [loadAccounts]);
+
+  const handleCreate = async () => {
+    if (!form.name || !form.api_key) {
+      notify({ type: "error", message: "名称和 API Key 为必填" });
+      return;
+    }
+    setCreating(true);
+    try {
+      await configApi.createLLMAccount(form);
+      notify({ type: "success", message: `账号 "${form.name}" 已创建` });
+      setForm({ name: "", provider_type: "gemini", api_base: "", api_key: "" });
+      setShowForm(false);
+      loadAccounts();
+    } catch (e: any) {
+      notify({ type: "error", message: e.message });
+    }
+    setCreating(false);
+  };
+
+  const handleDelete = async (id: number, name: string) => {
+    if (!confirm(`确定删除账号 "${name}"？此操作不可恢复。`)) return;
+    try {
+      await configApi.deleteLLMAccount(id);
+      notify({ type: "success", message: `账号 "${name}" 已删除` });
+      loadAccounts();
+    } catch (e: any) {
+      notify({ type: "error", message: e.message });
+    }
+  };
+
+  if (!loaded) return null;
+
+  const inputStyle: React.CSSProperties = {
+    padding: "4px 8px",
+    backgroundColor: "#0F172A",
+    border: "1px solid #2D3548",
+    borderRadius: 4,
+    color: "#E2E8F4",
+    fontSize: 13,
+    width: "100%",
+  };
+
+  return (
+    <div className="card" style={{ marginBottom: 24 }}>
+      <h3>LLM 账号管理</h3>
+      <p style={{ fontSize: 12, color: "#94A3B8", marginBottom: 12 }}>
+        管理 API Key 凭据（加密存储），Provider 通过引用账号名获取凭据。
+      </p>
+
+      {accounts.length > 0 && (
+        <table className="data-table" style={{ marginBottom: 12 }}>
+          <thead>
+            <tr>
+              <th>名称</th>
+              <th>类型</th>
+              <th>接口 URL</th>
+              <th>Key (脱敏)</th>
+              <th>创建时间</th>
+              <th style={{ width: 60 }}>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {accounts.map((a) => (
+              <tr key={a.id}>
+                <td style={{ fontWeight: 600 }}>{a.name}</td>
+                <td>
+                  <span style={{
+                    display: "inline-block", padding: "1px 6px", fontSize: 10,
+                    borderRadius: 3, backgroundColor: "#3B82F618", border: "1px solid #3B82F633", color: "#60A5FA",
+                  }}>
+                    {a.provider_type}
+                  </span>
+                </td>
+                <td style={{ fontSize: 12, color: "#94A3B8", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis" }}>
+                  {a.api_base || "(默认)"}
+                </td>
+                <td style={{ fontFamily: "monospace", fontSize: 12, color: "#64748B" }}>{a.api_key_masked}</td>
+                <td style={{ fontSize: 12, color: "#64748B" }}>{a.created_at ? formatDate(a.created_at) : "-"}</td>
+                <td>
+                  <button
+                    className="btn btn-sm btn-danger"
+                    onClick={() => handleDelete(a.id, a.name)}
+                    style={{ padding: "2px 8px", fontSize: 12 }}
+                  >
+                    删除
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      {accounts.length === 0 && !showForm && (
+        <p style={{ color: "#64748B", fontSize: 13, marginBottom: 12 }}>暂无账号，点击下方按钮添加。</p>
+      )}
+
+      {showForm && (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12, maxWidth: 600 }}>
+          <div>
+            <label style={{ fontSize: 11, color: "#94A3B8" }}>名称 *</label>
+            <input style={inputStyle} placeholder="如: gemini-direct" value={form.name}
+              onChange={(e) => setForm({ ...form, name: e.target.value })} />
+          </div>
+          <div>
+            <label style={{ fontSize: 11, color: "#94A3B8" }}>类型 *</label>
+            <select style={inputStyle} value={form.provider_type}
+              onChange={(e) => setForm({ ...form, provider_type: e.target.value })}>
+              <option value="gemini">Gemini</option>
+              <option value="qwen">Qwen</option>
+              <option value="openrouter">OpenRouter</option>
+              <option value="custom">Custom</option>
+            </select>
+          </div>
+          <div>
+            <label style={{ fontSize: 11, color: "#94A3B8" }}>接口 URL (留空用默认)</label>
+            <input style={inputStyle} placeholder="https://..." value={form.api_base}
+              onChange={(e) => setForm({ ...form, api_base: e.target.value })} />
+          </div>
+          <div>
+            <label style={{ fontSize: 11, color: "#94A3B8" }}>API Key *</label>
+            <input type="password" style={inputStyle} placeholder="sk-..." value={form.api_key}
+              onChange={(e) => setForm({ ...form, api_key: e.target.value })} />
+          </div>
+          <div style={{ gridColumn: "1 / -1", display: "flex", gap: 8 }}>
+            <button className="btn btn-primary btn-sm" onClick={handleCreate} disabled={creating}>
+              {creating ? "创建中..." : "确认创建"}
+            </button>
+            <button className="btn btn-outline btn-sm" onClick={() => setShowForm(false)}>取消</button>
+          </div>
+        </div>
+      )}
+
+      {!showForm && (
+        <button className="btn btn-outline btn-sm" onClick={() => setShowForm(true)}>+ 添加账号</button>
+      )}
+    </div>
+  );
+}
+
+/* ─── LLM Provider 配置卡片 (优先级排序) ─── */
+function LLMProviderConfigCard({ onProvidersLoaded }: { onProvidersLoaded?: (names: string[]) => void }) {
+  const notify = useNotificationStore((s) => s.add);
+  const [providers, setProviders] = useState<LLMProviderEntry[]>([]);
+  const [expandedName, setExpandedName] = useState<string | null>(null);
   const [saving, setSaving] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
 
-  useEffect(() => {
-    configApi.getLLMProviderConfigs()
-      .then((res) => {
-        setDraft(JSON.parse(JSON.stringify(res.configs)));
+  const loadProviders = useCallback(async () => {
+    try {
+      const res = await configApi.getLLMProviders();
+      setProviders(res.providers);
+      setLoaded(true);
+    } catch {
+      // Fallback to legacy API
+      try {
+        const res = await configApi.getLLMProviderConfigs();
+        const legacy: LLMProviderEntry[] = Object.entries(res.configs).map(([name, cfg], idx) => ({
+          name,
+          provider_type: name,
+          access_mode: "direct" as const,
+          proxy_service: null,
+          model: "",
+          priority: idx,
+          enabled: true,
+          account_name: "",
+          qpm_limit: 60,
+          tpm_limit: 100000,
+          ...cfg,
+        }));
+        setProviders(legacy);
         setLoaded(true);
-      })
-      .catch((e: any) => notify({ type: "error", message: "加载 LLM 配置失败: " + e.message }));
-  }, []);
+      } catch (e: any) {
+        notify({ type: "error", message: "加载 LLM 配置失败: " + e.message });
+      }
+    }
+  }, [notify]);
 
-  const updateField = (provider: string, field: keyof LLMProviderConfig, value: number) => {
-    setDraft((prev) => ({
-      ...prev,
-      [provider]: { ...prev[provider], [field]: value },
-    }));
+  useEffect(() => { loadProviders(); }, [loadProviders]);
+
+  useEffect(() => {
+    if (loaded && onProvidersLoaded) {
+      onProvidersLoaded(providers.map((p) => p.name));
+    }
+  }, [loaded, providers, onProvidersLoaded]);
+
+  const handleMoveUp = async (idx: number) => {
+    if (idx <= 0) return;
+    const newOrder = [...providers];
+    [newOrder[idx - 1], newOrder[idx]] = [newOrder[idx], newOrder[idx - 1]];
+    const orderedNames = newOrder.map((p) => p.name);
+    try {
+      const res = await configApi.reorderLLMProviders(orderedNames);
+      setProviders(res.providers);
+    } catch (e: any) {
+      notify({ type: "error", message: e.message });
+    }
   };
 
-  const handleSave = async (provider: string) => {
-    const cfg = draft[provider];
-    if (cfg.timeout_seconds < 1 || cfg.vlm_timeout_seconds < 1) {
-      notify({ type: "error", message: "超时值必须 >= 1" });
-      return;
-    }
-    if (cfg.max_retries < 0 || cfg.max_retries > 10) {
-      notify({ type: "error", message: "重试次数必须在 0-10 之间" });
-      return;
-    }
-    setSaving(provider);
+  const handleMoveDown = async (idx: number) => {
+    if (idx >= providers.length - 1) return;
+    const newOrder = [...providers];
+    [newOrder[idx], newOrder[idx + 1]] = [newOrder[idx + 1], newOrder[idx]];
+    const orderedNames = newOrder.map((p) => p.name);
     try {
-      const res = await configApi.setLLMProviderConfig(provider, cfg);
-      setDraft((prev) => ({ ...prev, [provider]: { ...res.config } }));
-      notify({ type: "success", message: `${provider} 配置已保存` });
+      const res = await configApi.reorderLLMProviders(orderedNames);
+      setProviders(res.providers);
+    } catch (e: any) {
+      notify({ type: "error", message: e.message });
+    }
+  };
+
+  const handleToggle = async (name: string, enabled: boolean) => {
+    try {
+      await configApi.toggleLLMProvider(name, enabled);
+      setProviders((prev) =>
+        prev.map((p) => p.name === name ? { ...p, enabled } : p)
+      );
+    } catch (e: any) {
+      notify({ type: "error", message: e.message });
+    }
+  };
+
+  const handleSaveConfig = async (name: string, updates: Partial<Pick<LLMProviderEntry, "timeout_seconds" | "vlm_timeout_seconds" | "max_retries" | "qpm_limit" | "tpm_limit">>) => {
+    setSaving(name);
+    try {
+      const res = await configApi.updateLLMProvider(name, updates);
+      setProviders((prev) =>
+        prev.map((p) => p.name === name ? res.provider : p)
+      );
+      notify({ type: "success", message: `${name} 配置已保存` });
     } catch (e: any) {
       notify({ type: "error", message: e.message });
     }
@@ -203,6 +429,7 @@ function LLMProviderConfigCard() {
   };
 
   if (!loaded) return null;
+  if (providers.length === 0) return null;
 
   const inputStyle: React.CSSProperties = {
     width: 80,
@@ -215,66 +442,159 @@ function LLMProviderConfigCard() {
     textAlign: "center",
   };
 
+  const badgeStyle = (mode: string): React.CSSProperties => ({
+    display: "inline-block",
+    padding: "1px 6px",
+    fontSize: 10,
+    borderRadius: 3,
+    marginLeft: 6,
+    backgroundColor: mode === "direct" ? "#10B98118" : "#8B5CF618",
+    border: `1px solid ${mode === "direct" ? "#10B98133" : "#8B5CF633"}`,
+    color: mode === "direct" ? "#10B981" : "#8B5CF6",
+  });
+
   return (
     <div className="card" style={{ marginBottom: 24 }}>
-      <h3>LLM Provider 配置</h3>
+      <h3>LLM Provider 优先级</h3>
       <p style={{ fontSize: 12, color: "#94A3B8", marginBottom: 12 }}>
-        每个 LLM 提供者的超时和重试参数，修改后立即生效（热更新）。
+        按优先级排序，故障时自动 Fallback 到下一个启用的 Provider。
       </p>
 
       <table className="data-table" style={{ marginBottom: 12 }}>
         <thead>
           <tr>
+            <th style={{ width: 40 }}>#</th>
+            <th style={{ width: 60 }}>排序</th>
             <th>Provider</th>
-            <th>超时 (s)</th>
-            <th>VLM 超时 (s)</th>
-            <th>最大重试</th>
-            <th style={{ width: 80 }}>操作</th>
+            <th>模型</th>
+            <th>账号</th>
+            <th style={{ width: 70 }}>启用</th>
+            <th style={{ width: 60 }}>展开</th>
           </tr>
         </thead>
         <tbody>
-          {Object.entries(draft).map(([provider, cfg]) => (
-            <tr key={provider}>
-              <td style={{ fontWeight: 600 }}>{provider}</td>
-              <td>
-                <input
-                  type="number"
-                  min={1}
-                  value={cfg.timeout_seconds}
-                  onChange={(e) => updateField(provider, "timeout_seconds", parseInt(e.target.value) || 1)}
-                  style={inputStyle}
-                />
-              </td>
-              <td>
-                <input
-                  type="number"
-                  min={1}
-                  value={cfg.vlm_timeout_seconds}
-                  onChange={(e) => updateField(provider, "vlm_timeout_seconds", parseInt(e.target.value) || 1)}
-                  style={inputStyle}
-                />
-              </td>
-              <td>
-                <input
-                  type="number"
-                  min={0}
-                  max={10}
-                  value={cfg.max_retries}
-                  onChange={(e) => updateField(provider, "max_retries", parseInt(e.target.value) || 0)}
-                  style={inputStyle}
-                />
-              </td>
-              <td>
-                <button
-                  className="btn btn-primary btn-sm"
-                  onClick={() => handleSave(provider)}
-                  disabled={saving === provider}
-                  style={{ padding: "2px 12px", fontSize: 12 }}
-                >
-                  {saving === provider ? "..." : "保存"}
-                </button>
-              </td>
-            </tr>
+          {providers.map((p, idx) => (
+            <>
+              <tr key={p.name} style={{ opacity: p.enabled ? 1 : 0.5 }}>
+                <td style={{ color: "#64748B" }}>{idx + 1}</td>
+                <td>
+                  <button
+                    className="btn btn-sm btn-outline"
+                    onClick={() => handleMoveUp(idx)}
+                    disabled={idx === 0}
+                    style={{ padding: "0 4px", fontSize: 11, marginRight: 2 }}
+                    title="上移"
+                  >
+                    ↑
+                  </button>
+                  <button
+                    className="btn btn-sm btn-outline"
+                    onClick={() => handleMoveDown(idx)}
+                    disabled={idx === providers.length - 1}
+                    style={{ padding: "0 4px", fontSize: 11 }}
+                    title="下移"
+                  >
+                    ↓
+                  </button>
+                </td>
+                <td>
+                  <span style={{ fontWeight: 600 }}>{p.name}</span>
+                  <span style={badgeStyle(p.access_mode)}>
+                    {p.access_mode === "direct" ? "直连" : p.proxy_service || "代理"}
+                  </span>
+                </td>
+                <td style={{ fontSize: 12, color: "#94A3B8" }}>{p.model || "-"}</td>
+                <td style={{ fontSize: 12, color: "#94A3B8" }}>{p.account_name || "-"}</td>
+                <td>
+                  <label style={{ cursor: "pointer" }}>
+                    <input
+                      type="checkbox"
+                      checked={p.enabled}
+                      onChange={(e) => handleToggle(p.name, e.target.checked)}
+                      style={{ marginRight: 4 }}
+                    />
+                    {p.enabled ? "开" : "关"}
+                  </label>
+                </td>
+                <td>
+                  <button
+                    className="btn btn-sm btn-outline"
+                    onClick={() => setExpandedName(expandedName === p.name ? null : p.name)}
+                    style={{ padding: "0 8px", fontSize: 11 }}
+                  >
+                    {expandedName === p.name ? "收起" : "配置"}
+                  </button>
+                </td>
+              </tr>
+              {expandedName === p.name && (
+                <tr key={`${p.name}-config`}>
+                  <td colSpan={7} style={{ padding: "8px 16px", backgroundColor: "#0F172A" }}>
+                    <div style={{ display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
+                      <label style={{ fontSize: 12 }}>
+                        超时(s):
+                        <input
+                          type="number" min={1}
+                          defaultValue={p.timeout_seconds}
+                          id={`timeout-${p.name}`}
+                          style={{ ...inputStyle, marginLeft: 4 }}
+                        />
+                      </label>
+                      <label style={{ fontSize: 12 }}>
+                        VLM超时(s):
+                        <input
+                          type="number" min={1}
+                          defaultValue={p.vlm_timeout_seconds}
+                          id={`vlm-timeout-${p.name}`}
+                          style={{ ...inputStyle, marginLeft: 4 }}
+                        />
+                      </label>
+                      <label style={{ fontSize: 12 }}>
+                        重试:
+                        <input
+                          type="number" min={0} max={10}
+                          defaultValue={p.max_retries}
+                          id={`retries-${p.name}`}
+                          style={{ ...inputStyle, marginLeft: 4 }}
+                        />
+                      </label>
+                      <label style={{ fontSize: 12 }}>
+                        QPM:
+                        <input
+                          type="number" min={1}
+                          defaultValue={p.qpm_limit ?? 60}
+                          id={`qpm-${p.name}`}
+                          style={{ ...inputStyle, marginLeft: 4 }}
+                        />
+                      </label>
+                      <label style={{ fontSize: 12 }}>
+                        TPM:
+                        <input
+                          type="number" min={1}
+                          defaultValue={p.tpm_limit ?? 100000}
+                          id={`tpm-${p.name}`}
+                          style={{ ...inputStyle, marginLeft: 4 }}
+                        />
+                      </label>
+                      <button
+                        className="btn btn-primary btn-sm"
+                        disabled={saving === p.name}
+                        style={{ padding: "2px 12px", fontSize: 12 }}
+                        onClick={() => {
+                          const ts = parseInt((document.getElementById(`timeout-${p.name}`) as HTMLInputElement)?.value) || p.timeout_seconds;
+                          const vts = parseInt((document.getElementById(`vlm-timeout-${p.name}`) as HTMLInputElement)?.value) || p.vlm_timeout_seconds;
+                          const mr = parseInt((document.getElementById(`retries-${p.name}`) as HTMLInputElement)?.value) ?? p.max_retries;
+                          const qpm = parseInt((document.getElementById(`qpm-${p.name}`) as HTMLInputElement)?.value) || 60;
+                          const tpm = parseInt((document.getElementById(`tpm-${p.name}`) as HTMLInputElement)?.value) || 100000;
+                          handleSaveConfig(p.name, { timeout_seconds: ts, vlm_timeout_seconds: vts, max_retries: mr, qpm_limit: qpm, tpm_limit: tpm });
+                        }}
+                      >
+                        {saving === p.name ? "..." : "保存"}
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              )}
+            </>
           ))}
         </tbody>
       </table>
@@ -290,6 +610,7 @@ export default function ConfigPage() {
   const [preview, setPreview] = useState<any>(null);
   const [loading, setLoading] = useState(false);
   const [reason, setReason] = useState("");
+  const [providerNames, setProviderNames] = useState<string[]>([]);
 
   useEffect(() => {
     loadData();
@@ -365,11 +686,14 @@ export default function ConfigPage() {
     <div className="page config-page">
       <h2>系统配置</h2>
 
+      {/* LLM 账号管理 */}
+      <LLMAccountCard />
+
       {/* Pipeline 并发规则 */}
-      <PipelineConcurrencyCard />
+      <PipelineConcurrencyCard providerNames={providerNames} />
 
       {/* LLM Provider 配置 */}
-      <LLMProviderConfigCard />
+      <LLMProviderConfigCard onProvidersLoaded={setProviderNames} />
 
       {profile && (
         <div className="card">

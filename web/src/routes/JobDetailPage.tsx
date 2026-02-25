@@ -278,7 +278,11 @@ export default function JobDetailPage() {
                           {pageDetail?.skus.map((sku) => (
                             <div key={sku.sku_id} style={{ marginBottom: 10, padding: 8, backgroundColor: "#1B2233", borderRadius: 6, border: "1px solid #2D3548" }}>
                               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
-                                <span style={{ color: "#E2E8F4" }}>{sku.attributes?.model || sku.attributes?.name || sku.sku_id}</span>
+                                <span style={{ color: "#E2E8F4" }}>
+                                  {sku.attributes?.model_number || sku.attributes?.model || sku.sku_id}
+                                  {sku.attributes?.product_name || sku.attributes?.name ? ` ${sku.attributes.product_name || sku.attributes.name}` : ""}
+                                  {sku.attributes?.size ? ` | ${sku.attributes.size}` : ""}
+                                </span>
                                 <span style={{ color: "#64748B" }}>{sku.validity}</span>
                               </div>
                               {sku.images.length > 0 && (

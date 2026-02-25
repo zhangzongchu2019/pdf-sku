@@ -62,8 +62,8 @@ export const jobsApi = {
   create: (uploadId: string, merchantId: string, category?: string) =>
     api.post<Job>("/jobs", { upload_id: uploadId, merchant_id: merchantId, category }),
 
-  cancel: (jobId: string) => api.post<void>(`/jobs/${jobId}/cancel`),
-  retry: (jobId: string) => api.post<void>(`/jobs/${jobId}/requeue`),
+  cancel: (jobId: string) => api.post<Job>(`/jobs/${jobId}/cancel`),
+  retry: (jobId: string) => api.post<Job>(`/jobs/${jobId}/requeue`),
   delete: (jobId: string) => api.delete<void>(`/ops/jobs/${jobId}`),
 
   getPages: async (jobId: string) => {

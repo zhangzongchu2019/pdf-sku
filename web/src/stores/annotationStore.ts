@@ -161,7 +161,7 @@ export const useAnnotationStore = create<AnnotationState>()(
             s.currentTaskId = task.task_id;
             s.currentJobId = task.job_id;
             s.currentPageNo = task.page_number;
-            s.elements = (task as any).elements ?? [];
+            s.elements = task.elements ?? [];
           }
         });
         if (heartbeatTimer) clearInterval(heartbeatTimer);
