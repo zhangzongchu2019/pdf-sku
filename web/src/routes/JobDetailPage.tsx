@@ -232,7 +232,7 @@ export default function JobDetailPage() {
             <tr>
               <th style={{ width: 70 }}>缩略图</th>
               <th>页码</th><th>状态</th><th>类型</th><th>SKU数</th>
-              <th>置信度</th><th>提取方式</th><th>LLM模型</th>
+              <th>置信度</th><th style={{ width: 70 }}>需介入</th><th>提取方式</th><th>LLM模型</th>
             </tr>
           </thead>
           <tbody>
@@ -254,12 +254,19 @@ export default function JobDetailPage() {
                   <td>{p.page_type || "-"}</td>
                   <td>{p.sku_count}</td>
                   <td>{p.page_confidence ? formatPercent(p.page_confidence) : "-"}</td>
+                  <td style={{ textAlign: "center" }}>
+                    {p.needs_review ? (
+                      <span title="需要人工介入" style={{ color: "#EF4444", fontSize: 16 }}>&#9873;</span>
+                    ) : (
+                      <span style={{ color: "#64748B" }}>—</span>
+                    )}
+                  </td>
                   <td>{p.extraction_method || "-"}</td>
                   <td>{p.llm_model_used || "-"}</td>
                 </tr>
                 {expandedPage === p.page_number && (
                   <tr key={`detail-${p.id}`}>
-                    <td colSpan={8} style={{ padding: 0 }}>
+                    <td colSpan={9} style={{ padding: 0 }}>
                       <div style={{ display: "flex", gap: 16, padding: 16, backgroundColor: "#151C2C", borderBottom: "2px solid #22D3EE33" }}>
                         {/* Left: large screenshot */}
                         <div style={{ flexShrink: 0 }}>

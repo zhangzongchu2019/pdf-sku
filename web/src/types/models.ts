@@ -32,6 +32,7 @@ export interface Job {
   blank_pages: number[];
   ai_pages: number[];
   human_pages: number[];
+  review_pages: number[];
   failed_pages: number[];
   created_at: string;
   updated_at: string;

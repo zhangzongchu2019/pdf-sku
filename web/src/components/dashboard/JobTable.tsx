@@ -22,6 +22,7 @@ const COLUMNS = [
   { key: "route", label: "路由", width: 80 },
   { key: "status", label: "状态", width: 140 },
   { key: "progress", label: "进度", width: 120 },
+  { key: "review", label: "需审核", width: 60 },
   { key: "human", label: "待标注", width: 60 },
   { key: "action", label: "操作", width: 60 },
 ];

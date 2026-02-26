@@ -91,21 +91,27 @@ class ConsistencyValidator:
 
     @staticmethod
     def enforce_sku_validity(
-        skus: list[SKUResult], profile: dict | None = None
+        skus: list[SKUResult],
+        profile: dict | None = None,
+        text_block_count: int | None = None,
     ) -> list[SKUResult]:
         """
         [C6] 强制 SKU validity: valid/invalid (无 partial)。
-        strict 模式: 必须有 product_name
+        strict 模式: 至少两个核心属性 (name/model/size 中任意两个)
+        relaxed 模式 (纯图页 text_block_count <= 5): 任何属性非空即可
         """
         mode = (profile or {}).get("sku_validity_mode", "strict")
+        is_image_only = text_block_count is not None and text_block_count <= 5
         for sku in skus:
             attrs = sku.attributes
-            if mode == "strict":
+            if mode == "strict" and not is_image_only:
                 has_name = bool(attrs.get("product_name"))
                 has_model = bool(attrs.get("model_number"))
                 has_size = bool(attrs.get("size"))
-                # 仅有 product_name 不够，至少还需要 model_number 或 size
-                sku.validity = "valid" if (has_name and (has_model or has_size)) else "invalid"
+                # 至少两个核心属性: name/model/size 中任意两个
+                core_count = sum([has_name, has_model, has_size])
+                sku.validity = "valid" if core_count >= 2 else "invalid"
             else:
+                # relaxed: 任何属性非空即 valid
                 sku.validity = "valid" if any(attrs.values()) else "invalid"
         return skus

@@ -14,8 +14,11 @@ import structlog
 logger = structlog.get_logger()
 _parser = ResponseParser()
 
-BOUNDARY_PROMPT_TEMPLATE = """Identify SKU product boundaries in this PDF page image.
+BOUNDARY_PROMPT_TEMPLATE = """Identify ALL product boundaries in this PDF catalog page image.
 The image dimensions are {img_w} x {img_h} pixels.
+
+IMPORTANT: Scene/room photos often contain MULTIPLE products (e.g. a bedroom photo may show a bed, bedside tables, wardrobe, and dresser). Each distinct product must have its own boundary, even if it appears small or in the background.
+
 For each product, return its bounding box coordinates in pixel units (0 to {img_w} for x, 0 to {img_h} for y).
 The bbox uses the top-left origin: [x0, y0, x1, y1] where (x0,y0) is the top-left and (x1,y1) is the bottom-right of the product region.
 

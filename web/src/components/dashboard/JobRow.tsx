@@ -92,6 +92,16 @@ export function JobRow({ job, selected, onSelect, onClick }: JobRowProps) {
           </span>
         </div>
       </td>
+      <td style={{ padding: "10px 8px", fontSize: 12 }}>
+        {job.review_pages.length > 0 ? (
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 3, color: "#EF4444" }}>
+            <span style={{ fontSize: 14 }}>&#9873;</span>
+            {job.review_pages.length}
+          </span>
+        ) : (
+          <span style={{ color: "#64748B" }}>0</span>
+        )}
+      </td>
       <td style={{ padding: "10px 8px", color: "#94A3B8", fontSize: 12 }}>
         {job.human_pages.length}
       </td>

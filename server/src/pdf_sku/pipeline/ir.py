@@ -180,6 +180,7 @@ class PageResult:
     classification_confidence: float = 0.0
     extraction_method: str | None = None
     llm_model_used: str | None = None
+    page_confidence: float = 0.0
     fallback_reason: str | None = None
     degrade_reason: str | None = None
     error: str | None = None

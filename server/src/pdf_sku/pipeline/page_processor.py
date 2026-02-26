@@ -13,12 +13,13 @@ Phase 9: 导出
 """
 from __future__ import annotations
 import asyncio
+import math
 import hashlib
 from concurrent.futures import ProcessPoolExecutor
 
 from pdf_sku.pipeline.ir import (
     ParsedPageIR, FeatureVector, ClassifyResult, PageResult,
-    SKUResult, ImageInfo, BindingResult,
+    SKUResult, ImageInfo, BindingResult, ValidationResult,
 )
 from pdf_sku.pipeline.parser.adapter import PDFExtractor
 from pdf_sku.pipeline.parser.feature_extractor import FeatureExtractor
@@ -127,6 +128,9 @@ class PageProcessor:
                 if img.data:
                     img.image_hash = hashlib.md5(img.data[:2048]).hexdigest()[:12]
 
+            # ═══ Phase 2a: 图片去重 ═══
+            raw.images = self._dedup_images(raw.images)
+
             # ═══ Phase 2b: 瓦片碎片聚类合并 ═══
             raw.images = self._merge_tile_fragments(raw.images, page_no)
 
@@ -157,7 +161,8 @@ class PageProcessor:
             if page_type == "D" and cls_result.confidence >= 0.85:
                 return PageResult(
                     status="SKIPPED", page_type="D",
-                    classification_confidence=cls_result.confidence)
+                    classification_confidence=cls_result.confidence,
+                    page_confidence=cls_result.confidence)
 
             # ═══ Phase 6: SKU 提取 ═══
             skus = await self._extract_skus_with_fallback(
@@ -166,8 +171,38 @@ class PageProcessor:
 
             # deduplicate + enforce validity + filter invalid
             skus = self._validator.deduplicate_skus(skus)
-            skus = self._validator.enforce_sku_validity(skus, None)
+            skus = self._validator.enforce_sku_validity(
+                skus, None, text_block_count=features.text_block_count)
             skus = [s for s in skus if s.validity == "valid"]
+
+            # ── retry: validity 全灭 或 SKU 数远少于图片数 ──
+            eligible_count = sum(1 for img in raw.images if img.search_eligible)
+            should_retry = (
+                page_type not in ("D", "A")
+                and (
+                    (not skus and extraction_method is not None)
+                    or (0 < len(skus) < eligible_count * 0.5
+                        and eligible_count >= 2)
+                )
+            )
+            if should_retry:
+                retry_skus = await self._extract_skus_with_fallback(
+                    raw, page_type, screenshot, features, llm_calls_used=4)
+                retry_skus = self._validator.deduplicate_skus(retry_skus)
+                retry_skus = self._validator.enforce_sku_validity(
+                    retry_skus, None, text_block_count=features.text_block_count)
+                retry_skus = [s for s in retry_skus if s.validity == "valid"]
+                if len(retry_skus) > len(skus):
+                    skus = retry_skus
+                    extraction_method = skus[0].extraction_method if skus else extraction_method
+                    fallback_reason = "retry_improved"
+                logger.info("sku_extraction_retry",
+                            page=page_no,
+                            trigger="all_invalid" if not skus else "low_coverage",
+                            before_retry=len(skus),
+                            after_retry=len(retry_skus),
+                            adopted=len(retry_skus) > len(skus),
+                            eligible_images=eligible_count)
 
             # ═══ Phase 7: ID 分配 ═══
             hash_prefix = (file_hash or "unknown")[:8]
@@ -187,19 +222,25 @@ class PageProcessor:
                         img.bbox[3] * scale,
                     )
             eligible_images = [img for img in raw.images if img.search_eligible]
+
+            # source_bbox 修正: 用 PDF 文本块精确定位 SKU 位置
+            if raw.text_blocks and skus:
+                self._refine_sku_bboxes(skus, raw.text_blocks, scale)
+
             bindings = self._binder.bind(skus, eligible_images, cls_result)
 
-            # 瓦片页 VLM 辅助绑定: 文字层为空时空间绑定不可靠，用 VLM 重新匹配
-            composites = [img for img in eligible_images
-                          if "_composite_" in img.image_id]
-            if (not raw.text_blocks and composites and skus
-                    and screenshot and self._llm):
+            # VLM 辅助绑定: 文字层为空时空间绑定不可靠，用 VLM 视觉匹配
+            if (not raw.text_blocks and len(eligible_images) >= 1
+                    and len(skus) >= 2 and screenshot and self._llm):
                 vlm_bindings = await self._vlm_rebind_composites(
-                    skus, composites, screenshot)
+                    skus, eligible_images, screenshot)
                 if vlm_bindings:
-                    bindings = vlm_bindings
+                    # 合并模式: VLM 匹配的覆盖空间绑定，未匹配的保留原绑定
+                    vlm_sku_ids = {b.sku_id for b in vlm_bindings}
+                    kept = [b for b in bindings if b.sku_id not in vlm_sku_ids]
+                    bindings = vlm_bindings + kept
 
-            # Composite 图片: 从截图裁剪生成实际图片数据
+            # 虚拟图片裁剪: 从截图生成实际图片数据
             if screenshot:
                 self._crop_composites(raw.images, screenshot)
 
@@ -210,11 +251,11 @@ class PageProcessor:
             exported = await self._exporter.export(
                 skus, job_id, page_no)
 
-            needs_review = (
-                validation.has_errors or
-                cls_result.confidence < 0.6 or
-                (not skus and page_type not in ("D",))
+            page_confidence = self._compute_page_confidence(
+                cls_result, skus, bindings, validation,
+                extraction_method, fallback_reason,
             )
+            needs_review = page_confidence < 0.6
 
             return PageResult(
                 status="AI_COMPLETED",
@@ -228,6 +269,7 @@ class PageProcessor:
                 extraction_method=extraction_method,
                 llm_model_used=self._llm.current_model_name if self._llm else None,
                 fallback_reason=fallback_reason,
+                page_confidence=page_confidence,
             )
 
         except Exception as e:
@@ -308,13 +350,96 @@ class PageProcessor:
                     ))
         return results
 
+    @staticmethod
+    def _refine_sku_bboxes(
+        skus: list[SKUResult],
+        text_blocks: list,
+        scale: float,
+    ) -> None:
+        """用 PDF 文本块修正 SKU 的 source_bbox。
+
+        LLM 返回的 source_bbox 可能不准（过大或偏移），
+        用 text_blocks 中匹配到的关键属性文本位置来生成更精确的 bbox。
+        text_blocks bbox 是 PDF points，乘 scale 转为截图像素坐标。
+        """
+        for sku in skus:
+            # 提取匹配关键词: model_number 最可靠，其次 product_name
+            keywords = []
+            model = sku.attributes.get("model_number", "").strip()
+            if model and len(model) >= 2:
+                keywords.append(model)
+            name = sku.attributes.get("product_name", "").strip()
+            if name and len(name) >= 2:
+                keywords.append(name)
+            if not keywords:
+                continue
+
+            # 找包含关键词的文本块
+            matched_blocks = []
+            for tb in text_blocks:
+                content = tb.content.strip()
+                if not content:
+                    continue
+                for kw in keywords:
+                    if kw in content:
+                        matched_blocks.append(tb)
+                        break
+
+            if not matched_blocks:
+                continue
+
+            # 用匹配文本块的外接矩形作为修正 bbox (转为截图像素坐标)
+            refined_x0 = min(tb.bbox[0] for tb in matched_blocks) * scale
+            refined_y0 = min(tb.bbox[1] for tb in matched_blocks) * scale
+            refined_x1 = max(tb.bbox[2] for tb in matched_blocks) * scale
+            refined_y1 = max(tb.bbox[3] for tb in matched_blocks) * scale
+
+            old = sku.source_bbox
+            sku.source_bbox = (refined_x0, refined_y0, refined_x1, refined_y1)
+            logger.info("sku_bbox_refined",
+                        sku_id=sku.sku_id,
+                        keywords=keywords[:2],
+                        matched=len(matched_blocks),
+                        old_bbox=[round(v, 1) for v in old[:4]],
+                        new_bbox=[round(v, 1) for v in sku.source_bbox[:4]])
+
+    REBIND_BATCH_SIZE = 15
+
     async def _vlm_rebind_composites(
         self,
         skus: list[SKUResult],
         composites: list[ImageInfo],
         screenshot: bytes,
     ) -> list[BindingResult] | None:
-        """瓦片页 VLM 辅助绑定: 在截图上标注图片区域，让 VLM 匹配 SKU→图片。"""
+        """瓦片页 VLM 辅助绑定: 分批调度，避免大量 SKU 时 token 截断。"""
+        if len(skus) <= self.REBIND_BATCH_SIZE:
+            return await self._vlm_rebind_batch(skus, composites, screenshot)
+
+        all_bindings: list[BindingResult] = []
+        for start in range(0, len(skus), self.REBIND_BATCH_SIZE):
+            batch = skus[start:start + self.REBIND_BATCH_SIZE]
+            result = await self._vlm_rebind_batch(batch, composites, screenshot)
+            if result:
+                all_bindings.extend(result)
+
+        if len(all_bindings) >= len(skus) * 0.5:
+            logger.info("vlm_rebind_batched_success",
+                        batches=math.ceil(len(skus) / self.REBIND_BATCH_SIZE),
+                        sku_count=len(skus),
+                        matched=len(all_bindings))
+            return all_bindings
+
+        logger.warning("vlm_rebind_batched_low_coverage",
+                       matched=len(all_bindings), total=len(skus))
+        return None
+
+    async def _vlm_rebind_batch(
+        self,
+        skus: list[SKUResult],
+        composites: list[ImageInfo],
+        screenshot: bytes,
+    ) -> list[BindingResult] | None:
+        """单批次 VLM 辅助绑定: 在截图上标注图片区域，让 VLM 匹配 SKU→图片。"""
         try:
             from PIL import Image as PILImage, ImageDraw, ImageFont
             import io
@@ -352,8 +477,8 @@ Match each SKU to the image that shows that product. Multiple SKUs can share the
 SKUs:
 {chr(10).join(sku_lines)}
 
-Respond with ONLY a JSON array:
-[{{"sku_index": 0, "image_index": 2}}, ...]"""
+Respond with ONLY a JSON array of [sku_index, image_index] pairs:
+[[0,2],[1,3],...]"""
 
             resp = await self._llm.call_llm(
                 operation="vlm_rebind",
@@ -361,15 +486,48 @@ Respond with ONLY a JSON array:
                 images=[annotated],
             )
 
-            from pdf_sku.llm_adapter.parser.response_parser import ResponseParser
-            parsed = ResponseParser().parse(resp.text, expected_type="array")
-            if not parsed.success or not isinstance(parsed.data, list):
+            import re, json as _json
+            text = resp.text.strip()
+            items = None
+
+            # 尝试解析紧凑格式 [[0,2],[1,3],...]
+            m = re.search(r'\[[\s\S]*\]', text)
+            if m:
+                try:
+                    items = _json.loads(m.group(0))
+                except Exception:
+                    pass
+
+            if not items:
+                # 截断修复: response 以 [ 开头但无 ]（token 限制截断）
+                if '[' in text and ']' not in text:
+                    arr_start = text.index('[')
+                    truncated = text[arr_start:]
+                    last_bracket = truncated.rfind(']')
+                    if last_bracket > 0:
+                        repaired = truncated[:last_bracket + 1] + ']'
+                        try:
+                            items = _json.loads(repaired)
+                            logger.info("vlm_rebind_truncated_repaired",
+                                        parsed_count=len(items))
+                        except Exception:
+                            pass
+
+            if not items or not isinstance(items, list):
+                logger.warning("vlm_rebind_parse_failed",
+                               text_preview=text[:300])
                 return None
 
             new_bindings = []
-            for item in parsed.data:
-                si = item.get("sku_index", -1)
-                ii = item.get("image_index", -1)
+            for item in items:
+                # 支持紧凑格式 [sku_idx, img_idx] 和旧格式 {"sku_index":..., "image_index":...}
+                if isinstance(item, list) and len(item) >= 2:
+                    si, ii = item[0], item[1]
+                elif isinstance(item, dict):
+                    si = item.get("sku_index", -1)
+                    ii = item.get("image_index", -1)
+                else:
+                    continue
                 if 0 <= si < len(skus) and 0 <= ii < len(composites):
                     new_bindings.append(BindingResult(
                         sku_id=skus[si].sku_id,
@@ -397,7 +555,8 @@ Respond with ONLY a JSON array:
     def _crop_composites(images: list[ImageInfo], screenshot: bytes) -> None:
         """从页面截图裁剪 composite 图片区域，填充 img.data。"""
         composites = [img for img in images
-                      if "_composite_" in img.image_id and not img.data]
+                      if ("_composite_" in img.image_id or "_region_" in img.image_id)
+                      and not img.data]
         if not composites:
             return
         try:
@@ -422,6 +581,120 @@ Respond with ONLY a JSON array:
             logger.warning("crop_composites_failed", error=str(e))
 
     @staticmethod
+    def _compute_page_confidence(
+        cls_result: ClassifyResult,
+        skus: list[SKUResult],
+        bindings: list[BindingResult],
+        validation: ValidationResult | None,
+        extraction_method: str | None,
+        fallback_reason: str | None,
+    ) -> float:
+        """计算页面综合置信度: 几何均值(分类, 提取, 绑定) × 惩罚因子。"""
+        # ── C_classify ──
+        c_classify = cls_result.confidence
+
+        # ── C_extract ──
+        page_type = cls_result.page_type
+        if skus:
+            confs = [s.confidence for s in skus]
+            c_extract = 0.3 * min(confs) + 0.7 * (sum(confs) / len(confs))
+        else:
+            c_extract = 1.0 if page_type == "D" else 0.0
+
+        # ── C_bind ──
+        if bindings and skus:
+            bind_confs = [b.confidence for b in bindings]
+            c_bind_raw = 0.3 * min(bind_confs) + 0.7 * (sum(bind_confs) / len(bind_confs))
+            # 歧义惩罚
+            ambiguous_ratio = sum(1 for b in bindings if b.is_ambiguous) / len(bindings)
+            c_bind_raw *= (1.0 - 0.3 * ambiguous_ratio)
+            # 覆盖惩罚
+            bound_sku_ids = set(b.sku_id for b in bindings)
+            coverage = len(bound_sku_ids) / len(skus)
+            c_bind = c_bind_raw * min(1.0, coverage)
+        elif not skus:
+            c_bind = 1.0
+        else:
+            c_bind = 0.0
+
+        # 几何均值
+        c_page = (c_classify * c_extract * c_bind) ** (1.0 / 3.0)
+
+        # 方法降级惩罚
+        if fallback_reason == "retry_improved":
+            c_page *= 0.9
+        if extraction_method == "single_stage":
+            c_page *= 0.95
+
+        # 校验错误惩罚
+        if validation and validation.has_errors:
+            c_page *= 0.8
+
+        return round(max(0.0, min(1.0, c_page)), 3)
+
+    @staticmethod
+    def _bbox_overlap_ratio(bbox1: tuple, bbox2: tuple) -> float:
+        """计算两个 bbox 的重叠比率: overlap_area / min(area1, area2)。"""
+        if len(bbox1) < 4 or len(bbox2) < 4:
+            return 0.0
+        ox0 = max(bbox1[0], bbox2[0])
+        oy0 = max(bbox1[1], bbox2[1])
+        ox1 = min(bbox1[2], bbox2[2])
+        oy1 = min(bbox1[3], bbox2[3])
+        overlap = max(0, ox1 - ox0) * max(0, oy1 - oy0)
+        if overlap == 0:
+            return 0.0
+        a1 = max(1, (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1]))
+        a2 = max(1, (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1]))
+        return overlap / min(a1, a2)
+
+    @staticmethod
+    def _dedup_images(images: list[ImageInfo]) -> list[ImageInfo]:
+        """图片去重: 哈希去重 + 重叠去重 + 小图过滤。"""
+        if not images:
+            return images
+
+        # 1. 小图过滤: short_edge < 30 → 不参与搜索
+        for img in images:
+            if img.short_edge < 30:
+                img.search_eligible = False
+
+        # 2. 哈希去重: 相同 image_hash → 保留分辨率最高的
+        hash_groups: dict[str, list[ImageInfo]] = {}
+        for img in images:
+            if img.image_hash:
+                hash_groups.setdefault(img.image_hash, []).append(img)
+        for h, group in hash_groups.items():
+            if len(group) <= 1:
+                continue
+            group.sort(key=lambda i: i.width * i.height, reverse=True)
+            for dup in group[1:]:
+                dup.is_duplicate = True
+                dup.search_eligible = False
+
+        # 3. 重叠去重: bbox 重叠率 > 70% → 保留高分辨率的
+        active = [img for img in images if not img.is_duplicate and img.search_eligible]
+        for i in range(len(active)):
+            if active[i].is_duplicate:
+                continue
+            for j in range(i + 1, len(active)):
+                if active[j].is_duplicate:
+                    continue
+                ratio = PageProcessor._bbox_overlap_ratio(
+                    active[i].bbox, active[j].bbox)
+                if ratio > 0.7:
+                    area_i = active[i].width * active[i].height
+                    area_j = active[j].width * active[j].height
+                    loser = active[j] if area_i >= area_j else active[i]
+                    loser.is_duplicate = True
+                    loser.search_eligible = False
+
+        deduped = sum(1 for img in images if img.is_duplicate)
+        if deduped > 0:
+            logger.info("image_dedup", total=len(images), deduped=deduped)
+        return images
+
+    @staticmethod
     def _merge_tile_fragments(images: list[ImageInfo], page_no: int = 0) -> list[ImageInfo]:
         """检测并合并瓦片碎片为虚拟复合图片。
 
@@ -432,12 +705,25 @@ Respond with ONLY a JSON array:
         if len(images) < 30:
             return images
 
-        # 检查是否为瓦片页: 多数原生 short_edge < 200
+        # 检查是否为瓦片页:
+        # 1) 多数原生 short_edge < 200 (经典小瓦片)
+        # 2) 图片数 > 50 且尺寸高度一致 (大瓦片, 如 225×215)
         small_count = sum(
             1 for img in images
             if min(img.width, img.height) < 200 and img.width > 0
         )
-        if small_count < len(images) * 0.7:
+        is_tile_page = small_count >= len(images) * 0.7
+        if not is_tile_page and len(images) > 50:
+            # 大瓦片检测: 多数图片尺寸相近
+            dims = [(img.width, img.height) for img in images
+                    if img.width and img.height]
+            if dims:
+                from collections import Counter
+                dim_counts = Counter(dims)
+                most_common_count = dim_counts.most_common(1)[0][1]
+                if most_common_count >= len(dims) * 0.5:
+                    is_tile_page = True
+        if not is_tile_page:
             return images
 
         # Union-Find
@@ -485,12 +771,10 @@ Respond with ONLY a JSON array:
         composite_idx = 0
         for members in clusters.values():
             if len(members) == 1:
-                # 瓦片页中的独立小图: 标记为碎片，不参与绑定
+                # 瓦片页中的独立碎片: 标记为碎片，不参与绑定
                 img = images[members[0]]
-                native_short = min(img.width, img.height) if img.width and img.height else 0
-                if native_short < 200:
-                    img.is_fragmented = True
-                    img.search_eligible = False
+                img.is_fragmented = True
+                img.search_eligible = False
                 merged.append(img)
                 continue
 

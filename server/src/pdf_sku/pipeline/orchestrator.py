@@ -253,6 +253,7 @@ class Orchestrator:
                 extraction_method=result.extraction_method,
                 llm_model_used=result.llm_model_used,
                 classification_confidence=result.classification_confidence,
+                page_confidence=result.page_confidence,
             )
         )
 

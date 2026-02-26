@@ -78,6 +78,7 @@ class PDFJob(Base):
     human_pages: Mapped[list[int]] = mapped_column(ARRAY(Integer), default=list)
     skipped_pages: Mapped[list[int]] = mapped_column(ARRAY(Integer), default=list)
     failed_pages: Mapped[list[int]] = mapped_column(ARRAY(Integer), default=list)
+    review_pages: Mapped[list[int]] = mapped_column(ARRAY(Integer), default=list)
     total_skus: Mapped[int] = mapped_column(Integer, default=0)
     total_images: Mapped[int] = mapped_column(Integer, default=0)
 

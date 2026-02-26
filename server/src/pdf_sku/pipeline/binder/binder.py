@@ -48,7 +48,53 @@ class SKUImageBinder:
             and not img.is_duplicate
         ]
 
+        # 单 SKU 多图: 所有图片都绑定到该 SKU
+        if len(skus) == 1 and len(deliverable) >= 1:
+            for rank, img in enumerate(deliverable):
+                results.append(BindingResult(
+                    sku_id=skus[0].sku_id, image_id=img.image_id,
+                    confidence=0.7, method="single_sku_all_images",
+                    is_ambiguous=False, rank=rank + 1))
+            return results
+
+        # 单图页面: 所有 SKU 直接绑定唯一图片
+        if len(deliverable) == 1:
+            only_img = deliverable[0]
+            for sku in skus:
+                results.append(BindingResult(
+                    sku_id=sku.sku_id, image_id=only_img.image_id,
+                    confidence=0.6, method="single_image_page",
+                    is_ambiguous=False,
+                ))
+            self._unify_product_bindings(skus, results)
+            return results
+
+        # 零 bbox 批量处理: 所有 SKU 都是零 bbox 时用位置启发式匹配
+        all_zero = all(self._is_zero_bbox(s.source_bbox) for s in skus)
+        if all_zero and deliverable:
+            return self._bind_zero_bbox_skus(skus, deliverable)
+        if all_zero and not deliverable:
+            for sku in skus:
+                results.append(BindingResult(
+                    sku_id=sku.sku_id, image_id=None,
+                    confidence=0.0, is_ambiguous=False))
+            return results
+
         for sku in skus:
+            # 单个零 bbox SKU: 降级到最大图片
+            if self._is_zero_bbox(sku.source_bbox):
+                if deliverable:
+                    largest = max(deliverable, key=lambda img: self._bbox_area(img.bbox))
+                    results.append(BindingResult(
+                        sku_id=sku.sku_id, image_id=largest.image_id,
+                        confidence=0.4, method="zero_bbox_largest",
+                        is_ambiguous=True))
+                else:
+                    results.append(BindingResult(
+                        sku_id=sku.sku_id, image_id=None,
+                        confidence=0.0, is_ambiguous=False))
+                continue
+
             # 大 bbox (覆盖 >50% 页面): 用包含关系匹配，取 bbox 内最大图片
             is_large = self._is_fullpage_bbox(
                 sku.source_bbox, [img.bbox for img in deliverable]
@@ -194,6 +240,52 @@ class SKUImageBinder:
             return False
         sku_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
         return sku_area > page_area * 0.85
+
+    @staticmethod
+    def _is_zero_bbox(bbox: tuple[float, ...]) -> bool:
+        """检测 bbox 是否全为 0。"""
+        if len(bbox) < 4:
+            return True
+        return all(v == 0 for v in bbox[:4])
+
+    @staticmethod
+    def _bind_zero_bbox_skus(
+        skus: list[SKUResult], deliverable: list[ImageInfo],
+    ) -> list[BindingResult]:
+        """零 bbox 批量绑定: 按图片 Y 坐标排序与 SKU 出现顺序一一对应。
+
+        - SKU 数 == 图片数: 1:1 对应 (confidence=0.55)
+        - SKU 数 < 图片数: 前 N 张按序对应，多余图片忽略
+        - SKU 数 > 图片数: 前 M 个 SKU 按序对应，多余 SKU 绑最大图
+        """
+        results: list[BindingResult] = []
+        # 按 Y 坐标 (bbox 中心) 排序图片
+        sorted_imgs = sorted(
+            deliverable,
+            key=lambda img: (img.bbox[1] + img.bbox[3]) / 2
+            if len(img.bbox) >= 4 else 0,
+        )
+
+        for i, sku in enumerate(skus):
+            if i < len(sorted_imgs):
+                results.append(BindingResult(
+                    sku_id=sku.sku_id, image_id=sorted_imgs[i].image_id,
+                    confidence=0.55, method="zero_bbox_positional",
+                    is_ambiguous=len(skus) != len(sorted_imgs),
+                ))
+            else:
+                # 多余 SKU → 绑最大图
+                largest = max(
+                    sorted_imgs, key=lambda img: SKUImageBinder._bbox_area(img.bbox))
+                results.append(BindingResult(
+                    sku_id=sku.sku_id, image_id=largest.image_id,
+                    confidence=0.35, method="zero_bbox_largest",
+                    is_ambiguous=True,
+                ))
+
+        logger.info("zero_bbox_positional_bind",
+                     sku_count=len(skus), img_count=len(sorted_imgs))
+        return results
 
     @staticmethod
     def _bbox_area(bbox: tuple[float, ...]) -> float:

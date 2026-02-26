@@ -100,6 +100,14 @@ async def refresh_job_page_stats(db: AsyncSession, job_id: str) -> PDFJob:
         status_pages.get(PageStatus.DEAD_LETTER.value, [])
     )
 
+    # needs_review 页面
+    review_result = await db.execute(
+        select(func.array_agg(Page.page_number))
+        .where(Page.job_id == job_id, Page.attempt_no == 1, Page.needs_review == True)
+    )
+    review_arr = review_result.scalar()
+    job.review_pages = sorted(review_arr) if review_arr else []
+
     # SKU 总数
     from pdf_sku.common.models import SKU
     sku_count_result = await db.execute(

@@ -1304,6 +1304,7 @@ def _job_to_dict(job: PDFJob, detail: bool = False) -> dict:
         "blank_pages": job.blank_pages or [],
         "ai_pages": job.ai_pages or [],
         "human_pages": job.human_pages or [],
+        "review_pages": job.review_pages or [],
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
         "eval_completed_at": job.eval_completed_at.isoformat() if job.eval_completed_at else None,
