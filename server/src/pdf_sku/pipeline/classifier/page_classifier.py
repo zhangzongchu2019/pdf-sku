@@ -86,7 +86,7 @@ class PageClassifier:
             and not features.has_price_pattern
             and not features.has_model_pattern
             and features.table_count == 0):
-            return ClassifyResult(page_type="D", layout_type="freeform", confidence=0.85)
+            return ClassifyResult(page_type="D", layout_type="freeform", confidence=0.75)
 
         # C: 图片为主
         if features.image_count >= 3 and features.text_block_count < 5:
