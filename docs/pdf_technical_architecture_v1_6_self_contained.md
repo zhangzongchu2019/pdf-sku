@@ -1,17 +1,19 @@
+
 # PDF 自动分类与 SKU 提取系统 — 技术架构文档
 
-> **文档版本**: V1.8
+> **文档版本**: V1.9
 > **基线输入**: BRD V2.1 + 业务架构 V1.1
 > **文档目的**: 定义系统的技术架构、模块划分、数据存储、接口协议和部署方案，指导开发实施
 > **架构阶段**: V1（行业开拓期，预计 3-6 个月）
-> **自包含性**: V1.8 为完全独立可读文档，所有技术细节均已内联展开，无需查阅 V1.2 或更早版本。
+> **自包含性**: V1.9 为完全独立可读文档，所有技术细节均已内联展开，无需查阅 V1.2 或更早版本。
+> **V1.8→V1.9 变更**: Pipeline 新增 Phase 2c 合成大图布局检测（DocLayout-YOLO 自动拆分全页大图为独立产品子图）；新增 `layout_detector.py` 模块。
 > **V1.7→V1.8 变更**: 新增 OpenAI 兼容客户端（支持 laozhang.ai / OpenRouter 中转）；Product→SKU 两级层级模型；图片锚点空间聚类。
 > **V1.6→V1.7 变更**: Pipeline 并行化重构（删除串行/分片双模式，统一 Semaphore 并行）；Gateway 新增图片服务和页面详情端点；前端新增商品导入配置 UI + Job 详情增强（缩略图、SKU 图片预览、属性展开）。
 > **V1.5→V1.6 变更**: 综合 Cross Review + ChatGPT5.2 + Gemini3 + Kimi2.5 四份交叉审查反馈（34 项），修正 BRD/BA 一致性缺口。主要变更：
 > - **P0×8**：DEGRADED_HUMAN 终态修正；新增 images/sku_image_bindings/annotations/threshold_profiles/calibration_records 5 张表；新增 SKU/Image 状态机；不变式工程化；解析器许可证合规 Gate  
 > - **P1×18**：页级评估数据复用；预筛配置化+可解释；Fallback SKU 强制校验；对账轮询强化；Route/Status 一致性；评估报告可解释性；图片去重显性化；StorageProvider→OSS 优先级提升等  
 > - **P2×8**：BR/INV 编号交叉引用；ParsedPageIR 覆盖度；Shadow Mode；不变式自动审计等  
-> **变更记录**: 见附录 A（V1.0→V1.3 修订）、附录 B（V1.3→V1.5 修订）、附录 C（V1.5→V1.6 修订）、附录 D（V1.7→V1.8 修订）
+> **变更记录**: 见附录 A（V1.0→V1.3 修订）、附录 B（V1.3→V1.5 修订）、附录 C（V1.5→V1.6 修订）、附录 D（V1.7→V1.8 修订）、附录 E（V1.8→V1.9 修订）
 
 ---
 
@@ -1195,6 +1197,7 @@ pipeline/
 │   ├── pdf_extractor.py    # 文本/图片/表格提取（多库 + PaddleOCR）[T26]
 │   ├── feature_extractor.py # 结构化特征向量
 │   └── image_processor.py  # 碎图检测 + 光栅化 + 质量评估 + 去重
+├── layout_detector.py      # Phase 2c: 合成大图布局检测（DocLayout-YOLO）
 ├── classifiers/
 │   ├── page_classifier.py  # 页面类型分类（A/B/C/D）
 │   ├── text_classifier.py  # 文本角色分类
@@ -1315,7 +1318,14 @@ async def process_page(job: PDFJob, page_no: int, attempt_no: int) -> PageResult
             img.is_fragmented = True
         img.quality = image_processor.assess_quality(img)
         processed_images.append(img)
-    
+
+    # === Phase 2c: 合成大图布局检测 ===
+    # 触发条件: 仅 1 张 search_eligible 图片且 bbox 面积 > 60% 页面面积
+    # DocLayout-YOLO 检测 Figure 区域 → ≥2 个区域时拆分为 p{page}_region_{idx} 子图
+    # Graceful degradation: doclayout-yolo 未安装或模型不存在时静默跳过
+    processed_images = layout_detector.split_composite_image(
+        processed_images, page_no, raw.metadata.page_width, raw.metadata.page_height)
+
     # === Phase 3: 特征提取 ===
     features = feature_extractor.extract(raw)
     
@@ -4376,3 +4386,19 @@ tech_debt_check:
 | **D-8** | 新增复合索引 `idx_skus_product(job_id, product_id)` | §4.2 |
 | **D-9** | Pipeline 阶段1 边界识别支持图片锚点空间聚类（基于图片 bbox y 坐标层次聚类） | §3.3 |
 | **D-10** | Pipeline 提取输出支持 Product→SKU 层级分组 | §3.3 |
+
+---
+
+## 附录 E：V1.8 → V1.9 修订历史
+
+> **版本**: V1.9（2026-02-27）
+> **主要变更**: Pipeline 新增 Phase 2c 合成大图布局检测（DocLayout-YOLO）
+
+| # | 修订内容 | 章节 |
+|---|---------|------|
+| **E-1** | 新增 `layout_detector.py`：DocLayout-YOLO 模型懒加载单例 + Figure 区域检测 + NMS 去包含框 + 合成大图拆分 | §3.3 |
+| **E-2** | `process_page` 伪代码新增 Phase 2c 步骤：合成大图布局检测（Phase 2 与 Phase 3 之间） | §3.3 |
+| **E-3** | 触发条件：页面仅 1 张 `search_eligible` 图片且 bbox 面积 > 60% 页面面积；≥2 个 Figure 区域时拆分为 `p{page}_region_{idx}` 子图 | §3.3 |
+| **E-4** | Graceful degradation：`doclayout-yolo` 包或模型文件不存在时静默跳过，不影响 pipeline 正常运行 | §3.3 |
+| **E-5** | 新增环境变量：`DOCLAYOUT_MODEL_PATH`、`LAYOUT_DETECT_ENABLED`、`LAYOUT_DETECT_CONFIDENCE` | §3.3 |
+| **E-6** | 新增 optional dependency group：`layout = ["doclayout-yolo>=0.0.4", "ultralytics>=8.1.0"]` | §3.3 |

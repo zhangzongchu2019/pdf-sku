@@ -1,7 +1,7 @@
 # Pipeline 模块详细设计
 
 > **文档版本**: V1.4
-> **上游依赖**: TA V1.6 §3.3 + §2.4 + §2.5 | BRD V2.1 | BA V1.1 §4
+> **上游依赖**: TA V1.9 §3.3 + §2.4 + §2.5 | BRD V2.1 | BA V1.1 §4
 > **模块定位**: 系统核心 — 9 阶段处理链 + Semaphore 并行编排，承接单页解析→分类→SKU提取→绑定→校验→导出
 > **设计原则**: 路由准确率 > SKU 召回率 > 图片质量 > 人工成本 > 速度（BRD §1.4）
 
@@ -132,6 +132,8 @@ app/
 │   │   ├── pdf_extractor.py        # 多库兜底（pdfplumber/PyMuPDF/PaddleOCR）
 │   │   ├── feature_extractor.py    # 结构化特征向量
 │   │   └── image_processor.py      # 碎图检测 + 光栅化 + 质量评估
+│   │
+│   ├── layout_detector.py          # Phase 2c: 合成大图布局检测（DocLayout-YOLO）
 │   │
 │   ├── classifiers/                # 阶段 5（LLM 调用）
 │   │   ├── __init__.py
@@ -340,6 +342,14 @@ sequenceDiagram
         end
         PP->>ImgP: assess_quality(img)
         ImgP-->>PP: ImageQuality(short_edge, warning)
+    end
+    end
+
+    rect rgb(50, 30, 40)
+    Note over PP,ImgP: Phase 2c: 合成大图布局检测
+    alt 仅1张eligible图 且 面积>60%页面
+        PP->>PP: layout_detector.split_composite_image()
+        Note right of PP: DocLayout-YOLO 检测 Figure 区域<br/>≥2区域→拆分为 region 子图<br/>Graceful degradation: 未安装时跳过
     end
     end
 
@@ -805,6 +815,12 @@ class PageProcessor:
                     metrics.image_rasterize_timeout_total.inc()
             img.quality = self._img_proc.assess_quality(img)
             processed_images.append(img)
+
+        # ═══ Phase 2c: 合成大图布局检测 ═══
+        # [L1] DocLayout-YOLO 检测全页大图中的 Figure 区域，拆分为独立子图
+        # 触发: 仅1张 search_eligible 图 & 面积>60%页面; Graceful degradation
+        processed_images = self._split_fullpage_composites(
+            processed_images, page_no, raw.metadata)
 
         # ═══ Phase 3: 特征提取 ═══
         features = self._feat.extract(raw)
