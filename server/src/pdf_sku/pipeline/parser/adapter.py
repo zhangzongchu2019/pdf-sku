@@ -228,9 +228,14 @@ class PDFExtractor:
 
     @staticmethod
     def _fill_image_data_pymupdf(path: str, page_no: int, images: list[ImageInfo]) -> None:
-        """用 PyMuPDF 为 pdfplumber 提取的图片补充像素数据。"""
+        """用 PyMuPDF 为 pdfplumber 提取的图片补充像素数据。
+
+        pdfplumber 与 PyMuPDF 返回图片的顺序可能不同（PDF 内部 xref 顺序
+        vs. 页面渲染顺序），因此改用 bbox 中心距离匹配，避免按索引错配。
+        """
         try:
             import fitz
+            import math
             doc = fitz.open(path)
             try:
                 page = doc[page_no - 1]
@@ -242,17 +247,42 @@ class PDFExtractor:
                     if len(info) > 1 and info[1] > 0:
                         smask_xrefs.add(info[1])
 
-                # 只处理非 mask 图片
-                real_imgs = [
-                    info for info in all_img_info
-                    if info[0] not in smask_xrefs
-                ]
+                # 只处理非 mask 图片，同时获取页面 bbox
+                real_imgs = []
+                for info in all_img_info:
+                    xref = info[0]
+                    if xref in smask_xrefs:
+                        continue
+                    smask_xref = info[1] if len(info) > 1 else 0
+                    rects = page.get_image_rects(xref)
+                    bbox = rects[0] if rects else None
+                    real_imgs.append((xref, smask_xref, bbox))
 
-                for i, img_info in enumerate(real_imgs):
-                    if i >= len(images):
-                        break
-                    xref = img_info[0]
-                    smask_xref = img_info[1] if len(img_info) > 1 else 0
+                # 按 bbox 中心距离匹配 pdfplumber 图片 → PyMuPDF 图片
+                # 避免顺序不一致导致像素数据错配
+                used: set[int] = set()
+                for img in images:
+                    img_cx = (img.bbox[0] + img.bbox[2]) / 2
+                    img_cy = (img.bbox[1] + img.bbox[3]) / 2
+
+                    best_idx = -1
+                    best_dist = float("inf")
+                    for i, (_, _, bbox) in enumerate(real_imgs):
+                        if i in used or bbox is None:
+                            continue
+                        cx = (bbox.x0 + bbox.x1) / 2
+                        cy = (bbox.y0 + bbox.y1) / 2
+                        dist = math.sqrt((img_cx - cx) ** 2 + (img_cy - cy) ** 2)
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_idx = i
+
+                    # 超过 20pt 则认为无对应，跳过（避免误匹配）
+                    if best_idx < 0 or best_dist > 20:
+                        continue
+
+                    used.add(best_idx)
+                    xref, smask_xref, _ = real_imgs[best_idx]
                     try:
                         pix = fitz.Pixmap(doc, xref)
                         # CMYK → RGB
@@ -263,12 +293,12 @@ class PDFExtractor:
                             pix = PDFExtractor._apply_smask(fitz, doc, pix, smask_xref)
                         img_data = PDFExtractor._pixmap_to_png(fitz, pix)
                         if img_data:
-                            images[i].data = img_data
-                            images[i].width = pix.width
-                            images[i].height = pix.height
-                            images[i].short_edge = min(pix.width, pix.height)
-                            images[i].search_eligible = images[i].short_edge >= 150
-                            images[i].image_hash = hashlib.md5(img_data[:1024]).hexdigest()[:12]
+                            img.data = img_data
+                            img.width = pix.width
+                            img.height = pix.height
+                            img.short_edge = min(pix.width, pix.height)
+                            img.search_eligible = img.short_edge >= 150
+                            img.image_hash = hashlib.md5(img_data[:1024]).hexdigest()[:12]
                     except Exception:
                         pass
             finally:
