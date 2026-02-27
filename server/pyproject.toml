@@ -48,6 +48,8 @@ dev = [
     "pre-commit>=3.8.0",
 ]
 
+layout = ["doclayout-yolo>=0.0.4", "ultralytics>=8.1.0"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

@@ -68,6 +68,11 @@ class Settings(BaseSettings):
     langfuse_secret_key: str = ""
     langfuse_host: str = ""
 
+    # === Layout Detection ===
+    doclayout_model_path: str = ""  # 留空用默认 server/models/doclayout_yolo.pt
+    layout_detect_enabled: bool = True
+    layout_detect_confidence: float = 0.25
+
     # === Paths ===
     tus_upload_dir: str = "/data/tus-uploads"
     job_data_dir: str = "/data/jobs"

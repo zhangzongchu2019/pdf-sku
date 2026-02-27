@@ -134,6 +134,10 @@ class PageProcessor:
             # ═══ Phase 2b: 瓦片碎片聚类合并 ═══
             raw.images = self._merge_tile_fragments(raw.images, page_no)
 
+            # ═══ Phase 2c: 合成大图布局检测 ═══
+            raw.images = self._split_fullpage_composites(
+                raw.images, page_no, raw.metadata)
+
             # ═══ Phase 3: 特征提取 ═══
             features = self._feat.extract(raw)
 
@@ -812,6 +816,26 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                      composites=composite_idx,
                      remaining=len([m for m in merged if not m.is_fragmented]))
         return merged
+
+    @staticmethod
+    def _split_fullpage_composites(
+        images: list[ImageInfo],
+        page_no: int,
+        metadata: "PageMetadata",
+    ) -> list[ImageInfo]:
+        """Phase 2c: 合成大图布局检测拆分。
+
+        当页面仅 1 张 search_eligible 图片且覆盖 >60% 页面面积时，
+        用 DocLayout-YOLO 检测 Figure 区域并拆分为独立子图。
+        ultralytics 未安装或模型不存在时 graceful pass。
+        """
+        try:
+            from pdf_sku.pipeline.layout_detector import split_composite_image
+            return split_composite_image(
+                images, page_no, metadata.page_width, metadata.page_height)
+        except Exception as exc:
+            logger.debug("phase2c_skip", reason=str(exc))
+            return images
 
     def clear_job_cache(self, job_id: str) -> None:
         self._xpage.clear_job(job_id)
