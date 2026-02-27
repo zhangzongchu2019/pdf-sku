@@ -25,7 +25,7 @@ services:
     restart: unless-stopped
 
   postgres:
-    image: postgres:16-alpine
+    image: docker.m.daocloud.io/postgres:16-alpine
     environment:
       POSTGRES_DB: pdf_sku
       POSTGRES_USER: pdf_sku
@@ -41,7 +41,7 @@ services:
       retries: 5
 
   redis:
-    image: redis:7-alpine
+    image: docker.m.daocloud.io/redis:7-alpine
     ports:
       - "6379:6379"
     healthcheck:
@@ -51,7 +51,7 @@ services:
       retries: 5
 
   minio:
-    image: minio/minio:latest
+    image: docker.m.daocloud.io/minio/minio:latest
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin

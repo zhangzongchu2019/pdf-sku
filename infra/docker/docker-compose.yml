@@ -4,7 +4,7 @@ version: "3.9"
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: docker.m.daocloud.io/postgres:16-alpine
     environment:
       POSTGRES_USER: pdfsku
       POSTGRES_PASSWORD: pdfsku
@@ -20,7 +20,7 @@ services:
       retries: 10
 
   redis:
-    image: redis:7-alpine
+    image: docker.m.daocloud.io/redis:7-alpine
     ports: ["6379:6379"]
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
     volumes:
@@ -32,7 +32,7 @@ services:
       retries: 10
 
   minio:
-    image: minio/minio:latest
+    image: docker.m.daocloud.io/minio/minio:latest
     ports:
       - "9000:9000"
       - "9001:9001"

@@ -100,13 +100,48 @@ class PDFExtractor:
 
             # Images
             images = []
-            for i, img_info in enumerate(page.get_images(full=True)):
+            all_img_info = page.get_images(full=True)
+            # 收集所有 smask xref，这些是蒙版图层，不应作为独立图片
+            smask_xrefs = set()
+            for info in all_img_info:
+                if len(info) > 1 and info[1] > 0:
+                    smask_xrefs.add(info[1])
+
+            img_idx = 0
+            for img_info in all_img_info:
                 xref = img_info[0]
+                smask_xref = img_info[1] if len(img_info) > 1 else 0
+
+                # 跳过纯蒙版图片 (它的 xref 是别人的 smask)
+                if xref in smask_xrefs:
+                    continue
+
                 try:
                     pix = fitz.Pixmap(doc, xref)
+
+                    # CMYK → RGB (在应用 mask 之前转换)
+                    if pix.colorspace and pix.colorspace.n == 4:
+                        pix = fitz.Pixmap(fitz.csRGB, pix)
+
+                    # 应用软蒙版 → 正确的透明度/裁切
+                    if smask_xref > 0:
+                        try:
+                            mask_pix = fitz.Pixmap(doc, smask_xref)
+                            if (mask_pix.width == pix.width
+                                    and mask_pix.height == pix.height):
+                                # 确保 mask 为灰度 (n=1)
+                                if mask_pix.n > 1:
+                                    mask_pix = fitz.Pixmap(fitz.csGRAY, mask_pix)
+                                pix = fitz.Pixmap(pix, mask_pix)
+                        except Exception as e:
+                            logger.debug("smask_apply_failed",
+                                         xref=xref, error=str(e))
+
                     img_data = self._pixmap_to_png(fitz, pix)
+                    if not img_data:
+                        continue
                     short_edge = min(pix.width, pix.height)
-                    img_hash = hashlib.md5(img_data[:1024]).hexdigest()[:12] if img_data else ""
+                    img_hash = hashlib.md5(img_data[:1024]).hexdigest()[:12]
                     # 获取图片在页面上的位置 (PDF points)
                     img_bbox = (0, 0, 0, 0)
                     try:
@@ -117,7 +152,7 @@ class PDFExtractor:
                     except Exception:
                         pass
                     images.append(ImageInfo(
-                        image_id=f"p{page_no}_img{i}",
+                        image_id=f"p{page_no}_img{img_idx}",
                         bbox=img_bbox,
                         data=img_data,
                         width=pix.width,
@@ -126,6 +161,7 @@ class PDFExtractor:
                         image_hash=img_hash,
                         search_eligible=short_edge >= 200,
                     ))
+                    img_idx += 1
                 except Exception:
                     pass
 
@@ -165,11 +201,18 @@ class PDFExtractor:
 
     @staticmethod
     def _pixmap_to_png(fitz, pix) -> bytes:
-        """将 Pixmap 转为 PNG bytes，处理 CMYK 等非 RGB 色彩空间。"""
-        if pix.n >= 5:  # CMYK with alpha or beyond
-            return b""
-        if pix.n == 4:  # CMYK → RGB
+        """将 Pixmap 转为 PNG bytes，处理 CMYK/RGBA 等色彩空间。"""
+        cs = pix.colorspace
+        if cs is None:
+            # 无色彩空间 (纯 alpha mask 等)，尝试直接输出
+            try:
+                return pix.tobytes("png")
+            except Exception:
+                return b""
+        # CMYK 色彩空间 (cs.n == 4) → 转为 RGB (保留 alpha)
+        if cs.n == 4:
             pix = fitz.Pixmap(fitz.csRGB, pix)
+        # RGB / RGBA / Grayscale / Gray+Alpha → PNG 原生支持
         return pix.tobytes("png")
 
     @staticmethod
@@ -180,13 +223,42 @@ class PDFExtractor:
             doc = fitz.open(path)
             try:
                 page = doc[page_no - 1]
-                fitz_images = page.get_images(full=True)
-                for i, img_info in enumerate(fitz_images):
+                all_img_info = page.get_images(full=True)
+
+                # 收集 smask xref
+                smask_xrefs = set()
+                for info in all_img_info:
+                    if len(info) > 1 and info[1] > 0:
+                        smask_xrefs.add(info[1])
+
+                # 只处理非 mask 图片
+                real_imgs = [
+                    info for info in all_img_info
+                    if info[0] not in smask_xrefs
+                ]
+
+                for i, img_info in enumerate(real_imgs):
                     if i >= len(images):
                         break
                     xref = img_info[0]
+                    smask_xref = img_info[1] if len(img_info) > 1 else 0
                     try:
                         pix = fitz.Pixmap(doc, xref)
+                        # CMYK → RGB
+                        if pix.colorspace and pix.colorspace.n == 4:
+                            pix = fitz.Pixmap(fitz.csRGB, pix)
+                        # 应用 smask
+                        if smask_xref > 0:
+                            try:
+                                mask_pix = fitz.Pixmap(doc, smask_xref)
+                                if (mask_pix.width == pix.width
+                                        and mask_pix.height == pix.height):
+                                    if mask_pix.n > 1:
+                                        mask_pix = fitz.Pixmap(
+                                            fitz.csGRAY, mask_pix)
+                                    pix = fitz.Pixmap(pix, mask_pix)
+                            except Exception:
+                                pass
                         img_data = PDFExtractor._pixmap_to_png(fitz, pix)
                         if img_data:
                             images[i].data = img_data

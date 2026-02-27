@@ -24,6 +24,7 @@ SERVER_DIR="$ROOT_DIR/server"
 WEB_DIR="$ROOT_DIR/web"
 INFRA_DIR="$ROOT_DIR/infra"
 COMPOSE_FILE="$INFRA_DIR/docker/docker-compose.yml"
+VENV="${HOME}/envs/pdf"
 
 # ── 前置检查 ──
 check_prerequisites() {
@@ -102,21 +103,25 @@ setup_backend() {
     info "配置后端 Python 环境..."
     cd "$SERVER_DIR"
 
-    if [[ ! -d ".venv" ]]; then
-        python3 -m venv .venv
-        ok "虚拟环境已创建"
+    if [[ ! -f "$VENV/bin/python" ]]; then
+        fail "虚拟环境不存在: $VENV，请先创建: python3 -m venv $VENV"
     fi
+    ok "使用虚拟环境: $VENV"
 
     info "安装 Python 依赖..."
-    .venv/bin/pip install --quiet --upgrade pip
-    .venv/bin/pip install --quiet -r requirements.txt
+    "$VENV/bin/pip" install --quiet --upgrade pip
+    "$VENV/bin/pip" install --quiet -r requirements.txt
     ok "Python 依赖安装完成"
 
     # 布局检测依赖 (可选, 用于合成大图拆分)
-    info "安装布局检测依赖 (doclayout-yolo)..."
-    .venv/bin/pip install --quiet doclayout-yolo ultralytics 2>/dev/null \
-        && ok "布局检测依赖安装完成" \
-        || warn "布局检测依赖安装失败 (可选功能, 不影响核心流程)"
+    if "$VENV/bin/pip" show doclayout-yolo >/dev/null 2>&1; then
+        ok "布局检测依赖已安装 (跳过)"
+    else
+        info "安装布局检测依赖 (doclayout-yolo + ultralytics, 首次安装较慢)..."
+        "$VENV/bin/pip" install doclayout-yolo ultralytics \
+            && ok "布局检测依赖安装完成" \
+            || warn "布局检测依赖安装失败 (可选功能, 不影响核心流程)"
+    fi
 
     # 下载 DocLayout-YOLO 模型 (可选)
     if [[ ! -f "models/doclayout_yolo.pt" ]]; then
@@ -131,7 +136,7 @@ setup_backend() {
     fi
 
     info "运行数据库迁移..."
-    .venv/bin/python -m alembic upgrade head 2>/dev/null \
+    PYTHONPATH="$SERVER_DIR/src" "$VENV/bin/python" -m alembic upgrade head 2>/dev/null \
         && ok "数据库迁移完成" \
         || warn "数据库迁移失败, 可能需要手动处理"
 
@@ -153,7 +158,7 @@ setup_frontend() {
 start_dev_services() {
     info "启动后端服务..."
     cd "$SERVER_DIR"
-    .venv/bin/python -m uvicorn "pdf_sku.main:create_app" --factory \
+    PYTHONPATH="$SERVER_DIR/src" "$VENV/bin/python" -m uvicorn "pdf_sku.main:create_app" --factory \
         --host 0.0.0.0 --port 8000 --reload --reload-dir src &
     local SERVER_PID=$!
 
@@ -246,7 +251,7 @@ main() {
             start_infra
             echo ""
             ok "基础设施已启动, 可运行后端:"
-            echo "  cd server && .venv/bin/python -m uvicorn pdf_sku.main:create_app --factory --reload --port 8000"
+            echo "  cd server && PYTHONPATH=src ~/envs/pdf/bin/python -m uvicorn pdf_sku.main:create_app --factory --reload --port 8000"
             ;;
         --docker)
             check_prerequisites --docker
