@@ -125,17 +125,7 @@ class PDFExtractor:
 
                     # 应用软蒙版 → 正确的透明度/裁切
                     if smask_xref > 0:
-                        try:
-                            mask_pix = fitz.Pixmap(doc, smask_xref)
-                            if (mask_pix.width == pix.width
-                                    and mask_pix.height == pix.height):
-                                # 确保 mask 为灰度 (n=1)
-                                if mask_pix.n > 1:
-                                    mask_pix = fitz.Pixmap(fitz.csGRAY, mask_pix)
-                                pix = fitz.Pixmap(pix, mask_pix)
-                        except Exception as e:
-                            logger.debug("smask_apply_failed",
-                                         xref=xref, error=str(e))
+                        pix = PDFExtractor._apply_smask(fitz, doc, pix, smask_xref)
 
                     img_data = self._pixmap_to_png(fitz, pix)
                     if not img_data:
@@ -201,19 +191,40 @@ class PDFExtractor:
 
     @staticmethod
     def _pixmap_to_png(fitz, pix) -> bytes:
-        """将 Pixmap 转为 PNG bytes，处理 CMYK/RGBA 等色彩空间。"""
+        """将 Pixmap 转为 PNG bytes，处理 CMYK/RGBA 等色彩空间。
+
+        注意: pix.alpha 表示有 alpha 通道; pix.n 是 通道总数(含alpha)。
+        对于带 alpha 的 PNG，不做色彩空间转换以保留透明度。
+        """
         cs = pix.colorspace
         if cs is None:
-            # 无色彩空间 (纯 alpha mask 等)，尝试直接输出
             try:
                 return pix.tobytes("png")
             except Exception:
                 return b""
-        # CMYK 色彩空间 (cs.n == 4) → 转为 RGB (保留 alpha)
+        # CMYK (cs.n == 4, 无alpha pix.n==4; 有alpha pix.n==5)
         if cs.n == 4:
             pix = fitz.Pixmap(fitz.csRGB, pix)
-        # RGB / RGBA / Grayscale / Gray+Alpha → PNG 原生支持
+        # RGB(3)/RGBA(4)/Gray(1)/GrayA(2) → PNG 原生支持
         return pix.tobytes("png")
+
+    @staticmethod
+    def _apply_smask(fitz, doc, pix, smask_xref: int):
+        """给 Pixmap 应用 soft mask，返回带 alpha 的 Pixmap。"""
+        try:
+            mask_pix = fitz.Pixmap(doc, smask_xref)
+            # mask 尺寸不匹配则跳过
+            if mask_pix.width != pix.width or mask_pix.height != pix.height:
+                return pix
+            # 确保 mask 是灰度 (n=1, 无 alpha)
+            if mask_pix.n != 1:
+                mask_pix = fitz.Pixmap(fitz.csGRAY, mask_pix)
+                if mask_pix.alpha:
+                    # 去掉 mask 自身的 alpha
+                    mask_pix = fitz.Pixmap(mask_pix, 0)  # drop alpha
+            return fitz.Pixmap(pix, mask_pix)
+        except Exception:
+            return pix
 
     @staticmethod
     def _fill_image_data_pymupdf(path: str, page_no: int, images: list[ImageInfo]) -> None:
@@ -249,16 +260,7 @@ class PDFExtractor:
                             pix = fitz.Pixmap(fitz.csRGB, pix)
                         # 应用 smask
                         if smask_xref > 0:
-                            try:
-                                mask_pix = fitz.Pixmap(doc, smask_xref)
-                                if (mask_pix.width == pix.width
-                                        and mask_pix.height == pix.height):
-                                    if mask_pix.n > 1:
-                                        mask_pix = fitz.Pixmap(
-                                            fitz.csGRAY, mask_pix)
-                                    pix = fitz.Pixmap(pix, mask_pix)
-                            except Exception:
-                                pass
+                            pix = PDFExtractor._apply_smask(fitz, doc, pix, smask_xref)
                         img_data = PDFExtractor._pixmap_to_png(fitz, pix)
                         if img_data:
                             images[i].data = img_data

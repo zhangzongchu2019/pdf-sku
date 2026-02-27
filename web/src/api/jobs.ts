@@ -116,5 +116,17 @@ export const jobsApi = {
       `/jobs/${jobId}/pages/${pageNo}/ocr-region`, { bbox }
     ),
 
+  /** 从页面截图裁剪商品子图 (添加新图片 或 调整已有图片) */
+  cropImage: (
+    jobId: string,
+    pageNo: number,
+    bbox: number[],
+    options?: { image_id?: string; sku_id?: string },
+  ) =>
+    api.post<{ image_id: string; bbox: number[]; resolution: number[]; short_edge: number; mode: string }>(
+      `/jobs/${jobId}/pages/${pageNo}/crop-image`,
+      { bbox, ...options },
+    ),
+
   dashboard: () => api.get<DashboardMetrics>("/dashboard/metrics"),
 };

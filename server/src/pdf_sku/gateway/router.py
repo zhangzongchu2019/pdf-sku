@@ -1234,6 +1234,186 @@ async def ocr_region(
         })
 
 
+# ───────────────────────── Crop Image (人工添加/调整子图) ─────────────────────────
+
+@router.post("/jobs/{job_id}/pages/{page_number}/crop-image")
+async def crop_image(
+    request: Request,
+    job_id: uuid.UUID,
+    db: DBSession,
+    page_number: int = PathParam(..., ge=1),
+):
+    """从页面截图上裁剪指定区域作为商品子图。
+
+    用途:
+    - 人工添加遗漏的商品子图 (mode=add)
+    - 调整已有子图的截取范围 (mode=adjust, 传 image_id)
+
+    Body: { "bbox": [x1,y1,x2,y2], "image_id": "可选-更新已有图片", "sku_id": "可选-绑定到SKU" }
+    坐标系: 截图像素坐标 (与前端展示的页面截图一致, @150dpi)
+    """
+    body = await request.json()
+    bbox = body.get("bbox")
+    if not bbox or len(bbox) != 4:
+        return JSONResponse(status_code=400, content={
+            "error_code": "INVALID_BBOX",
+            "message": "bbox must be [x1, y1, x2, y2]",
+        })
+
+    existing_image_id = body.get("image_id")  # 调整模式
+    bind_sku_id = body.get("sku_id")          # 可选: 同时绑定到 SKU
+
+    # 验证 job 存在
+    job_result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
+    job = job_result.scalar_one_or_none()
+    if not job:
+        raise JobNotFoundError(f"Job {job_id} not found")
+
+    # 获取页面截图
+    job_dir = Path(settings.job_data_dir) / str(job_id)
+    cache_path = job_dir / "screenshots" / f"page-{page_number}.png"
+    png_bytes: bytes | None = None
+
+    if cache_path.exists():
+        png_bytes = cache_path.read_bytes()
+    else:
+        source_pdf = job_dir / "source.pdf"
+        if not source_pdf.exists():
+            return JSONResponse(status_code=404, content={
+                "error_code": "SOURCE_PDF_MISSING",
+                "message": f"Source PDF not found for job {job_id}",
+            })
+        try:
+            import fitz
+            doc = fitz.open(source_pdf)
+            try:
+                if page_number < 1 or page_number > doc.page_count:
+                    return JSONResponse(status_code=404, content={
+                        "error_code": "PAGE_OUT_OF_RANGE",
+                        "message": f"Page {page_number} is out of range",
+                    })
+                zoom = 150 / 72
+                pix = doc[page_number - 1].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                png_bytes = pix.tobytes("png")
+            finally:
+                doc.close()
+        except Exception as e:
+            logger.exception("crop_screenshot_failed", error=str(e))
+            return JSONResponse(status_code=500, content={
+                "error_code": "RENDER_FAILED",
+                "message": "Failed to render page screenshot",
+            })
+
+    # 裁剪
+    try:
+        from PIL import Image as PILImage
+        import io
+
+        full_img = PILImage.open(io.BytesIO(png_bytes))
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        x1 = max(0, min(x1, full_img.width))
+        y1 = max(0, min(y1, full_img.height))
+        x2 = max(0, min(x2, full_img.width))
+        y2 = max(0, min(y2, full_img.height))
+        if x2 <= x1 or y2 <= y1:
+            return JSONResponse(status_code=400, content={
+                "error_code": "INVALID_BBOX",
+                "message": "bbox area is zero or negative",
+            })
+        cropped = full_img.crop((x1, y1, x2, y2))
+
+        buf = io.BytesIO()
+        cropped.save(buf, format="JPEG", quality=90)
+        crop_bytes = buf.getvalue()
+        w, h = cropped.size
+    except Exception as e:
+        logger.exception("crop_failed", error=str(e))
+        return JSONResponse(status_code=500, content={
+            "error_code": "CROP_FAILED",
+            "message": "Failed to crop image region",
+        })
+
+    import hashlib as _hashlib
+    img_hash = _hashlib.md5(crop_bytes[:2048]).hexdigest()[:12]
+
+    if existing_image_id:
+        # ═══ 调整模式: 更新已有图片 ═══
+        result = await db.execute(
+            select(Image).where(
+                Image.job_id == job_id, Image.image_id == existing_image_id))
+        img_row = result.scalars().first()
+        if not img_row:
+            return JSONResponse(status_code=404, content={
+                "error_code": "IMAGE_NOT_FOUND",
+                "message": f"Image {existing_image_id} not found",
+            })
+        # 覆写图片文件
+        file_path = job_dir / img_row.extracted_path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_bytes(crop_bytes)
+        # 更新 DB 元数据
+        img_row.bbox = [x1, y1, x2, y2]
+        img_row.resolution = [w, h]
+        img_row.short_edge = min(w, h)
+        img_row.image_hash = img_hash
+        img_row.search_eligible = min(w, h) >= 200
+        img_row.parser_backend = "manual_crop"
+        await db.commit()
+
+        image_id = existing_image_id
+        logger.info("image_crop_adjusted",
+                     job_id=str(job_id), image_id=image_id,
+                     bbox=[x1, y1, x2, y2], size=f"{w}x{h}")
+    else:
+        # ═══ 添加模式: 创建新图片 ═══
+        from nanoid import generate as nanoid
+        image_id = f"p{page_number}_manual_{nanoid(size=6)}"
+        file_rel = f"images/{image_id}.jpg"
+        file_abs = job_dir / file_rel
+        file_abs.parent.mkdir(parents=True, exist_ok=True)
+        file_abs.write_bytes(crop_bytes)
+
+        db.add(Image(
+            image_id=image_id,
+            job_id=job_id,
+            page_number=page_number,
+            role="product_main",
+            bbox=[x1, y1, x2, y2],
+            extracted_path=file_rel,
+            format="jpg",
+            resolution=[w, h],
+            short_edge=min(w, h),
+            image_hash=img_hash,
+            search_eligible=min(w, h) >= 200,
+            parser_backend="manual_crop",
+        ))
+
+        # 如果指定了 sku_id, 同时创建绑定
+        if bind_sku_id:
+            db.add(SKUImageBinding(
+                sku_id=bind_sku_id,
+                image_id=image_id,
+                job_id=job_id,
+                binding_method="manual",
+                binding_confidence=1.0,
+                rank=1,
+            ))
+
+        await db.commit()
+        logger.info("image_crop_added",
+                     job_id=str(job_id), image_id=image_id,
+                     page=page_number, bbox=[x1, y1, x2, y2],
+                     size=f"{w}x{h}", sku_id=bind_sku_id)
+
+    return {
+        "image_id": image_id,
+        "bbox": [x1, y1, x2, y2],
+        "resolution": [w, h],
+        "short_edge": min(w, h),
+        "mode": "adjust" if existing_image_id else "add",
+    }
+
+
 # ───────────────────────── LLM Accounts ─────────────────────────
 
 @router.get("/system/llm-accounts")

@@ -13,6 +13,7 @@ import { SKUList } from "../components/dashboard/SKUList";
 import { TimelineDrawer } from "../components/dashboard/TimelineDrawer";
 import { formatDate, formatPercent } from "../utils/format";
 import type { PageHeatmapCell } from "../components/dashboard/PageHeatmap";
+import ImageCropOverlay from "../components/annotation/ImageCropOverlay";
 
 // ── 实时活动面板 ──
 interface ActivityEntry {
@@ -105,6 +106,15 @@ export default function JobDetailPage() {
   const [showTimeline, setShowTimeline] = useState(false);
   const [activities, setActivities] = useState<ActivityEntry[]>([]);
   const actIdRef = useRef(0);
+
+  // 裁剪模式状态
+  const [cropState, setCropState] = useState<{
+    pageNo: number;
+    mode: "add" | "adjust";
+    imageId?: string;
+    skuId?: string;
+    initialBbox?: number[];
+  } | null>(null);
 
   const addActivity = useCallback((event: string, data: any) => {
     // 心跳事件不记录，避免刷屏
