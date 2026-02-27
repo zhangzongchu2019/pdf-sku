@@ -149,7 +149,7 @@ class PDFExtractor:
                         height=pix.height,
                         short_edge=short_edge,
                         image_hash=img_hash,
-                        search_eligible=short_edge >= 200,
+                        search_eligible=short_edge >= 150,
                     ))
                     img_idx += 1
                 except Exception:
@@ -267,7 +267,7 @@ class PDFExtractor:
                             images[i].width = pix.width
                             images[i].height = pix.height
                             images[i].short_edge = min(pix.width, pix.height)
-                            images[i].search_eligible = images[i].short_edge >= 200
+                            images[i].search_eligible = images[i].short_edge >= 150
                             images[i].image_hash = hashlib.md5(img_data[:1024]).hexdigest()[:12]
                     except Exception:
                         pass

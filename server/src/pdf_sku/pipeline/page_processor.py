@@ -124,7 +124,7 @@ class PageProcessor:
                     dh = abs(img.bbox[3] - img.bbox[1]) * dpi_scale
                     display_short = int(min(dw, dh))
                 img.short_edge = max(native_short, display_short)
-                img.search_eligible = img.short_edge >= 200
+                img.search_eligible = img.short_edge >= 150
                 if img.data:
                     img.image_hash = hashlib.md5(img.data[:2048]).hexdigest()[:12]
 

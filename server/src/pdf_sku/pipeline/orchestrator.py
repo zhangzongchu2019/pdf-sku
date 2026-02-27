@@ -278,11 +278,36 @@ class Orchestrator:
         result: PageResult,
     ) -> None:
         """持久化 SKU/Image/Binding 到 DB。"""
+        from sqlalchemy import delete, update as sa_update
         from pdf_sku.common.models import SKU, Image, SKUImageBinding
 
         job_dir = Path(os.environ.get("JOB_DATA_DIR", "/data/jobs")) / str(job_id)
         img_dir = job_dir / "images"
         img_dir.mkdir(parents=True, exist_ok=True)
+
+        # 重新处理时清理旧数据，避免唯一约束冲突
+        old_sku_ids_result = await db.execute(
+            select(SKU.sku_id).where(
+                SKU.job_id == job_id,
+                SKU.page_number == page_no,
+                SKU.superseded == False,  # noqa: E712
+            )
+        )
+        old_sku_ids = [row[0] for row in old_sku_ids_result.fetchall()]
+        if old_sku_ids:
+            await db.execute(
+                delete(SKUImageBinding).where(SKUImageBinding.sku_id.in_(old_sku_ids))
+            )
+            await db.execute(
+                sa_update(SKU).where(
+                    SKU.job_id == job_id,
+                    SKU.page_number == page_no,
+                    SKU.superseded == False,  # noqa: E712
+                ).values(superseded=True)
+            )
+        await db.execute(
+            delete(Image).where(Image.job_id == job_id, Image.page_number == page_no)
+        )
 
         for idx, sku in enumerate(result.skus, start=1):
             if sku.validity == "valid":
