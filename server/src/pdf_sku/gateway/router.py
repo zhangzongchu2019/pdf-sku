@@ -633,6 +633,7 @@ async def get_page_detail(
             select(SKUImageBinding).where(
                 SKUImageBinding.job_id == job_id,
                 SKUImageBinding.sku_id.in_(sku_ids),
+                SKUImageBinding.is_latest == True,
             )
         )
         for b in bindings_result.scalars().all():
@@ -702,6 +703,7 @@ async def get_skus(
             select(SKUImageBinding).where(
                 SKUImageBinding.job_id == job_id,
                 SKUImageBinding.sku_id.in_(sku_ids),
+                SKUImageBinding.is_latest == True,
             )
         )
         for b in bindings_result.scalars().all():
@@ -736,10 +738,11 @@ async def update_sku(
     sku_id: str,
     db: DBSession,
 ):
-    """更新 SKU 属性（支持已完成 Job 的后期修正）。"""
+    """更新 SKU 属性（支持已完成 Job 的后期修正）。自动记录 Annotation。"""
     body = await request.json()
     attributes = body.get("attributes")
     validity = body.get("validity")
+    annotator = body.get("annotator", "")
 
     result = await db.execute(
         select(SKU).where(
@@ -756,9 +759,32 @@ async def update_sku(
         })
 
     if attributes is not None:
-        sku.attributes = {**sku.attributes, **attributes}
-    if validity is not None:
+        old_attrs = dict(sku.attributes or {})
+        new_attrs = {**old_attrs, **attributes}
+        # Compute diff: only changed fields
+        diff = {k: {"old": old_attrs.get(k), "new": v}
+                for k, v in attributes.items() if old_attrs.get(k) != v}
+        if diff:
+            sku.attributes = new_attrs
+            sku.attribute_source = "HUMAN_CORRECTED"
+            db.add(Annotation(
+                job_id=job_id,
+                page_number=sku.page_number,
+                annotator=annotator,
+                type="SKU_ATTRIBUTE_CORRECTION",
+                payload={"sku_id": sku_id, "old": old_attrs, "new": new_attrs, "diff": diff},
+            ))
+
+    if validity is not None and validity != sku.validity:
+        old_validity = sku.validity
         sku.validity = validity
+        db.add(Annotation(
+            job_id=job_id,
+            page_number=sku.page_number,
+            annotator=annotator,
+            type="SKU_VALIDITY_CORRECTION",
+            payload={"sku_id": sku_id, "old_validity": old_validity, "new_validity": validity},
+        ))
 
     await db.commit()
 
@@ -766,7 +792,208 @@ async def update_sku(
         "sku_id": sku.sku_id,
         "attributes": sku.attributes,
         "validity": sku.validity,
+        "attribute_source": sku.attribute_source,
         "status": sku.status,
+    }
+
+
+@router.patch("/jobs/{job_id}/skus/{sku_id}/binding")
+async def update_sku_binding(
+    request: Request,
+    job_id: uuid.UUID,
+    sku_id: str,
+    db: DBSession,
+):
+    """替换 SKU 的图片绑定，记录 BINDING_CORRECTION Annotation。"""
+    body = await request.json()
+    new_image_id = body.get("image_id")
+    annotator = body.get("annotator", "")
+
+    if not new_image_id:
+        return JSONResponse(status_code=400, content={
+            "error_code": "MISSING_IMAGE_ID",
+            "message": "image_id is required",
+        })
+
+    # Verify SKU exists
+    sku_result = await db.execute(
+        select(SKU).where(SKU.job_id == job_id, SKU.sku_id == sku_id, SKU.superseded == False)
+    )
+    sku = sku_result.scalar_one_or_none()
+    if not sku:
+        return JSONResponse(status_code=404, content={
+            "error_code": "SKU_NOT_FOUND",
+            "message": f"SKU {sku_id} not found in job {job_id}",
+        })
+
+    # Verify target image exists in this job
+    img_result = await db.execute(
+        select(Image).where(Image.job_id == job_id, Image.image_id == new_image_id)
+    )
+    if not img_result.scalar_one_or_none():
+        return JSONResponse(status_code=404, content={
+            "error_code": "IMAGE_NOT_FOUND",
+            "message": f"Image {new_image_id} not found in job {job_id}",
+        })
+
+    # Get ALL bindings for this SKU (including non-latest, for revision tracking)
+    all_bind_result = await db.execute(
+        select(SKUImageBinding).where(
+            SKUImageBinding.sku_id == sku_id,
+            SKUImageBinding.job_id == job_id,
+        )
+    )
+    all_bindings = all_bind_result.scalars().all()
+    old_image_ids = [b.image_id for b in all_bindings if b.is_latest]
+    max_revision = max((b.revision for b in all_bindings), default=0)
+
+    # Mark all current bindings as not latest
+    for b in all_bindings:
+        b.is_latest = False
+
+    # Check if binding for new image already exists (reuse row to respect unique constraint)
+    existing = next((b for b in all_bindings if b.image_id == new_image_id), None)
+    if existing:
+        existing.is_latest = True
+        existing.binding_method = "human_correction"
+        existing.binding_confidence = 1.0
+        existing.is_ambiguous = False
+        existing.rank = 1
+        existing.revision = max_revision + 1
+    else:
+        db.add(SKUImageBinding(
+            sku_id=sku_id,
+            image_id=new_image_id,
+            job_id=job_id,
+            image_role="PRODUCT_MAIN",
+            binding_method="human_correction",
+            binding_confidence=1.0,
+            is_ambiguous=False,
+            rank=1,
+            revision=max_revision + 1,
+            is_latest=True,
+        ))
+
+    # Record annotation
+    db.add(Annotation(
+        job_id=job_id,
+        page_number=sku.page_number,
+        annotator=annotator,
+        type="BINDING_CORRECTION",
+        payload={"sku_id": sku_id, "old_image_ids": old_image_ids, "new_image_id": new_image_id},
+    ))
+
+    await db.commit()
+    return {"sku_id": sku_id, "new_image_id": new_image_id, "old_image_ids": old_image_ids}
+
+
+@router.post("/jobs/{job_id}/pages/{page_number}/review-complete")
+async def mark_review_complete(
+    request: Request,
+    job_id: uuid.UUID,
+    db: DBSession,
+    page_number: int = PathParam(..., ge=1),
+):
+    """标记页面审核完成，记录 PAGE_REVIEW_COMPLETE Annotation。"""
+    body = await request.json()
+    reviewer = body.get("reviewer", "")
+    review_time_sec = body.get("review_time_sec")
+
+    # Find page
+    result = await db.execute(
+        select(Page).where(Page.job_id == job_id, Page.page_number == page_number)
+        .order_by(desc(Page.attempt_no)).limit(1)
+    )
+    page = result.scalar_one_or_none()
+    if not page:
+        return JSONResponse(status_code=404, content={
+            "error_code": "PAGE_NOT_FOUND",
+            "message": f"Page {page_number} not found in job {job_id}",
+        })
+
+    if not page.needs_review:
+        return JSONResponse(status_code=409, content={
+            "error_code": "NOT_IN_REVIEW",
+            "message": f"Page {page_number} is not marked for review",
+        })
+
+    page.needs_review = False
+
+    db.add(Annotation(
+        job_id=job_id,
+        page_number=page_number,
+        annotator=reviewer,
+        type="PAGE_REVIEW_COMPLETE",
+        payload={
+            "reviewer": reviewer,
+            "review_time_sec": review_time_sec,
+        },
+    ))
+
+    await db.commit()
+
+    # Update job review_pages list
+    job_result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
+    job = job_result.scalar_one_or_none()
+    if job and job.review_pages and page_number in job.review_pages:
+        job.review_pages = [p for p in job.review_pages if p != page_number]
+        await db.commit()
+
+    return {"page_number": page_number, "needs_review": False}
+
+
+@router.get("/ops/review-stats")
+async def review_stats(
+    db: DBSession,
+    job_id: str | None = Query(None),
+    days: int = Query(30, ge=1, le=365),
+):
+    """审核统计：按类型聚合 annotation 数据，分析常见修正模式。"""
+    from datetime import timedelta
+
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    review_types = [
+        "SKU_ATTRIBUTE_CORRECTION",
+        "SKU_VALIDITY_CORRECTION",
+        "BINDING_CORRECTION",
+        "PAGE_REVIEW_COMPLETE",
+    ]
+
+    query = (
+        select(Annotation.type, func.count().label("count"))
+        .where(Annotation.type.in_(review_types), Annotation.annotated_at >= since)
+    )
+    if job_id:
+        query = query.where(Annotation.job_id == uuid.UUID(job_id))
+    query = query.group_by(Annotation.type)
+
+    result = await db.execute(query)
+    type_counts = {row.type: row.count for row in result.all()}
+
+    # Attribute field correction frequency
+    field_freq: dict[str, int] = {}
+    if type_counts.get("SKU_ATTRIBUTE_CORRECTION", 0) > 0:
+        attr_query = (
+            select(Annotation.payload)
+            .where(
+                Annotation.type == "SKU_ATTRIBUTE_CORRECTION",
+                Annotation.annotated_at >= since,
+            )
+        )
+        if job_id:
+            attr_query = attr_query.where(Annotation.job_id == uuid.UUID(job_id))
+        attr_result = await db.execute(attr_query)
+        for row in attr_result.scalars():
+            diff = row.get("diff", {}) if isinstance(row, dict) else {}
+            for field_name in diff:
+                field_freq[field_name] = field_freq.get(field_name, 0) + 1
+
+    return {
+        "period_days": days,
+        "job_id": job_id,
+        "correction_type_counts": type_counts,
+        "total_corrections": sum(type_counts.values()),
+        "attribute_field_frequency": dict(sorted(field_freq.items(), key=lambda x: -x[1])),
     }
 
 

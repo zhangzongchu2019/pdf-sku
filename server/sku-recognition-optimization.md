@@ -132,6 +132,30 @@
 
 ---
 
+### [2026-02-27] Phase 2c 合成大图布局检测
+
+**背景**: 部分产品目录 PDF 将整页内容（含多个产品照片）嵌入为单个 XObject，导致提取出一张覆盖整页的大图而非独立产品照片（如 Job `603ec88c` 第 3 页）。
+
+#### 1. DocLayout-YOLO 布局检测
+- **文件**: `pipeline/layout_detector.py` (新建)
+- **方案**: 引入 DocLayout-YOLO 模型，在 Phase 2b 后增加 Phase 2c，自动检测大图中的 Figure 区域
+- **触发条件**: 页面仅 1 张 `search_eligible` 图片，且 bbox 面积 > 60% 页面面积
+- **检测**: 用 `doclayout_yolo.YOLOv10` 加载模型（懒加载单例），置信度阈值 0.25
+- **NMS**: 去掉包含其他小框的大框（overlap_ratio > 80%）
+- **拆分**: ≥2 个 Figure 区域才拆分，子图 ID 为 `p{page}_region_{idx}`，`data=b""` 由 Phase 8 `_crop_composites` 裁剪
+- **Graceful degradation**: `doclayout-yolo` 未安装或模型文件不存在时自动跳过
+
+#### 2. 坐标系对齐
+- Phase 2c: YOLO 像素坐标 → ÷ (img_px / bbox_pt) → PDF points
+- Phase 8: bbox × (150/72) → 截图像素坐标
+- `_crop_composites` 已支持 `_region_` 前缀匹配
+
+#### 3. 验证结果
+- Job `603ec88c` 第 3 页: 1 张全页大图 → 3 个 `p3_region_*` 子图（左上产品、右上产品、右下产品）
+- 原大图 `search_eligible=False`，3 个子图全部 `search_eligible=True`
+
+---
+
 ## 待优化问题
 
 > 以下为用户反馈中排除确定性代码 bug 后，需要从模型/策略层面优化的问题。
@@ -188,3 +212,4 @@
 | `pipeline/extractor/consistency_validator.py` | SKU 去重、relaxed 模式、strict 放宽为任意两个核心属性 |
 | `pipeline/classifier/page_classifier.py` | 封面/扉页规则 |
 | `pipeline/binder/binder.py` | 歧义绑定、单图页快捷绑定、product_group 传播、零 bbox 降级/位置启发式绑定、单 SKU 多图绑定 |
+| `pipeline/layout_detector.py` | Phase 2c 合成大图布局检测: DocLayout-YOLO 模型加载 + Figure 检测 + NMS + 坐标转换 |

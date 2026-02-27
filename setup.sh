@@ -112,6 +112,24 @@ setup_backend() {
     .venv/bin/pip install --quiet -r requirements.txt
     ok "Python 依赖安装完成"
 
+    # 布局检测依赖 (可选, 用于合成大图拆分)
+    info "安装布局检测依赖 (doclayout-yolo)..."
+    .venv/bin/pip install --quiet doclayout-yolo ultralytics 2>/dev/null \
+        && ok "布局检测依赖安装完成" \
+        || warn "布局检测依赖安装失败 (可选功能, 不影响核心流程)"
+
+    # 下载 DocLayout-YOLO 模型 (可选)
+    if [[ ! -f "models/doclayout_yolo.pt" ]]; then
+        info "下载 DocLayout-YOLO 模型 (~40MB)..."
+        mkdir -p models
+        wget -q --show-progress -O models/doclayout_yolo.pt \
+            "https://huggingface.co/juliozhao/DocLayout-YOLO-DocStructBench/resolve/main/doclayout_yolo_docstructbench_imgsz1024.pt" 2>/dev/null \
+            && ok "DocLayout-YOLO 模型下载完成" \
+            || warn "模型下载失败 (可选功能, 合成大图页面将跳过布局检测)"
+    else
+        ok "DocLayout-YOLO 模型已存在"
+    fi
+
     info "运行数据库迁移..."
     .venv/bin/python -m alembic upgrade head 2>/dev/null \
         && ok "数据库迁移完成" \

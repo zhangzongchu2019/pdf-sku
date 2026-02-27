@@ -1,5 +1,25 @@
 # Changelog
 
+## V0.4.0 (2026-02-27)
+
+### 新功能
+- **Phase 2c 合成大图布局检测**: 引入 DocLayout-YOLO 模型，自动检测并拆分覆盖整页的合成大图为独立产品区域
+  - 触发条件: 页面仅 1 张 search_eligible 图片且 bbox 面积 > 60% 页面面积
+  - 检测到 ≥2 个 Figure 区域时拆分为 `p{page}_region_{idx}` 子图
+  - NMS 后处理去除包含关系的冗余大框
+  - Graceful degradation: ultralytics/doclayout-yolo 未安装或模型不存在时自动跳过
+
+### 配置
+- 新增环境变量: `DOCLAYOUT_MODEL_PATH`, `LAYOUT_DETECT_ENABLED`, `LAYOUT_DETECT_CONFIDENCE`
+- 新增 optional dependency group: `layout = ["doclayout-yolo>=0.0.4", "ultralytics>=8.1.0"]`
+
+### 部署
+- `setup.sh` 新增自动安装布局检测依赖和下载模型的步骤
+- `server/.gitignore` 新增 `models/*.pt` 忽略规则
+- `README.md` 更新前置要求、项目结构和手动安装说明
+
+---
+
 ## V0.3.0 (2026-02-24)
 
 ### 新功能

@@ -20,6 +20,7 @@
 - **Python** ≥ 3.11（本地开发模式）
 - **Node.js** ≥ 20（本地开发模式）
 - **LLM API Key**（至少配置一个: Gemini / Qwen / OpenRouter）
+- **磁盘空间** ≥ 2GB（用于 DocLayout-YOLO 模型、PyTorch 依赖、图片缓存）
 
 ## 快速开始
 
@@ -116,10 +117,12 @@ pdf-sku/
 │   │   ├── gateway/         # API 路由
 │   │   └── pipeline/        # 9 阶段处理管线
 │   │       ├── parser/      # Phase 1: PDF 解析
+│   │       ├── layout_detector.py  # Phase 2c: 合成大图布局检测 (DocLayout-YOLO)
 │   │       ├── classifier/  # Phase 5: 页面分类
 │   │       ├── extractor/   # Phase 6: SKU 提取
 │   │       ├── binder/      # Phase 8: SKU-图片绑定
 │   │       └── exporter/    # Phase 9: 导出
+│   ├── models/              # YOLO 模型文件 (git ignored, setup.sh 自动下载)
 │   ├── alembic/             # 数据库迁移
 │   ├── Dockerfile
 │   └── .env.example
@@ -169,4 +172,11 @@ curl -X POST http://localhost:8000/api/v1/ops/jobs/{job_id}/reprocess-page/{page
 
 # 查看 Docker 日志
 docker compose -f infra/docker/docker-compose.yml logs -f server
+
+# 手动安装布局检测依赖 (setup.sh 会自动执行)
+cd server
+.venv/bin/pip install doclayout-yolo ultralytics
+# 下载 DocLayout-YOLO 模型 (~40MB)
+mkdir -p models && wget -O models/doclayout_yolo.pt \
+  "https://huggingface.co/juliozhao/DocLayout-YOLO-DocStructBench/resolve/main/doclayout_yolo_docstructbench_imgsz1024.pt"
 ```

@@ -100,6 +100,17 @@ export const jobsApi = {
       `/jobs/${jobId}/skus/${skuId}`, data
     ),
 
+  updateSkuBinding: (jobId: string, skuId: string, imageId: string) =>
+    api.patch<{ sku_id: string; new_image_id: string; old_image_ids: string[] }>(
+      `/jobs/${jobId}/skus/${skuId}/binding`, { image_id: imageId }
+    ),
+
+  markReviewComplete: (jobId: string, pageNo: number, reviewTimeSec?: number) =>
+    api.post<{ page_number: number; needs_review: boolean }>(
+      `/jobs/${jobId}/pages/${pageNo}/review-complete`,
+      { reviewer: "", review_time_sec: reviewTimeSec ?? null }
+    ),
+
   ocrRegion: (jobId: string, pageNo: number, bbox: number[]) =>
     api.post<{ attributes: Record<string, string>; source_text: string }>(
       `/jobs/${jobId}/pages/${pageNo}/ocr-region`, { bbox }

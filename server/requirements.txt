@@ -24,3 +24,7 @@ aiofiles>=24.1.0
 orjson>=3.10.0
 nanoid>=2.0.0
 pydantic-settings>=2.0.0
+
+# Layout Detection (optional, for Phase 2c composite image splitting)
+# Install separately: pip install doclayout-yolo ultralytics
+# Also requires model file: server/models/doclayout_yolo.pt

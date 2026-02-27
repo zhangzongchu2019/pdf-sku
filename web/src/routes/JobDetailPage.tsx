@@ -98,6 +98,9 @@ export default function JobDetailPage() {
   const [expandedPage, setExpandedPage] = useState<number | null>(null);
   const [pageDetail, setPageDetail] = useState<PageDetail | null>(null);
   const [lightboxImg, setLightboxImg] = useState<string | null>(null);
+  const [reviewCompleting, setReviewCompleting] = useState(false);
+  const [bindingSku, setBindingSku] = useState<string | null>(null);
+  const [reviewStartTime] = useState<Record<number, number>>({});
   const [tab, setTab] = useState<"pages" | "skus" | "heatmap" | "eval">("pages");
   const [showTimeline, setShowTimeline] = useState(false);
   const [activities, setActivities] = useState<ActivityEntry[]>([]);
@@ -155,11 +158,47 @@ export default function JobDetailPage() {
       return;
     }
     setExpandedPage(pageNo);
+    // Track review start time for time calculation
+    const pg = pages.find((pp) => pp.page_number === pageNo);
+    if (pg?.needs_review && !reviewStartTime[pageNo]) {
+      reviewStartTime[pageNo] = Date.now();
+    }
     try {
       const detail = await jobsApi.getPageDetail(jobId!, pageNo);
       setPageDetail(detail);
     } catch {
       setPageDetail(null);
+    }
+  };
+
+  const handleReviewComplete = async (pageNo: number) => {
+    if (!jobId || reviewCompleting) return;
+    setReviewCompleting(true);
+    try {
+      const startTime = reviewStartTime[pageNo];
+      const timeSec = startTime ? Math.round((Date.now() - startTime) / 1000) : undefined;
+      await jobsApi.markReviewComplete(jobId, pageNo, timeSec);
+      await fetchPages(jobId);
+      await fetchJob(jobId);
+    } catch (e) {
+      console.error("审核完成失败:", e);
+    } finally {
+      setReviewCompleting(false);
+    }
+  };
+
+  const handleBindImage = async (skuId: string, imageId: string) => {
+    if (!jobId) return;
+    try {
+      await jobsApi.updateSkuBinding(jobId, skuId, imageId);
+      if (expandedPage !== null) {
+        const detail = await jobsApi.getPageDetail(jobId, expandedPage);
+        setPageDetail(detail);
+      }
+    } catch (e) {
+      console.error("绑定修正失败:", e);
+    } finally {
+      setBindingSku(null);
     }
   };
 
@@ -257,6 +296,8 @@ export default function JobDetailPage() {
                   <td style={{ textAlign: "center" }}>
                     {p.needs_review ? (
                       <span title="需要人工介入" style={{ color: "#EF4444", fontSize: 16 }}>&#9873;</span>
+                    ) : (p.page_confidence != null && p.page_confidence < 0.6) ? (
+                      <span title="已审核完成" style={{ color: "#22C55E", fontSize: 14 }}>&#10003;</span>
                     ) : (
                       <span style={{ color: "#64748B" }}>—</span>
                     )}
@@ -267,6 +308,34 @@ export default function JobDetailPage() {
                 {expandedPage === p.page_number && (
                   <tr key={`detail-${p.id}`}>
                     <td colSpan={9} style={{ padding: 0 }}>
+                      {/* Review toolbar for needs_review pages */}
+                      {p.needs_review && (
+                        <div style={{
+                          display: "flex", alignItems: "center", gap: 12,
+                          padding: "8px 16px",
+                          backgroundColor: "#1A1520",
+                          borderBottom: "1px solid #EF444433",
+                        }}>
+                          <span style={{ fontSize: 12, color: "#F59E0B", fontWeight: 600 }}>
+                            &#9873; 审核修正
+                          </span>
+                          <span style={{ fontSize: 11, color: "#64748B" }}>
+                            修改 SKU 属性请使用 SKU Tab 编辑功能
+                          </span>
+                          <div style={{ flex: 1 }} />
+                          <button
+                            onClick={() => handleReviewComplete(p.page_number)}
+                            disabled={reviewCompleting}
+                            style={{
+                              padding: "4px 14px", fontSize: 12, cursor: "pointer",
+                              backgroundColor: "#22C55E22", border: "1px solid #22C55E44",
+                              borderRadius: 4, color: "#22C55E", fontWeight: 500,
+                            }}
+                          >
+                            {reviewCompleting ? "提交中..." : "审核完成"}
+                          </button>
+                        </div>
+                      )}
                       <div style={{ display: "flex", gap: 16, padding: 16, backgroundColor: "#151C2C", borderBottom: "2px solid #22D3EE33" }}>
                         {/* Left: large screenshot */}
                         <div style={{ flexShrink: 0 }}>
@@ -290,23 +359,64 @@ export default function JobDetailPage() {
                                   {sku.attributes?.product_name || sku.attributes?.name ? ` ${sku.attributes.product_name || sku.attributes.name}` : ""}
                                   {sku.attributes?.size ? ` | ${sku.attributes.size}` : ""}
                                 </span>
-                                <span style={{ color: "#64748B" }}>{sku.validity}</span>
+                                <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                                  <span style={{ color: "#64748B", fontSize: 11 }}>{sku.attribute_source === "HUMAN_CORRECTED" ? "已修正" : ""}</span>
+                                  <span style={{ color: "#64748B" }}>{sku.validity}</span>
+                                </div>
                               </div>
-                              {sku.images.length > 0 && (
-                                <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                                  {sku.images.slice(0, 3).map((img) => (
-                                    <img
-                                      key={img.image_id}
-                                      src={imageUrl(img.image_id)}
-                                      style={{ width: 48, height: 48, objectFit: "cover", borderRadius: 3, border: "1px solid #2D3548", cursor: "pointer" }}
-                                      onClick={(e) => { e.stopPropagation(); setLightboxImg(imageUrl(img.image_id)); }}
-                                    />
-                                  ))}
-                                  {sku.images.length > 3 && (
-                                    <span style={{ display: "flex", alignItems: "center", fontSize: 11, color: "#64748B" }}>
-                                      +{sku.images.length - 3}
-                                    </span>
-                                  )}
+                              {/* SKU images with binding correction */}
+                              <div style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
+                                {sku.images.slice(0, 3).map((img) => (
+                                  <img
+                                    key={img.image_id}
+                                    src={imageUrl(img.image_id)}
+                                    style={{
+                                      width: 48, height: 48, objectFit: "cover", borderRadius: 3,
+                                      border: bindingSku === sku.sku_id ? "2px solid #F59E0B" : "1px solid #2D3548",
+                                      cursor: "pointer",
+                                    }}
+                                    onClick={(e) => { e.stopPropagation(); setLightboxImg(imageUrl(img.image_id)); }}
+                                  />
+                                ))}
+                                {sku.images.length > 3 && (
+                                  <span style={{ display: "flex", alignItems: "center", fontSize: 11, color: "#64748B" }}>
+                                    +{sku.images.length - 3}
+                                  </span>
+                                )}
+                                {p.needs_review && (
+                                  <button
+                                    onClick={(e) => { e.stopPropagation(); setBindingSku(bindingSku === sku.sku_id ? null : sku.sku_id); }}
+                                    style={{
+                                      padding: "2px 6px", fontSize: 10, cursor: "pointer",
+                                      backgroundColor: bindingSku === sku.sku_id ? "#F59E0B22" : "transparent",
+                                      border: `1px solid ${bindingSku === sku.sku_id ? "#F59E0B44" : "#2D3548"}`,
+                                      borderRadius: 3,
+                                      color: bindingSku === sku.sku_id ? "#F59E0B" : "#64748B",
+                                    }}
+                                  >
+                                    {bindingSku === sku.sku_id ? "取消" : "换图"}
+                                  </button>
+                                )}
+                              </div>
+                              {/* Binding selection: show all page images to pick from */}
+                              {bindingSku === sku.sku_id && pageDetail?.images && (
+                                <div style={{ marginTop: 6, padding: 6, backgroundColor: "#151C2C", borderRadius: 4, border: "1px dashed #F59E0B44" }}>
+                                  <div style={{ fontSize: 11, color: "#F59E0B", marginBottom: 4 }}>选择正确的图片:</div>
+                                  <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                                    {pageDetail.images.map((img) => (
+                                      <img
+                                        key={img.image_id}
+                                        src={imageUrl(img.image_id)}
+                                        style={{
+                                          width: 56, height: 56, objectFit: "cover", borderRadius: 3,
+                                          border: "2px solid #2D3548", cursor: "pointer",
+                                        }}
+                                        onClick={(e) => { e.stopPropagation(); handleBindImage(sku.sku_id, img.image_id); }}
+                                        onMouseEnter={(e) => { (e.target as HTMLImageElement).style.borderColor = "#22D3EE"; }}
+                                        onMouseLeave={(e) => { (e.target as HTMLImageElement).style.borderColor = "#2D3548"; }}
+                                      />
+                                    ))}
+                                  </div>
                                 </div>
                               )}
                             </div>
