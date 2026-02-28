@@ -321,16 +321,37 @@ class PDFExtractor:
         tables = []
         # 使用 find_tables() 而非 extract_tables()，以获取真实 bbox 用于分类器面积计算
         for tbl_obj in (page.find_tables() or []):
-            tbl = tbl_obj.extract()
+            tbl = tbl_obj.extract()  # list[list[str|None]] — None 表示竖向合并单元格
             if tbl:
                 rows = [[str(c or "") for c in row] for row in tbl]
+                # 检测图片列并记录每行是否有独立图片单元格
+                # pdfplumber 对竖向 span 的合并单元格返回 None（而非空字符串）
+                img_col = PDFExtractor._detect_image_col(tbl)
+                row_image_flags = [
+                    (row[img_col] is not None) if img_col < len(row) else True
+                    for row in tbl
+                ]
                 tables.append(TableData(
                     rows=rows,
                     bbox=tbl_obj.bbox,  # (x0, top, x1, bottom) in PDF points
                     header_row=rows[0] if rows else None,
                     column_count=len(rows[0]) if rows else 0,
+                    row_image_flags=row_image_flags,
                 ))
         return tables
+
+    @staticmethod
+    def _detect_image_col(tbl: list) -> int:
+        """在原始 pdfplumber 表格中检测图片列索引。
+
+        扫描前 3 行，找含「图」字的列（如「图片」「效果图」）。
+        若未找到则默认返回 0（图片通常在最左列）。
+        """
+        for row in tbl[:3]:
+            for ci, cell in enumerate(row):
+                if cell and isinstance(cell, str) and "图" in cell:
+                    return ci
+        return 0
 
     @staticmethod
     def _plumber_images(page, path: str, page_no: int) -> list[ImageInfo]:

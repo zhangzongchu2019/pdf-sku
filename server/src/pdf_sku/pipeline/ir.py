@@ -29,6 +29,9 @@ class TableData:
     header_row: list[str] | None = None
     column_count: int = 0
     is_continuation: bool = False
+    # 每行是否有独立图片单元格 (True=非合并, False=pdfplumber None=竖向合并共享上行图片)
+    # 与 rows 等长，仅 _plumber_tables 时填充；CrossPageMerger 修改后可能为空列表
+    row_image_flags: list[bool] = field(default_factory=list)
 
 
 @dataclass
@@ -128,6 +131,7 @@ class SKUResult:
     raw_response: str = ""
     product_id: str = ""         # 所属产品组 ID（同一产品的多个 SKU 变体共享）
     variant_label: str = ""      # 变体描述（如 "双人位"、"红色"）
+    has_own_image: bool = True   # 表格行是否有独立图片单元格（False=合并共享上行图片）
 
 
 @dataclass

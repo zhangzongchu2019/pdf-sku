@@ -20,7 +20,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 from pdf_sku.pipeline.ir import (
     ParsedPageIR, FeatureVector, ClassifyResult, PageResult,
-    SKUResult, ImageInfo, BindingResult, ValidationResult,
+    SKUResult, ImageInfo, BindingResult, ValidationResult, TableData,
 )
 from pdf_sku.pipeline.parser.adapter import PDFExtractor
 from pdf_sku.pipeline.parser.feature_extractor import FeatureExtractor
@@ -250,7 +250,13 @@ class PageProcessor:
             if raw.text_blocks and skus:
                 self._refine_sku_bboxes(skus, raw.text_blocks, scale)
 
-            bindings = self._binder.bind(skus, eligible_images, cls_result)
+            # A 类表格页: 图片与 SKU 按竖直顺序一一对应，不依赖空间 bbox 匹配
+            # （_table_extract 给所有 SKU 相同的 table.bbox，空间绑定无法区分行）
+            if page_type == "A" and skus:
+                bindings = self._bind_table_by_row_order(
+                    skus, eligible_images, raw.tables, scale)
+            else:
+                bindings = self._binder.bind(skus, eligible_images, cls_result)
 
             # VLM 辅助绑定: 文字层为空时空间绑定不可靠，用 VLM 视觉匹配
             if (not raw.text_blocks and len(eligible_images) >= 1
@@ -387,9 +393,13 @@ class PageProcessor:
             # 归一化: 中文列名 → 标准英文键（精确匹配 > 前缀匹配 > 原名兜底）
             headers = [self._normalize_header(h) for h in raw_headers]
 
+            # 获取数据行的图片标志（True=有独立图片单元格, False=合并共享上行图片）
+            # row_image_flags 与 table.rows 等长（含标题行）；CrossPageMerger 改写后可能为空
+            img_flags = table.row_image_flags[header_idx + 1:] if table.row_image_flags else []
+
             # 前向填充游标: 记录上一有效行的属性，用于继承竖向合并单元格的值
             prev_attrs: dict[str, str] = {}
-            for row in table.rows[header_idx + 1:]:
+            for data_row_idx, row in enumerate(table.rows[header_idx + 1:]):
                 attrs: dict[str, str] = {}
                 row_has_own_value = False
                 for i, cell in enumerate(row):
@@ -411,12 +421,19 @@ class PageProcessor:
                             attrs[key] = val
 
                 if attrs:
+                    # 图片共享标志: 从 row_image_flags 读取；缺失时默认独立图片
+                    has_own_image = (
+                        img_flags[data_row_idx]
+                        if data_row_idx < len(img_flags)
+                        else True
+                    )
                     results.append(SKUResult(
                         attributes=attrs,
                         source_bbox=table.bbox,
                         validity="valid",
                         confidence=0.85,
                         extraction_method="table_rule",
+                        has_own_image=has_own_image,
                     ))
                     prev_attrs = attrs
         return results
@@ -511,6 +528,73 @@ class PageProcessor:
                         matched=len(matched_blocks),
                         old_bbox=[round(v, 1) for v in old[:4]],
                         new_bbox=[round(v, 1) for v in sku.source_bbox[:4]])
+
+    @staticmethod
+    def _bind_table_by_row_order(
+        skus: list[SKUResult],
+        images: list[ImageInfo],
+        tables: list[TableData] | None = None,
+        scale: float = 150 / 72.0,
+    ) -> list[BindingResult]:
+        """表格页专用绑定: 按图片 Y 坐标顺序与 SKU 提取顺序对应。
+
+        处理两种特殊情况:
+        1. 合并图片单元格 (sku.has_own_image=False): 不前进图片索引，
+           共享上一行图片（同一产品的多个规格 SKU 共用一张产品图）。
+        2. 表格 bbox 外的图片: 溢出到表格下方的图片按中心点过滤，
+           避免把下一产品区域的图片错误绑定给最后一行 SKU。
+        """
+        deliverable = [
+            img for img in images
+            if not img.is_duplicate
+            and (not img.role or img.role in {"product_main", "product_detail", "unknown"})
+        ]
+        sorted_imgs = sorted(
+            deliverable,
+            key=lambda img: (img.bbox[1] + img.bbox[3]) / 2 if len(img.bbox) >= 4 else 0,
+        )
+
+        # 过滤表格 bbox 外的图片（用图片中心判断，比用顶边更鲁棒）
+        # table.bbox 是 PDF points，图片 bbox 已在 Phase 8 中缩放为像素坐标
+        if tables:
+            table_bottoms = [tbl.bbox[3] * scale for tbl in tables if len(tbl.bbox) >= 4]
+            if table_bottoms:
+                tbl_bottom_px = max(table_bottoms)
+                sorted_imgs = [
+                    img for img in sorted_imgs
+                    if len(img.bbox) < 4
+                    or (img.bbox[1] + img.bbox[3]) / 2 <= tbl_bottom_px
+                ]
+
+        results: list[BindingResult] = []
+        img_idx = -1
+        current_img_id: str | None = None
+
+        for sku in skus:
+            if sku.has_own_image:
+                img_idx += 1
+                current_img_id = (
+                    sorted_imgs[img_idx].image_id
+                    if img_idx < len(sorted_imgs)
+                    else None
+                )
+            # has_own_image=False: 保持 current_img_id（共享上一行图片）
+
+            if current_img_id is not None:
+                results.append(BindingResult(
+                    sku_id=sku.sku_id,
+                    image_id=current_img_id,
+                    confidence=0.9,
+                    method="table_row_order",
+                    is_ambiguous=False,
+                    rank=1,
+                ))
+
+        logger.info("table_row_order_bind",
+                    sku_count=len(skus),
+                    img_count=len(sorted_imgs),
+                    bound=len(results))
+        return results
 
     REBIND_BATCH_SIZE = 15
 
