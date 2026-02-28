@@ -319,11 +319,14 @@ class PDFExtractor:
     @staticmethod
     def _plumber_tables(page) -> list[TableData]:
         tables = []
-        for tbl in (page.extract_tables() or []):
+        # 使用 find_tables() 而非 extract_tables()，以获取真实 bbox 用于分类器面积计算
+        for tbl_obj in (page.find_tables() or []):
+            tbl = tbl_obj.extract()
             if tbl:
                 rows = [[str(c or "") for c in row] for row in tbl]
                 tables.append(TableData(
                     rows=rows,
+                    bbox=tbl_obj.bbox,  # (x0, top, x1, bottom) in PDF points
                     header_row=rows[0] if rows else None,
                     column_count=len(rows[0]) if rows else 0,
                 ))

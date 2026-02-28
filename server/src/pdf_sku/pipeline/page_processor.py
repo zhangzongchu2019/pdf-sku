@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import math
 import hashlib
+import re
 from concurrent.futures import ProcessPoolExecutor
 
 from pdf_sku.pipeline.ir import (
@@ -131,6 +132,20 @@ class PageProcessor:
             # ═══ Phase 2a: 图片去重 ═══
             raw.images = self._dedup_images(raw.images)
 
+            # ═══ Phase 2a2: 过滤跨页溢出图片 ═══
+            # bbox[3] (底边) 超出页面高度 + 5pt 容差 → 属于下一页产品，排除当前页绑定
+            page_h = raw.metadata.page_height
+            for img in raw.images:
+                if (len(img.bbox) >= 4
+                        and img.bbox[3] > page_h + 5
+                        and img.search_eligible):
+                    img.search_eligible = False
+                    logger.info("image_overflow_excluded",
+                                page=page_no,
+                                image_id=img.image_id,
+                                img_bottom=round(img.bbox[3], 1),
+                                page_height=round(page_h, 1))
+
             # ═══ Phase 2b: 瓦片碎片聚类合并 ═══
             raw.images = self._merge_tile_fragments(raw.images, page_no)
 
@@ -142,7 +157,8 @@ class PageProcessor:
             features = self._feat.extract(raw)
 
             # ═══ Phase 4: 跨页表格检测 ═══
-            continuation = await self._xpage.find_continuation(job_id, page_no, raw)
+            continuation = await self._xpage.find_continuation(
+                job_id, page_no, raw, file_path=file_path)
             if continuation:
                 raw.tables = self._xpage.merge(continuation.source_tables, raw.tables)
 
@@ -173,10 +189,13 @@ class PageProcessor:
                 raw, page_type, screenshot, features, llm_calls_used)
             extraction_method = skus[0].extraction_method if skus else None
 
-            # deduplicate + enforce validity + filter invalid
-            skus = self._validator.deduplicate_skus(skus)
+            # A 类: 表格每行独立 SKU，无需去重；使用 relaxed 有效性校验（可信结构化数据）
+            # B/C 类: LLM 可能重复提取，需去重；使用 strict 校验
+            if page_type != "A":
+                skus = self._validator.deduplicate_skus(skus)
+            validity_profile = {"sku_validity_mode": "relaxed"} if page_type == "A" else None
             skus = self._validator.enforce_sku_validity(
-                skus, None, text_block_count=features.text_block_count)
+                skus, validity_profile, text_block_count=features.text_block_count)
             skus = [s for s in skus if s.validity == "valid"]
 
             # ── retry: validity 全灭 或 SKU 数远少于图片数 ──
@@ -332,27 +351,113 @@ class PageProcessor:
         # [C7] 最终兜底: 返回空
         return []
 
+    # 常见中文列名 → 系统标准英文键映射（供 bbox 精修 & 前端展示一致性）
+    _COLUMN_NORM: dict[str, str] = {
+        "产品名称": "product_name", "名称": "product_name", "商品名称": "product_name",
+        "品名": "product_name", "产品": "product_name",
+        "型号": "model_number", "货号": "model_number", "品号": "model_number",
+        "编号": "model_number", "sku": "model_number",
+        "规格": "size", "尺寸": "size",
+        "单价": "unit_price", "价格": "unit_price", "出厂价": "unit_price",
+        "price": "unit_price",  # PDF 中常见的英文价格列头
+        "颜色": "color", "材质": "material",
+        "备注": "remarks", "说明": "remarks",
+        "重量": "weight", "毛重": "weight",
+        "包装": "packaging", "最小量": "min_qty", "最小订量": "min_qty",
+    }
+
     def _table_extract(self, raw: ParsedPageIR) -> list[SKUResult]:
-        """A 类表格页: 规则引擎提取。"""
+        """A 类表格页: 规则引擎提取。
+
+        自动定位实际列标题行（跳过页面标题/说明行），
+        将常见中文列名归一化为系统标准英文键，
+        并对空白单元格执行前向填充（处理 PDF 竖向合并单元格）。
+        """
         results = []
         for table in raw.tables:
             if not table.rows or len(table.rows) < 2:
                 continue
-            headers = [h.lower().strip() for h in table.rows[0]]
-            for row in table.rows[1:]:
-                attrs = {}
+
+            # 定位实际列标题行（第一个多列非空的行）
+            header_idx = self._find_table_header_idx(table.rows, table.column_count)
+            if header_idx < 0:
+                continue
+
+            raw_headers = [h.lower().strip() for h in table.rows[header_idx]]
+            # 归一化: 中文列名 → 标准英文键（精确匹配 > 前缀匹配 > 原名兜底）
+            headers = [self._normalize_header(h) for h in raw_headers]
+
+            # 前向填充游标: 记录上一有效行的属性，用于继承竖向合并单元格的值
+            prev_attrs: dict[str, str] = {}
+            for row in table.rows[header_idx + 1:]:
+                attrs: dict[str, str] = {}
+                row_has_own_value = False
                 for i, cell in enumerate(row):
-                    if i < len(headers) and cell and cell.strip():
-                        attrs[headers[i]] = cell.strip()
+                    if i < len(headers) and headers[i]:
+                        if cell and cell.strip():
+                            val = self._clean_table_cell(cell.strip())
+                            if not val:
+                                continue
+                            # 避免同一键重复覆盖（取第一次出现的值）
+                            if headers[i] not in attrs:
+                                attrs[headers[i]] = val
+                            row_has_own_value = True
+
+                # 合并单元格前向填充: 当前行有自身值时，对空白列从上一行继承
+                # 这处理 PDF 中竖向 span 的单元格（pdfplumber 只填第一行）
+                if row_has_own_value:
+                    for key, val in prev_attrs.items():
+                        if key not in attrs:
+                            attrs[key] = val
+
                 if attrs:
                     results.append(SKUResult(
                         attributes=attrs,
                         source_bbox=table.bbox,
-                        validity="valid" if attrs else "invalid",
+                        validity="valid",
                         confidence=0.85,
                         extraction_method="table_rule",
                     ))
+                    prev_attrs = attrs
         return results
+
+    @staticmethod
+    def _clean_table_cell(value: str) -> str:
+        """清理表格单元格值。
+
+        处理 PDF 中常见的「英文标注\\n实际值」格式：
+        若多行值的第一行仅由 ASCII 字母组成（如 'PRICE\\n370'），
+        则该行为列内英文副标题，移除后取后续内容。
+        """
+        if '\n' in value:
+            parts = [p.strip() for p in value.split('\n') if p.strip()]
+            if parts and re.match(r'^[A-Za-z ]+$', parts[0]):
+                value = '\n'.join(parts[1:]).strip()
+        return value
+
+    @classmethod
+    def _normalize_header(cls, h: str) -> str:
+        """将表格列标题归一化为系统标准键。精确匹配 → 前缀匹配 → 原名兜底。"""
+        if h in cls._COLUMN_NORM:
+            return cls._COLUMN_NORM[h]
+        for key, val in cls._COLUMN_NORM.items():
+            if h.startswith(key):
+                return val
+        return h
+
+    @staticmethod
+    def _find_table_header_idx(rows: list[list[str]], column_count: int) -> int:
+        """定位实际列标题行的索引。
+
+        策略: 从上到下扫描，返回第一个非空格子数 >= max(2, col_count//2) 的行的索引。
+        该行之前的行是页面标题/说明文字，通常只有 1 个非空格子。
+        """
+        min_nonempty = max(2, column_count // 2)
+        for i, row in enumerate(rows):
+            nonempty = sum(1 for c in row if c and c.strip())
+            if nonempty >= min_nonempty:
+                return i
+        return -1
 
     @staticmethod
     def _refine_sku_bboxes(
