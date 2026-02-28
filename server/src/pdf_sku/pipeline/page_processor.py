@@ -194,9 +194,11 @@ class PageProcessor:
             if page_type != "A":
                 skus = self._validator.deduplicate_skus(skus)
             validity_profile = {"sku_validity_mode": "relaxed"} if page_type == "A" else None
+            # enforce validity → filter invalid → deduplicate
             skus = self._validator.enforce_sku_validity(
                 skus, validity_profile, text_block_count=features.text_block_count)
             skus = [s for s in skus if s.validity == "valid"]
+            skus = self._validator.deduplicate_skus(skus)
 
             # ── retry: validity 全灭 或 SKU 数远少于图片数 ──
             eligible_count = sum(1 for img in raw.images if img.search_eligible)
@@ -204,17 +206,17 @@ class PageProcessor:
                 page_type not in ("D", "A")
                 and (
                     (not skus and extraction_method is not None)
-                    or (0 < len(skus) < eligible_count * 0.5
-                        and eligible_count >= 2)
+                    or (0 < len(skus) < eligible_count * 0.7
+                        and eligible_count >= 1)
                 )
             )
             if should_retry:
                 retry_skus = await self._extract_skus_with_fallback(
                     raw, page_type, screenshot, features, llm_calls_used=4)
-                retry_skus = self._validator.deduplicate_skus(retry_skus)
                 retry_skus = self._validator.enforce_sku_validity(
                     retry_skus, None, text_block_count=features.text_block_count)
                 retry_skus = [s for s in retry_skus if s.validity == "valid"]
+                retry_skus = self._validator.deduplicate_skus(retry_skus)
                 if len(retry_skus) > len(skus):
                     skus = retry_skus
                     extraction_method = skus[0].extraction_method if skus else extraction_method
@@ -258,8 +260,12 @@ class PageProcessor:
             else:
                 bindings = self._binder.bind(skus, eligible_images, cls_result)
 
-            # VLM 辅助绑定: 文字层为空时空间绑定不可靠，用 VLM 视觉匹配
-            if (not raw.text_blocks and len(eligible_images) >= 1
+            # VLM 辅助绑定: 文字层极少或绑定质量低时用 VLM 视觉匹配
+            avg_bind_conf = (sum(b.confidence for b in bindings) / len(bindings)) if bindings else 0
+            low_quality_bind = avg_bind_conf < 0.5 and len(skus) >= 2
+            few_text = len(raw.text_blocks) <= 3
+            if ((few_text or low_quality_bind)
+                    and len(eligible_images) >= 1
                     and len(skus) >= 2 and screenshot and self._llm):
                 vlm_bindings = await self._vlm_rebind_composites(
                     skus, eligible_images, screenshot)

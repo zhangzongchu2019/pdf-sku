@@ -73,7 +73,7 @@ class ConsistencyValidator:
 
     @staticmethod
     def deduplicate_skus(skus: list[SKUResult]) -> list[SKUResult]:
-        """按 (product_name, model_number, size) 去重，保留 confidence 最高的。"""
+        """按 (product_name, model_number, size, color, material) 去重，保留 confidence 最高的。"""
         seen: dict[tuple, SKUResult] = {}
         for sku in skus:
             attrs = sku.attributes
@@ -81,8 +81,13 @@ class ConsistencyValidator:
                 attrs.get("product_name", ""),
                 attrs.get("model_number", ""),
                 attrs.get("size", ""),
+                attrs.get("color", ""),
+                attrs.get("material", ""),
             )
-            if key == ("", "", ""):
+            # product_id 非空时加入 key，区分同组不同变体
+            if sku.product_id:
+                key = (sku.product_id,) + key
+            if key == ("", "", "", "", ""):
                 # 无法判断重复，保留
                 seen[id(sku)] = sku
             elif key not in seen or sku.confidence > seen[key].confidence:
@@ -97,19 +102,20 @@ class ConsistencyValidator:
     ) -> list[SKUResult]:
         """
         [C6] 强制 SKU validity: valid/invalid (无 partial)。
-        strict 模式: 至少两个核心属性 (name/model/size 中任意两个)
-        relaxed 模式 (纯图页 text_block_count <= 5): 任何属性非空即可
+        strict 模式: 至少两个核心属性 (name/model/size/price 中任意两个)
+        relaxed 模式 (纯图页 text_block_count <= 10): 任何属性非空即可
         """
         mode = (profile or {}).get("sku_validity_mode", "strict")
-        is_image_only = text_block_count is not None and text_block_count <= 5
+        is_image_only = text_block_count is not None and text_block_count <= 10
         for sku in skus:
             attrs = sku.attributes
             if mode == "strict" and not is_image_only:
                 has_name = bool(attrs.get("product_name"))
                 has_model = bool(attrs.get("model_number"))
                 has_size = bool(attrs.get("size"))
-                # 至少两个核心属性: name/model/size 中任意两个
-                core_count = sum([has_name, has_model, has_size])
+                has_price = bool(attrs.get("price"))
+                # 至少两个核心属性: name/model/size/price 中任意两个
+                core_count = sum([has_name, has_model, has_size, has_price])
                 sku.validity = "valid" if core_count >= 2 else "invalid"
             else:
                 # relaxed: 任何属性非空即 valid

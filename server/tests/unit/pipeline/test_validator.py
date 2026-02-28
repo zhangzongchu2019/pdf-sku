@@ -37,12 +37,14 @@ def test_validate_duplicate_model():
 def test_enforce_validity_strict():
     v = ConsistencyValidator()
     skus = [
-        SKUResult(attributes={"product_name": "Widget"}),
-        SKUResult(attributes={"price": "10"}),  # no product_name
+        SKUResult(attributes={"product_name": "Widget", "price": "10"}),  # 2 core attrs → valid
+        SKUResult(attributes={"price": "10"}),  # only 1 core attr → invalid
+        SKUResult(attributes={"product_name": "Widget"}),  # only 1 core attr → invalid
     ]
     skus = v.enforce_sku_validity(skus)
     assert skus[0].validity == "valid"
     assert skus[1].validity == "invalid"
+    assert skus[2].validity == "invalid"
 
 
 def test_enforce_validity_relaxed():
