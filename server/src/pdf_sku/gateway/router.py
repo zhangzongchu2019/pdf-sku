@@ -9,6 +9,7 @@ Gateway API 路由。对齐: OpenAPI V2.0 §/jobs + §/uploads + §/dashboard
 - Dashboard: GET /dashboard/metrics
 """
 from __future__ import annotations
+import io
 import uuid
 import shutil
 from pathlib import Path
@@ -1023,6 +1024,40 @@ async def get_evaluation(job_id: uuid.UUID, db: DBSession):
         "model_used": evaluation.model_used,
         "evaluated_at": evaluation.evaluated_at.isoformat() if evaluation.evaluated_at else None,
     }
+
+
+# ───────────────────────── Excel 导出 ─────────────────────────
+
+@router.get(
+    "/jobs/{job_id}/export/excel",
+    summary="导出 Job SKU 识别结果为 Excel（ZIP 包）",
+    response_class=Response,
+)
+async def export_job_excel(
+    job_id: uuid.UUID,
+    db: DBSession,
+):
+    """将指定 Job 的所有 SKU 及绑定图片导出为两个 Excel 文件（ZIP 打包返回）。"""
+    import zipfile
+    from pdf_sku.pipeline.exporter.excel_exporter import ExcelExporter
+
+    exporter = ExcelExporter(settings.job_data_dir)
+    rows = await exporter.load_job_data(db, job_id)
+
+    full_bytes = exporter.build_full_excel(rows)
+    kw_bytes = exporter.build_keywords_excel(rows)
+
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"{job_id}_full.xlsx", full_bytes.getvalue())
+        zf.writestr(f"{job_id}_keywords.xlsx", kw_bytes.getvalue())
+    zip_buf.seek(0)
+
+    return Response(
+        content=zip_buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="export_{job_id}.zip"'},
+    )
 
 
 # ───────────────────────── SSE ─────────────────────────

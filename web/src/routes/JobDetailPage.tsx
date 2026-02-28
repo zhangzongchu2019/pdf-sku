@@ -105,6 +105,7 @@ export default function JobDetailPage() {
   const [tab, setTab] = useState<"pages" | "skus" | "heatmap" | "eval">("pages");
   const [showTimeline, setShowTimeline] = useState(false);
   const [activities, setActivities] = useState<ActivityEntry[]>([]);
+  const [exporting, setExporting] = useState(false);
   const actIdRef = useRef(0);
 
   // 裁剪模式状态
@@ -267,6 +268,33 @@ export default function JobDetailPage() {
           评估
         </button>
         <div style={{ flex: 1 }} />
+        <button
+          onClick={async () => {
+            if (exporting || !jobId) return;
+            setExporting(true);
+            try {
+              await jobsApi.exportExcel(jobId, `${job.source_file.replace(/\.pdf$/i, "")}_export.zip`);
+            } catch (e) {
+              console.error("导出失败:", e);
+              alert("导出失败，请稍后重试");
+            } finally {
+              setExporting(false);
+            }
+          }}
+          disabled={exporting}
+          style={{
+            padding: "4px 12px",
+            backgroundColor: exporting ? "#1E293B" : "transparent",
+            border: "1px solid #2D3548",
+            borderRadius: 4,
+            color: exporting ? "#475569" : "#94A3B8",
+            cursor: exporting ? "not-allowed" : "pointer",
+            fontSize: 12,
+            marginRight: 4,
+          }}
+        >
+          {exporting ? "⏳ 导出中..." : "📥 导出 Excel"}
+        </button>
         <button
           onClick={() => setShowTimeline(true)}
           style={{ padding: "4px 12px", backgroundColor: "transparent", border: "1px solid #2D3548", borderRadius: 4, color: "#94A3B8", cursor: "pointer", fontSize: 12 }}

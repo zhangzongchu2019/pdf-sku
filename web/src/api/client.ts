@@ -43,8 +43,34 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json();
 }
 
+async function requestBlob(path: string, init?: RequestInit): Promise<Blob> {
+  const url = `${API_BASE}${path}`;
+  const { headers: customHeaders, ...restInit } = init ?? {};
+  const res = await fetch(url, {
+    headers: {
+      ...getAuthHeaders(),
+      ...(customHeaders instanceof Headers
+        ? Object.fromEntries(customHeaders.entries())
+        : Array.isArray(customHeaders)
+          ? Object.fromEntries(customHeaders)
+          : customHeaders),
+    },
+    ...restInit,
+  });
+  if (!res.ok) {
+    if (res.status === 401) {
+      useAuthStore.getState().logout();
+      window.location.href = "/login";
+      throw new ApiError(401, "登录已过期，请重新登录");
+    }
+    throw new ApiError(res.status, `${res.status} ${res.statusText}`);
+  }
+  return res.blob();
+}
+
 export const api = {
   get: <T>(path: string) => request<T>(path),
+  getBlob: (path: string) => requestBlob(path),
   post: <T>(path: string, body?: unknown) =>
     request<T>(path, { method: "POST", body: body ? JSON.stringify(body) : undefined }),
   put: <T>(path: string, body?: unknown) =>

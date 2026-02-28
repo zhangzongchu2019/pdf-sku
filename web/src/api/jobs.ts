@@ -128,5 +128,17 @@ export const jobsApi = {
       { bbox, ...options },
     ),
 
+  exportExcel: async (jobId: string, filename?: string) => {
+    const blob = await api.getBlob(`/jobs/${jobId}/export/excel`);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename ?? `export_${jobId}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  },
+
   dashboard: () => api.get<DashboardMetrics>("/dashboard/metrics"),
 };
