@@ -191,14 +191,13 @@ class PageProcessor:
 
             # A 类: 表格每行独立 SKU，无需去重；使用 relaxed 有效性校验（可信结构化数据）
             # B/C 类: LLM 可能重复提取，需去重；使用 strict 校验
-            if page_type != "A":
-                skus = self._validator.deduplicate_skus(skus)
             validity_profile = {"sku_validity_mode": "relaxed"} if page_type == "A" else None
-            # enforce validity → filter invalid → deduplicate
             skus = self._validator.enforce_sku_validity(
                 skus, validity_profile, text_block_count=features.text_block_count)
             skus = [s for s in skus if s.validity == "valid"]
-            skus = self._validator.deduplicate_skus(skus)
+            if page_type != "A":
+                # A 类: 表格行天然不重复，跳过去重以保留同名不同规格/专利号的行
+                skus = self._validator.deduplicate_skus(skus)
 
             # ── retry: validity 全灭 或 SKU 数远少于图片数 ──
             eligible_count = sum(1 for img in raw.images if img.search_eligible)
