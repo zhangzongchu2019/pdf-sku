@@ -157,14 +157,17 @@ class CrossPageMerger:
             src = source_tables[-1]
             col_count = max(src.column_count, merged[0].column_count)
             header_row = CrossPageMerger._find_column_header(src.rows, col_count)
+            orig_flags = merged[0].row_image_flags
             if header_row:
                 # 只前置列标题行，当前页数据行保持原样，避免重复提取源页 SKU
+                # row_image_flags 也同步前置 True（代表新增的标题行自身有独立列）
                 merged[0] = TableData(
                     rows=[header_row] + merged[0].rows,
                     bbox=merged[0].bbox,
                     header_row=header_row,
                     column_count=col_count,
                     is_continuation=True,
+                    row_image_flags=[True] + orig_flags if orig_flags else [],
                 )
                 logger.info("cross_page_merge_header",
                             source_col_count=src.column_count,
@@ -172,12 +175,14 @@ class CrossPageMerger:
                             header_preview=str(header_row)[:80])
             else:
                 # 找不到明确标题行时，退化为全量前置（原有行为）
+                src_flags = [True] * len(src.rows)
                 merged[0] = TableData(
                     rows=src.rows + merged[0].rows,
                     bbox=merged[0].bbox,
                     header_row=src.header_row or merged[0].header_row,
                     column_count=col_count,
                     is_continuation=True,
+                    row_image_flags=(src_flags + orig_flags) if orig_flags else [],
                 )
         return merged
 
