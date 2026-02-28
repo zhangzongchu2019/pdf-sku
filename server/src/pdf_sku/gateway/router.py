@@ -1045,7 +1045,7 @@ async def export_job_excel(
     rows = await exporter.load_job_data(db, job_id)
 
     full_bytes = exporter.build_full_excel(rows)
-    kw_bytes = exporter.build_keywords_excel(rows)
+    kw_bytes = await exporter.build_keywords_excel(rows, llm_service=get_llm_service())
 
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:

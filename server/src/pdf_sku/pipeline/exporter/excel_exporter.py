@@ -2,11 +2,12 @@
 Excel 导出器 — 将 Job 的 SKU 识别结果导出为两个 Excel 文件。
 
 File 1 (full_export.xlsx):   商品子图 + 所有提取到的 SKU 属性（动态列）
-File 2 (keywords_export.xlsx): 商品子图 + 固定关键词字段映射
+File 2 (keywords_export.xlsx): 商品子图 + 固定关键词字段映射（LLM 语义匹配）
 """
 from __future__ import annotations
 
 import io
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import UUID
@@ -18,20 +19,20 @@ import structlog
 
 logger = structlog.get_logger()
 
-# ─────────────────────── 关键词映射 ───────────────────────
-
-KEYWORD_FIELDS: list[tuple[str, list[str]]] = [
-    ('商品名称/描述', ['product_name', 'name', 'description', '产品名称', '品名']),
-    ('售价',         ['unit_price', 'price', 'retail_price', '单价', '售价']),
-    ('商品规格',     ['size', 'spec', 'specification', '规格', '尺寸', '型号']),
-    ('颜色',         ['color', 'colour', '颜色', '色号']),
-    ('批发价',       ['wholesale_price', '批发价', '批发']),
-    ('打包价',       ['package_price', '打包价', '打包']),
-    ('代发价',       ['dropship_price', '代发价', '代发']),
-    ('活动价',       ['promotion_price', 'activity_price', '活动价', '促销价']),
-    ('库存',         ['stock', 'inventory', '库存', '数量']),
-    ('重量(kg)',     ['weight', '重量', 'weight_kg', '毛重']),
-    ('自动下架时间', ['auto_offline_time', '下架时间', 'offline_time']),
+# ─────────────────────── 关键词列定义 ───────────────────────
+# 每项: (列标题, 语义描述)
+KEYWORD_FIELDS: list[tuple[str, str]] = [
+    ('商品名称/描述', '商品的名称、品名、产品描述，例如"玻璃杯"、"女款连衣裙"'),
+    ('售价',         '商品零售单价或市场价，面向终端消费者的价格'),
+    ('商品规格',     '商品的规格、尺寸、型号，例如"30×40cm"、"L码"、"500ml"'),
+    ('颜色',         '商品颜色或色号，例如"红色"、"深蓝"'),
+    ('批发价',       '批量采购价格，通常低于零售价'),
+    ('打包价',       '打包装或组合销售价格'),
+    ('代发价',       '供货商代发货价格（dropship），直接发给终端买家'),
+    ('活动价',       '促销、活动或限时优惠价格'),
+    ('库存',         '商品库存数量'),
+    ('重量(kg)',     '商品重量，单位 kg 或 g'),
+    ('自动下架时间', '商品自动下架或到期时间'),
 ]
 
 # 固定列的候选键集合（用于从动态列中去除已覆盖的字段）
@@ -109,6 +110,119 @@ def _apply_header_style(ws, headers: list[str]) -> None:
         ws.column_dimensions[get_column_letter(col_idx)].width = 20
 
     ws.freeze_panes = "A2"
+
+
+# ─────────────────────── LLM 语义映射 ───────────────────────
+
+async def build_keyword_mapping_via_llm(
+    rows: list[ExportRow],
+    llm_service,
+) -> dict[str, list[str]]:
+    """
+    通过一次 LLM 调用，将 SKU 属性键语义映射到标准关键词列。
+
+    返回: {关键词列标题: [匹配的属性键, ...]}（按置信度从高到低）
+    如某列无匹配，则对应值为空列表。
+    """
+    # 1. 收集所有属性键及各自的示例值（最多 3 个不同值）
+    key_samples: dict[str, list[str]] = {}
+    for row in rows:
+        for k, v in row.attributes.items():
+            if v is None or v == "":
+                continue
+            samples = key_samples.setdefault(k, [])
+            sv = str(v).strip()
+            if sv and sv not in samples and len(samples) < 3:
+                samples.append(sv)
+
+    if not key_samples:
+        return {kf[0]: [] for kf in KEYWORD_FIELDS}
+
+    # 2. 构造 LLM prompt
+    attr_lines = "\n".join(
+        f'  "{k}": {json.dumps(v, ensure_ascii=False)}'
+        for k, v in key_samples.items()
+    )
+    keyword_lines = "\n".join(
+        f'  "{kf[0]}": {kf[1]}'
+        for kf in KEYWORD_FIELDS
+    )
+
+    prompt = f"""你是一个商品数据结构专家。请根据语义理解，将 SKU 属性字段映射到标准导出列。
+
+## SKU 属性字段（字段名: [示例值列表]）
+{{{attr_lines}
+}}
+
+## 标准导出列（列名: 语义说明）
+{{{keyword_lines}
+}}
+
+## 任务
+对于每个标准导出列，从属性字段中找出语义上最匹配的字段名（可能有多个，按匹配度从高到低排列）。
+如果没有任何字段与某个列语义相关，则返回空数组 []。
+
+## 返回格式（严格 JSON，不要有任何额外文字）
+{{
+  "商品名称/描述": ["最匹配的字段名", "次匹配的字段名"],
+  "售价": ["..."],
+  ...（覆盖所有 {len(KEYWORD_FIELDS)} 个标准列）
+}}"""
+
+    try:
+        resp = await llm_service.call_llm(
+            operation="keyword_mapping",
+            prompt=prompt,
+        )
+
+        # 3. 解析 LLM 返回的 JSON
+        raw = resp.content.strip()
+        # 兼容 LLM 可能输出 ```json ... ``` 包裹
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        mapping: dict = json.loads(raw.strip())
+
+        # 4. 验证并规范化：仅保留 KEYWORD_FIELDS 中存在的列，且值必须是列表
+        valid_keys = {kf[0] for kf in KEYWORD_FIELDS}
+        result: dict[str, list[str]] = {}
+        for col_name, _ in KEYWORD_FIELDS:
+            matched = mapping.get(col_name, [])
+            if not isinstance(matched, list):
+                matched = [str(matched)] if matched else []
+            # 只保留实际存在于数据中的属性键
+            matched = [k for k in matched if k in key_samples]
+            result[col_name] = matched
+
+        logger.info(
+            "keyword_mapping_llm_done",
+            attr_keys=len(key_samples),
+            mapped_cols=sum(1 for v in result.values() if v),
+        )
+        return result
+
+    except Exception as e:
+        logger.warning("keyword_mapping_llm_failed", error=str(e))
+        return {kf[0]: [] for kf in KEYWORD_FIELDS}
+
+
+def _apply_keyword_mapping(attrs: dict, keyword_mapping: dict[str, list[str]]) -> dict[str, str]:
+    """
+    给定单行 SKU 的 attributes 和 LLM 生成的 keyword_mapping，
+    提取每个关键词列对应的值。
+    """
+    result: dict[str, str] = {}
+    for col_name, _ in KEYWORD_FIELDS:
+        candidates = keyword_mapping.get(col_name, [])
+        value = ""
+        for key in candidates:
+            v = attrs.get(key)
+            if v is not None and str(v).strip():
+                value = str(v).strip()
+                break
+        result[col_name] = value
+    return result
 
 
 # ─────────────────────── 主类 ───────────────────────
@@ -256,12 +370,27 @@ class ExcelExporter:
         buf.seek(0)
         return buf
 
-    def build_keywords_excel(self, rows: list[ExportRow]) -> io.BytesIO:
+    async def build_keywords_excel(
+        self,
+        rows: list[ExportRow],
+        llm_service=None,
+    ) -> io.BytesIO:
         """
-        File 2: 图片 + 固定 11 个关键词字段（缺失留空）
+        File 2: 图片 + 固定 11 个关键词字段。
+
+        若提供 llm_service，则通过 LLM 语义理解将 SKU 属性映射到关键词列；
+        否则降级为基于候选键名的简单匹配（fallback）。
         """
         import openpyxl
         from openpyxl.styles import Alignment
+
+        # ── 决定映射策略 ──
+        keyword_mapping: dict[str, list[str]] | None = None
+        if llm_service is not None and rows:
+            keyword_mapping = await build_keyword_mapping_via_llm(rows, llm_service)
+            logger.info("keywords_excel_using_llm_mapping")
+        else:
+            logger.info("keywords_excel_using_fallback_mapping")
 
         wb = openpyxl.Workbook()
         ws = wb.active
@@ -270,10 +399,34 @@ class ExcelExporter:
         headers = ["图片"] + [kf[0] for kf in KEYWORD_FIELDS]
         _apply_header_style(ws, headers)
 
+        # 备用候选键（fallback，与旧逻辑一致）
+        _FALLBACK_CANDIDATES: dict[str, list[str]] = {
+            '商品名称/描述': ['product_name', 'name', 'description', '产品名称', '品名'],
+            '售价':         ['unit_price', 'price', 'retail_price', '单价', '售价'],
+            '商品规格':     ['size', 'spec', 'specification', '规格', '尺寸', '型号'],
+            '颜色':         ['color', 'colour', '颜色', '色号'],
+            '批发价':       ['wholesale_price', '批发价', '批发'],
+            '打包价':       ['package_price', '打包价', '打包'],
+            '代发价':       ['dropship_price', '代发价', '代发'],
+            '活动价':       ['promotion_price', 'activity_price', '活动价', '促销价'],
+            '库存':         ['stock', 'inventory', '库存', '数量'],
+            '重量(kg)':     ['weight', '重量', 'weight_kg', '毛重'],
+            '自动下架时间': ['auto_offline_time', '下架时间', 'offline_time'],
+        }
+
         for row_idx, row in enumerate(rows, 2):
             row_data: list = [None]  # A 列图片占位
-            for _, candidates in KEYWORD_FIELDS:
-                row_data.append(_get_field_value(row.attributes, candidates))
+
+            if keyword_mapping is not None:
+                # LLM 语义映射路径
+                col_values = _apply_keyword_mapping(row.attributes, keyword_mapping)
+                for col_name, _ in KEYWORD_FIELDS:
+                    row_data.append(col_values.get(col_name, ""))
+            else:
+                # Fallback：候选键名匹配
+                for col_name, _ in KEYWORD_FIELDS:
+                    candidates = _FALLBACK_CANDIDATES.get(col_name, [])
+                    row_data.append(_get_field_value(row.attributes, candidates))
 
             for col_idx, val in enumerate(row_data, 1):
                 if col_idx == 1:
