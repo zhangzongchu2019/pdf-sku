@@ -24,7 +24,7 @@ logger = structlog.get_logger()
 # ─────────────────────── 关键词列定义 ───────────────────────
 # 每项: (列标题, 语义描述)
 KEYWORD_FIELDS: list[tuple[str, str]] = [
-    ('商品名称/描述', '商品的名称、品名、产品描述，例如"玻璃杯"、"女款连衣裙"'),
+    ('商品名称/描述', '商品的产品描述、详情介绍文字；优先使用 description 字段，其次 product_name'),
     ('售价',         '商品零售单价或市场价，面向终端消费者的价格'),
     ('商品规格',     '商品的规格、尺寸、型号，例如"30×40cm"、"L码"、"500ml"'),
     ('颜色',         '商品颜色或色号，例如"红色"、"深蓝"'),
@@ -36,6 +36,9 @@ KEYWORD_FIELDS: list[tuple[str, str]] = [
     ('重量(kg)',     '商品重量，单位 kg 或 g'),
     ('自动下架时间', '商品自动下架或到期时间'),
 ]
+
+# 关键词导出中的特殊列（不经过 LLM 映射，直接取 ExportRow 字段或置空）
+_SPECIAL_KW_COLS: list[str] = ['来源（仅自己可见）', '规格图片']
 
 # 固定列的候选键集合（用于从动态列中去除已覆盖的字段）
 _FIXED_CANDIDATES: set[str] = {
@@ -57,6 +60,7 @@ class ExportRow:
     attributes: dict
     images: list[bytes] = field(default_factory=list)   # 多图：每张占一列
     image_ids: list[str] = field(default_factory=list)
+    source_text: str = ""   # PDF 原始 OCR 文字（按页）
 
 
 # ─────────────────────── 辅助函数 ───────────────────────
@@ -286,6 +290,20 @@ class ExcelExporter:
 
         # 5. 读取图片文件，构建导出行
         job_dir = self._job_data_dir / str(job_id)
+
+        # 5a. 从 source.pdf 提取每页原始 OCR 文字（用于"来源"列）
+        page_raw_text: dict[int, str] = {}
+        source_pdf = job_dir / "source.pdf"
+        if source_pdf.exists():
+            try:
+                import pdfplumber
+                with pdfplumber.open(str(source_pdf)) as pdf:
+                    for page_no, page in enumerate(pdf.pages, 1):
+                        text = page.extract_text() or ""
+                        page_raw_text[page_no] = text[:3000]
+            except Exception as e:
+                logger.warning("excel_pdf_raw_text_failed", error=str(e))
+
         rows: list[ExportRow] = []
 
         for sku in skus:
@@ -309,6 +327,7 @@ class ExcelExporter:
                 attributes=dict(sku.attributes or {}),
                 images=image_bytes_list,
                 image_ids=image_ids,
+                source_text=page_raw_text.get(sku.page_number, ""),
             ))
 
         logger.info("excel_export_rows_loaded", job_id=str(job_id), count=len(rows))
@@ -434,12 +453,12 @@ class ExcelExporter:
         ws = wb.active
         ws.title = "关键词导出"
 
-        headers = img_headers + [kf[0] for kf in KEYWORD_FIELDS]
+        headers = img_headers + [kf[0] for kf in KEYWORD_FIELDS] + _SPECIAL_KW_COLS
         _apply_header_style(ws, headers, n_img_cols=n_img_cols)
 
         # 备用候选键（fallback，与旧逻辑一致）
         _FALLBACK_CANDIDATES: dict[str, list[str]] = {
-            '商品名称/描述': ['product_name', 'name', 'description', '产品名称', '品名'],
+            '商品名称/描述': ['description', 'product_name', 'name', '产品名称', '品名'],
             '售价':         ['unit_price', 'price', 'retail_price', '单价', '售价'],
             '商品规格':     ['size', 'spec', 'specification', '规格', '尺寸', '型号'],
             '颜色':         ['color', 'colour', '颜色', '色号'],
@@ -463,6 +482,10 @@ class ExcelExporter:
                 for col_name, _ in KEYWORD_FIELDS:
                     candidates = _FALLBACK_CANDIDATES.get(col_name, [])
                     kw_data.append(_get_field_value(row.attributes, candidates))
+
+            # 特殊列：来源（仅自己可见）= PDF 原始文字；规格图片 = 留空
+            kw_data.append(row.source_text)
+            kw_data.append("")
 
             # 写关键词列（从第 n_img_cols+1 列开始）
             for col_offset, val in enumerate(kw_data):
