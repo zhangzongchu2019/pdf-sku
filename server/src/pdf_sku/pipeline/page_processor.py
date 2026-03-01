@@ -146,6 +146,21 @@ class PageProcessor:
                                 img_bottom=round(img.bbox[3], 1),
                                 page_height=round(page_h, 1))
 
+            # ═══ Phase 2a3: 过滤全页背景图 ═══
+            # 覆盖 >80% 页面面积的图片是页面背景/装饰，不应绑定给 SKU
+            page_w = raw.metadata.page_width
+            page_area = max(1.0, page_w * page_h)
+            for img in raw.images:
+                if not img.search_eligible or len(img.bbox) < 4:
+                    continue
+                img_area = abs(img.bbox[2] - img.bbox[0]) * abs(img.bbox[3] - img.bbox[1])
+                if img_area / page_area > 0.8:
+                    img.search_eligible = False
+                    img.role = "background"
+                    logger.info("image_fullpage_background_excluded",
+                                page=page_no, image_id=img.image_id,
+                                coverage=round(img_area / page_area, 2))
+
             # ═══ Phase 2b: 瓦片碎片聚类合并 ═══
             raw.images = self._merge_tile_fragments(raw.images, page_no)
 
@@ -844,7 +859,9 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
             return 0.0
         a1 = max(1, (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1]))
         a2 = max(1, (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1]))
-        return overlap / min(a1, a2)
+        # IoU: 避免「大图包含小图→小图被误删」；
+        # 真正重叠的副本 IoU 仍接近 1.0，被容器包含的子图 IoU ≈ 小图/大图 << 1
+        return overlap / (a1 + a2 - overlap)
 
     @staticmethod
     def _dedup_images(images: list[ImageInfo]) -> list[ImageInfo]:

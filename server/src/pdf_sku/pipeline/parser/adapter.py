@@ -57,10 +57,22 @@ class PDFExtractor:
             tables = self._plumber_tables(page)
             images = self._plumber_images(page, path, page_no)
             area = max(1.0, float(page.width) * float(page.height))
+            page_h_pts = float(page.height)  # 用于坐标有效性检测
 
         # pdfplumber 不提取图片字节，用 PyMuPDF 补充
+        # 部分 PDF 存在坐标系偏移：pdfplumber 报告的 top 值超出页高
+        # (如 top=1220 而页高=805)，此时改用 PyMuPDF 提取正确 bbox + 像素数据
         if images:
-            self._fill_image_data_pymupdf(path, page_no, images)
+            off_page = sum(
+                1 for img in images
+                if len(img.bbox) >= 4 and img.bbox[1] > page_h_pts
+            )
+            if off_page > len(images) // 2:
+                logger.debug("pdfplumber_imgs_coord_mismatch",
+                             page=page_no, off_page=off_page, total=len(images))
+                images = self._extract_images_via_pymupdf(path, page_no)
+            else:
+                self._fill_image_data_pymupdf(path, page_no, images)
 
         return ParsedPageIR(
             page_no=page_no,
@@ -225,6 +237,71 @@ class PDFExtractor:
             return fitz.Pixmap(pix, mask_pix)
         except Exception:
             return pix
+
+    @staticmethod
+    def _extract_images_via_pymupdf(path: str, page_no: int) -> list[ImageInfo]:
+        """当 pdfplumber 图片坐标失效时，完全用 PyMuPDF 提取 bbox + 像素数据。
+
+        适用场景：PDF 坐标系偏移，pdfplumber 报告的 top 值超出页高。
+        PyMuPDF 内部正确处理了 MediaBox/CTM 变换，返回屏幕空间坐标。
+        """
+        try:
+            import fitz
+            doc = fitz.open(path)
+            try:
+                page = doc[page_no - 1]
+                all_img_info = page.get_images(full=True)
+
+                smask_xrefs: set[int] = set()
+                for info in all_img_info:
+                    if len(info) > 1 and info[1] > 0:
+                        smask_xrefs.add(info[1])
+
+                images: list[ImageInfo] = []
+                img_idx = 0
+                for img_info in all_img_info:
+                    xref = img_info[0]
+                    if xref in smask_xrefs:
+                        continue
+                    smask_xref = img_info[1] if len(img_info) > 1 else 0
+                    try:
+                        pix = fitz.Pixmap(doc, xref)
+                        if pix.colorspace and pix.colorspace.n == 4:
+                            pix = fitz.Pixmap(fitz.csRGB, pix)
+                        if smask_xref > 0:
+                            pix = PDFExtractor._apply_smask(fitz, doc, pix, smask_xref)
+                        img_data = PDFExtractor._pixmap_to_png(fitz, pix)
+                        if not img_data:
+                            continue
+
+                        # 用 PyMuPDF 的屏幕空间 rect（已正确处理 CTM/MediaBox）
+                        img_bbox: tuple[float, float, float, float] = (0, 0, 0, 0)
+                        rects = page.get_image_rects(xref)
+                        if rects:
+                            r = rects[0]
+                            img_bbox = (r.x0, r.y0, r.x1, r.y1)
+
+                        short_edge = min(pix.width, pix.height)
+                        img_hash = hashlib.md5(img_data[:1024]).hexdigest()[:12]
+                        images.append(ImageInfo(
+                            image_id=f"p{page_no}_img{img_idx}",
+                            bbox=img_bbox,
+                            data=img_data,
+                            width=pix.width,
+                            height=pix.height,
+                            short_edge=short_edge,
+                            image_hash=img_hash,
+                            search_eligible=short_edge >= 150,
+                        ))
+                        img_idx += 1
+                    except Exception:
+                        pass
+                return images
+            finally:
+                doc.close()
+        except Exception as e:
+            logger.debug("extract_images_via_pymupdf_failed", page=page_no, error=str(e))
+            return []
 
     @staticmethod
     def _fill_image_data_pymupdf(path: str, page_no: int, images: list[ImageInfo]) -> None:

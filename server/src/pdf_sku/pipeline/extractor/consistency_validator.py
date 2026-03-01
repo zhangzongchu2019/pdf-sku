@@ -84,9 +84,6 @@ class ConsistencyValidator:
                 attrs.get("color", ""),
                 attrs.get("material", ""),
             )
-            # product_id 非空时加入 key，区分同组不同变体
-            if sku.product_id:
-                key = (sku.product_id,) + key
             if key == ("", "", "", "", ""):
                 # 无法判断重复，保留
                 seen[id(sku)] = sku
