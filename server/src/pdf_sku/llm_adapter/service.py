@@ -243,9 +243,30 @@ class LLMService:
         """Call a single provider with retries."""
         client = get_client(client_name)
 
-        # Dynamic per-provider config from Redis (with code defaults fallback)
-        provider_cfg = await get_provider_config(self._redis, client.provider)
-        max_retries = provider_cfg.max_retries
+        # Dynamic per-provider config:
+        # 优先从 pdf_sku:llm_providers（按 entry.name 精确匹配），
+        # 回退到 pdf_sku:llm_provider_config:{client.provider}（旧键格式）。
+        # 这修复了 update_provider_entry API 更改超时后不生效的 bug。
+        _cfg_timeout_s: int = 60
+        _cfg_vlm_timeout_s: int = 180
+        max_retries: int = 2
+        try:
+            entries = await get_provider_entries(self._redis)
+            entry = next((e for e in entries if e.name == client_name), None)
+            if entry:
+                _cfg_timeout_s = entry.timeout_seconds
+                _cfg_vlm_timeout_s = entry.vlm_timeout_seconds
+                max_retries = entry.max_retries
+            else:
+                provider_cfg = await get_provider_config(self._redis, client.provider)
+                _cfg_timeout_s = provider_cfg.timeout_seconds
+                _cfg_vlm_timeout_s = provider_cfg.vlm_timeout_seconds
+                max_retries = provider_cfg.max_retries
+        except Exception:
+            provider_cfg = await get_provider_config(self._redis, client.provider)
+            _cfg_timeout_s = provider_cfg.timeout_seconds
+            _cfg_vlm_timeout_s = provider_cfg.vlm_timeout_seconds
+            max_retries = provider_cfg.max_retries
 
         for attempt in range(max_retries + 1):
             # 1. 熔断检查
@@ -264,9 +285,9 @@ class LLMService:
                 if timeout is not None:
                     effective_timeout = timeout
                 elif images:
-                    effective_timeout = float(provider_cfg.vlm_timeout_seconds)
+                    effective_timeout = float(_cfg_vlm_timeout_s)
                 else:
-                    effective_timeout = float(provider_cfg.timeout_seconds)
+                    effective_timeout = float(_cfg_timeout_s)
 
                 resp = await client.complete(
                     prompt=prompt,
