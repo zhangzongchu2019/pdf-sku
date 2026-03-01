@@ -241,7 +241,7 @@ class ExcelExporter:
 
     async def load_job_data(self, db: AsyncSession, job_id: UUID) -> list[ExportRow]:
         """查询 SKU + 绑定图片（每 SKU 可多图），构建导出行列表。"""
-        from pdf_sku.common.models import SKU, SKUImageBinding, Image
+        from pdf_sku.common.models import SKU, SKUImageBinding, Image, PDFJob
 
         # 1. 所有非 superseded 的 SKU，按页码 + 插入顺序排序
         skus = (await db.execute(
@@ -291,18 +291,16 @@ class ExcelExporter:
         # 5. 读取图片文件，构建导出行
         job_dir = self._job_data_dir / str(job_id)
 
-        # 5a. 从 source.pdf 提取每页原始 OCR 文字（用于"来源"列）
-        page_raw_text: dict[int, str] = {}
-        source_pdf = job_dir / "source.pdf"
-        if source_pdf.exists():
-            try:
-                import pdfplumber
-                with pdfplumber.open(str(source_pdf)) as pdf:
-                    for page_no, page in enumerate(pdf.pages, 1):
-                        text = page.extract_text() or ""
-                        page_raw_text[page_no] = text[:3000]
-            except Exception as e:
-                logger.warning("excel_pdf_raw_text_failed", error=str(e))
+        # 5a. 查询 PDF 原始文件名（用于"来源"列）
+        source_filename = ""
+        try:
+            pdf_job = (await db.execute(
+                select(PDFJob).where(PDFJob.job_id == job_id)
+            )).scalar_one_or_none()
+            if pdf_job:
+                source_filename = pdf_job.source_file or ""
+        except Exception as e:
+            logger.warning("excel_source_filename_failed", error=str(e))
 
         rows: list[ExportRow] = []
 
@@ -327,7 +325,7 @@ class ExcelExporter:
                 attributes=dict(sku.attributes or {}),
                 images=image_bytes_list,
                 image_ids=image_ids,
-                source_text=page_raw_text.get(sku.page_number, ""),
+                source_text=source_filename,
             ))
 
         logger.info("excel_export_rows_loaded", job_id=str(job_id), count=len(rows))
@@ -472,18 +470,31 @@ class ExcelExporter:
         }
 
         for row_idx, row in enumerate(rows, 2):
+            attrs = row.attributes
+
+            # 商品名称 = 型号 + 规格（以空格拼接，任一字段为空则只取有值的部分）
+            model = _get_field_value(attrs, ['model_number', 'model', '型号'])
+            size  = _get_field_value(attrs, ['size', 'spec', 'specification', '规格', '尺寸'])
+            product_name_val = " ".join(p for p in [model, size] if p)
+
             # 关键词列值
             kw_data: list[str] = []
             if keyword_mapping is not None:
-                col_values = _apply_keyword_mapping(row.attributes, keyword_mapping)
+                col_values = _apply_keyword_mapping(attrs, keyword_mapping)
                 for col_name, _ in KEYWORD_FIELDS:
-                    kw_data.append(col_values.get(col_name, ""))
+                    if col_name == '商品名称/描述':
+                        kw_data.append(product_name_val)
+                    else:
+                        kw_data.append(col_values.get(col_name, ""))
             else:
                 for col_name, _ in KEYWORD_FIELDS:
-                    candidates = _FALLBACK_CANDIDATES.get(col_name, [])
-                    kw_data.append(_get_field_value(row.attributes, candidates))
+                    if col_name == '商品名称/描述':
+                        kw_data.append(product_name_val)
+                    else:
+                        candidates = _FALLBACK_CANDIDATES.get(col_name, [])
+                        kw_data.append(_get_field_value(attrs, candidates))
 
-            # 特殊列：来源（仅自己可见）= PDF 原始文字；规格图片 = 留空
+            # 特殊列：来源（仅自己可见）= PDF 文件名；规格图片 = 留空
             kw_data.append(row.source_text)
             kw_data.append("")
 
