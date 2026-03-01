@@ -3,6 +3,8 @@ Excel 导出器 — 将 Job 的 SKU 识别结果导出为两个 Excel 文件。
 
 File 1 (full_export.xlsx):   商品子图 + 所有提取到的 SKU 属性（动态列）
 File 2 (keywords_export.xlsx): 商品子图 + 固定关键词字段映射（LLM 语义匹配）
+
+多图支持: 同一 SKU 的多张商品子图各占一列 (商品图片1 / 商品图片2 / ...)。
 """
 from __future__ import annotations
 
@@ -53,8 +55,8 @@ class ExportRow:
     page_number: int
     sku_id: str
     attributes: dict
-    image_bytes: bytes = field(default_factory=bytes)
-    image_id: str = ""
+    images: list[bytes] = field(default_factory=list)   # 多图：每张占一列
+    image_ids: list[str] = field(default_factory=list)
 
 
 # ─────────────────────── 辅助函数 ───────────────────────
@@ -87,11 +89,11 @@ def _embed_image(ws, img_bytes: bytes, row: int, col: int = 1, max_px: int = 60)
         xl_img.anchor = f"{get_column_letter(col)}{row}"
         ws.add_image(xl_img)
     except Exception as e:
-        logger.warning("excel_embed_image_failed", row=row, error=str(e))
+        logger.warning("excel_embed_image_failed", row=row, col=col, error=str(e))
 
 
-def _apply_header_style(ws, headers: list[str]) -> None:
-    """统一设置首行表头样式：浅蓝底色 + 加粗 + 居中。"""
+def _apply_header_style(ws, headers: list[str], n_img_cols: int = 1) -> None:
+    """统一设置首行表头样式：浅蓝底色 + 加粗 + 居中。图片列宽 14，文字列宽 20。"""
     from openpyxl.styles import PatternFill, Font, Alignment
     from openpyxl.utils import get_column_letter
 
@@ -104,12 +106,15 @@ def _apply_header_style(ws, headers: list[str]) -> None:
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    # 图片列（A 列）宽度 14，文字列预设 20
-    ws.column_dimensions["A"].width = 14
-    for col_idx in range(2, len(headers) + 1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = 20
+    # 图片列宽 14，其余列宽 20
+    for col_idx in range(1, len(headers) + 1):
+        col_letter = get_column_letter(col_idx)
+        if col_idx <= n_img_cols:
+            ws.column_dimensions[col_letter].width = 14
+        else:
+            ws.column_dimensions[col_letter].width = 20
 
-    ws.freeze_panes = "A2"
+    ws.freeze_panes = f"{get_column_letter(n_img_cols + 1)}2"
 
 
 # ─────────────────────── LLM 语义映射 ───────────────────────
@@ -185,7 +190,6 @@ async def build_keyword_mapping_via_llm(
         mapping: dict = json.loads(raw.strip())
 
         # 4. 验证并规范化：仅保留 KEYWORD_FIELDS 中存在的列，且值必须是列表
-        valid_keys = {kf[0] for kf in KEYWORD_FIELDS}
         result: dict[str, list[str]] = {}
         for col_name, _ in KEYWORD_FIELDS:
             matched = mapping.get(col_name, [])
@@ -232,7 +236,7 @@ class ExcelExporter:
         self._job_data_dir = Path(job_data_dir)
 
     async def load_job_data(self, db: AsyncSession, job_id: UUID) -> list[ExportRow]:
-        """查询 SKU + 绑定图片，构建导出行列表。"""
+        """查询 SKU + 绑定图片（每 SKU 可多图），构建导出行列表。"""
         from pdf_sku.common.models import SKU, SKUImageBinding, Image
 
         # 1. 所有非 superseded 的 SKU，按页码 + 插入顺序排序
@@ -247,53 +251,64 @@ class ExcelExporter:
 
         sku_ids = [s.sku_id for s in skus]
 
-        # 2. 每个 SKU 的 rank=1 主图绑定
+        # 2. 每个 SKU 的所有有效图片绑定（不限 rank），按置信度降序
         bindings = (await db.execute(
             select(SKUImageBinding)
             .where(
                 SKUImageBinding.job_id == job_id,
                 SKUImageBinding.sku_id.in_(sku_ids),
-                SKUImageBinding.rank == 1,
                 SKUImageBinding.is_latest == True,
+                SKUImageBinding.image_id.isnot(None),
+            )
+            .order_by(
+                SKUImageBinding.sku_id,
+                SKUImageBinding.binding_confidence.desc(),
+                SKUImageBinding.image_id,
             )
         )).scalars().all()
 
-        sku_to_image_id: dict[str, str] = {b.sku_id: b.image_id for b in bindings}
-        image_ids = list(set(sku_to_image_id.values()))
+        # 3. 按 SKU 分组，保留有序去重的 image_id 列表
+        from collections import defaultdict
+        sku_image_ids: dict[str, list[str]] = defaultdict(list)
+        for b in bindings:
+            if b.image_id and b.image_id not in sku_image_ids[b.sku_id]:
+                sku_image_ids[b.sku_id].append(b.image_id)
 
-        # 3. 批量查询图片元数据
+        # 4. 批量查询图片元数据
+        all_image_ids = list({iid for ids in sku_image_ids.values() for iid in ids})
         images: dict[str, object] = {}
-        if image_ids:
+        if all_image_ids:
             img_rows = (await db.execute(
                 select(Image)
-                .where(Image.job_id == job_id, Image.image_id.in_(image_ids))
+                .where(Image.job_id == job_id, Image.image_id.in_(all_image_ids))
             )).scalars().all()
             images = {img.image_id: img for img in img_rows}
 
-        # 4. 读取图片文件，构建导出行
+        # 5. 读取图片文件，构建导出行
         job_dir = self._job_data_dir / str(job_id)
         rows: list[ExportRow] = []
 
         for sku in skus:
-            image_id = sku_to_image_id.get(sku.sku_id, "")
-            image_bytes = b""
-            if image_id and image_id in images:
-                img = images[image_id]
-                img_path = job_dir / img.extracted_path
-                try:
-                    image_bytes = img_path.read_bytes()
-                except Exception as e:
-                    logger.warning(
-                        "excel_export_image_read_failed",
-                        image_id=image_id, path=str(img_path), error=str(e),
-                    )
+            image_ids = sku_image_ids.get(sku.sku_id, [])
+            image_bytes_list: list[bytes] = []
+            for image_id in image_ids:
+                img = images.get(image_id)
+                if img:
+                    img_path = job_dir / img.extracted_path
+                    try:
+                        image_bytes_list.append(img_path.read_bytes())
+                    except Exception as e:
+                        logger.warning(
+                            "excel_export_image_read_failed",
+                            image_id=image_id, path=str(img_path), error=str(e),
+                        )
 
             rows.append(ExportRow(
                 page_number=sku.page_number,
                 sku_id=sku.sku_id,
                 attributes=dict(sku.attributes or {}),
-                image_bytes=image_bytes,
-                image_id=image_id,
+                images=image_bytes_list,
+                image_ids=image_ids,
             ))
 
         logger.info("excel_export_rows_loaded", job_id=str(job_id), count=len(rows))
@@ -301,7 +316,8 @@ class ExcelExporter:
 
     def build_full_excel(self, rows: list[ExportRow]) -> io.BytesIO:
         """
-        File 1: 图片 | 固定属性列 | 动态属性列（按出现频率排序）
+        File 1: 商品图片1 | 商品图片2 | ... | 页码 | SKU ID | 固定属性列 | 动态属性列
+        多图支持: 每张子图占一列，最大列数 = max(len(row.images))。
         """
         import openpyxl
         from openpyxl.styles import Alignment
@@ -310,14 +326,24 @@ class ExcelExporter:
         ws = wb.active
         ws.title = "全量导出"
 
-        # 收集所有行中出现过的属性键，按频率降序
+        # 确定最多图片数
+        n_img_cols = max((len(row.images) for row in rows), default=1)
+        n_img_cols = max(n_img_cols, 1)
+
+        # 图片列表头
+        if n_img_cols == 1:
+            img_headers = ["商品图片"]
+        else:
+            img_headers = [f"商品图片{i + 1}" for i in range(n_img_cols)]
+
+        # 收集所有属性键，按频率降序
         key_freq: dict[str, int] = {}
         for row in rows:
             for k in row.attributes:
                 key_freq[k] = key_freq.get(k, 0) + 1
         all_keys_by_freq = sorted(key_freq, key=lambda k: -key_freq[k])
 
-        # 固定列定义（列标题 → 候选键列表）
+        # 固定列定义
         fixed_cols: list[tuple[str, list[str]]] = [
             ("产品名称", ["product_name", "name", "产品名称"]),
             ("规格",     ["spec", "specification", "size", "规格", "尺寸"]),
@@ -331,39 +357,44 @@ class ExcelExporter:
         extra_keys = [k for k in all_keys_by_freq if k not in _FIXED_CANDIDATES]
 
         headers = (
-            ["图片", "页码", "SKU ID"]
+            img_headers
+            + ["页码", "SKU ID"]
             + [col[0] for col in fixed_cols]
             + extra_keys
         )
-        _apply_header_style(ws, headers)
+        _apply_header_style(ws, headers, n_img_cols=n_img_cols)
 
         # 数据行
         for row_idx, row in enumerate(rows, 2):
             attrs = row.attributes
 
-            row_data: list = [
-                None,                   # A 列：图片占位
-                row.page_number,        # B
-                row.sku_id,             # C
+            # 文字列（图片列之后）
+            text_data: list = [
+                row.page_number,
+                row.sku_id,
             ]
             for _, candidates in fixed_cols:
-                row_data.append(_get_field_value(attrs, candidates))
+                text_data.append(_get_field_value(attrs, candidates))
             for k in extra_keys:
                 v = attrs.get(k)
-                row_data.append(str(v) if v is not None else "")
+                text_data.append(str(v) if v is not None else "")
 
-            for col_idx, val in enumerate(row_data, 1):
-                if col_idx == 1:
-                    continue  # 图片列由 _embed_image 处理
-                ws.cell(row=row_idx, column=col_idx, value=val).alignment = Alignment(
-                    vertical="center", wrap_text=True
-                )
+            # 写文字列（从第 n_img_cols+1 列开始）
+            for col_offset, val in enumerate(text_data):
+                ws.cell(
+                    row=row_idx,
+                    column=n_img_cols + 1 + col_offset,
+                    value=val,
+                ).alignment = Alignment(vertical="center", wrap_text=True)
 
-            if row.image_bytes:
-                _embed_image(ws, row.image_bytes, row_idx, col=1, max_px=60)
-                ws.row_dimensions[row_idx].height = 60
-            else:
-                ws.row_dimensions[row_idx].height = 15
+            # 嵌入图片（每张占一列）
+            has_image = False
+            for img_idx, img_bytes in enumerate(row.images[:n_img_cols]):
+                if img_bytes:
+                    _embed_image(ws, img_bytes, row_idx, col=img_idx + 1, max_px=60)
+                    has_image = True
+
+            ws.row_dimensions[row_idx].height = 60 if has_image else 15
 
         buf = io.BytesIO()
         wb.save(buf)
@@ -376,10 +407,8 @@ class ExcelExporter:
         llm_service=None,
     ) -> io.BytesIO:
         """
-        File 2: 图片 + 固定 11 个关键词字段。
-
-        若提供 llm_service，则通过 LLM 语义理解将 SKU 属性映射到关键词列；
-        否则降级为基于候选键名的简单匹配（fallback）。
+        File 2: 商品图片1 | 商品图片2 | ... | 固定 11 个关键词字段。
+        多图支持: 每张子图占一列，最大列数 = max(len(row.images))。
         """
         import openpyxl
         from openpyxl.styles import Alignment
@@ -392,12 +421,21 @@ class ExcelExporter:
         else:
             logger.info("keywords_excel_using_fallback_mapping")
 
+        # 确定最多图片数
+        n_img_cols = max((len(row.images) for row in rows), default=1)
+        n_img_cols = max(n_img_cols, 1)
+
+        if n_img_cols == 1:
+            img_headers = ["商品图片"]
+        else:
+            img_headers = [f"商品图片{i + 1}" for i in range(n_img_cols)]
+
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "关键词导出"
 
-        headers = ["图片"] + [kf[0] for kf in KEYWORD_FIELDS]
-        _apply_header_style(ws, headers)
+        headers = img_headers + [kf[0] for kf in KEYWORD_FIELDS]
+        _apply_header_style(ws, headers, n_img_cols=n_img_cols)
 
         # 备用候选键（fallback，与旧逻辑一致）
         _FALLBACK_CANDIDATES: dict[str, list[str]] = {
@@ -415,31 +453,33 @@ class ExcelExporter:
         }
 
         for row_idx, row in enumerate(rows, 2):
-            row_data: list = [None]  # A 列图片占位
-
+            # 关键词列值
+            kw_data: list[str] = []
             if keyword_mapping is not None:
-                # LLM 语义映射路径
                 col_values = _apply_keyword_mapping(row.attributes, keyword_mapping)
                 for col_name, _ in KEYWORD_FIELDS:
-                    row_data.append(col_values.get(col_name, ""))
+                    kw_data.append(col_values.get(col_name, ""))
             else:
-                # Fallback：候选键名匹配
                 for col_name, _ in KEYWORD_FIELDS:
                     candidates = _FALLBACK_CANDIDATES.get(col_name, [])
-                    row_data.append(_get_field_value(row.attributes, candidates))
+                    kw_data.append(_get_field_value(row.attributes, candidates))
 
-            for col_idx, val in enumerate(row_data, 1):
-                if col_idx == 1:
-                    continue
-                ws.cell(row=row_idx, column=col_idx, value=val).alignment = Alignment(
-                    vertical="center", wrap_text=True
-                )
+            # 写关键词列（从第 n_img_cols+1 列开始）
+            for col_offset, val in enumerate(kw_data):
+                ws.cell(
+                    row=row_idx,
+                    column=n_img_cols + 1 + col_offset,
+                    value=val,
+                ).alignment = Alignment(vertical="center", wrap_text=True)
 
-            if row.image_bytes:
-                _embed_image(ws, row.image_bytes, row_idx, col=1, max_px=60)
-                ws.row_dimensions[row_idx].height = 60
-            else:
-                ws.row_dimensions[row_idx].height = 15
+            # 嵌入图片
+            has_image = False
+            for img_idx, img_bytes in enumerate(row.images[:n_img_cols]):
+                if img_bytes:
+                    _embed_image(ws, img_bytes, row_idx, col=img_idx + 1, max_px=60)
+                    has_image = True
+
+            ws.row_dimensions[row_idx].height = 60 if has_image else 15
 
         buf = io.BytesIO()
         wb.save(buf)

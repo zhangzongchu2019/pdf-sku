@@ -296,6 +296,10 @@ class PageProcessor:
                     kept = [b for b in bindings if b.sku_id not in vlm_sku_ids]
                     bindings = vlm_bindings + kept
 
+            # VLM 后修正: 同列独立产品图按位置顺序匹配人位变体
+            bindings = self._correct_column_isolated_bindings(
+                bindings, skus, eligible_images)
+
             # 虚拟图片裁剪: 从截图生成实际图片数据
             if screenshot:
                 self._crop_composites(raw.images, screenshot)
@@ -865,6 +869,90 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
             c_page *= 0.8
 
         return round(max(0.0, min(1.0, c_page)), 3)
+
+    @staticmethod
+    def _correct_column_isolated_bindings(
+        bindings: list,
+        skus: list,
+        images: list,
+    ) -> list:
+        """
+        VLM 后修正：同列独立产品图（面积 < 60% 最大图）按纵向位置顺序
+        映射到有「人位」标签的 SKU（座位数从小到大）。
+
+        触发条件:
+        1. SKU 中有 ≥ 2 个带「X人位」标签的变体
+        2. 独立产品图 ≥ 2 张，且它们的 x_center 相互间距 < 250px（同列）
+        3. 独立图数量 ≤ 人位变体数量
+        4. 独立图所在列的 x_center 与最大图 x_center 距离 > 200px（不同区域）
+        """
+        import re as _re
+        from pdf_sku.pipeline.ir import BindingResult
+
+        if not bindings or not skus or not images:
+            return bindings
+
+        # 1. 收集有人位标签的 SKU，解析座位数
+        ren_wei: list[tuple[int, object]] = []
+        for sku in skus:
+            label = getattr(sku, "variant_label", "") or ""
+            m = _re.match(r"(\d+)人位", label.strip())
+            if m:
+                ren_wei.append((int(m.group(1)), sku))
+        if len(ren_wei) < 2:
+            return bindings
+
+        ren_wei.sort(key=lambda x: x[0])
+
+        # 2. 找最大图（面积最大）
+        def _area(img):
+            if len(img.bbox) < 4:
+                return 0
+            return (img.bbox[2] - img.bbox[0]) * (img.bbox[3] - img.bbox[1])
+
+        max_area = max((_area(img) for img in images), default=0)
+        if max_area <= 0:
+            return bindings
+
+        largest = max(images, key=_area)
+        largest_xc = (largest.bbox[0] + largest.bbox[2]) / 2 if len(largest.bbox) >= 4 else 0
+
+        # 3. 找独立产品图（面积 < 60% 最大图，且在不同列）
+        isolated = [
+            img for img in images
+            if _area(img) < max_area * 0.60 and len(img.bbox) >= 4
+            and abs((img.bbox[0] + img.bbox[2]) / 2 - largest_xc) > 200
+        ]
+        if len(isolated) < 2 or len(isolated) > len(ren_wei):
+            return bindings
+
+        # 4. 独立图必须在同一列（x_center 相互间距 < 250px）
+        xcs = [(img.bbox[0] + img.bbox[2]) / 2 for img in isolated]
+        if max(xcs) - min(xcs) >= 250:
+            return bindings
+
+        # 5. 按 Y 坐标（上→下）排序独立图
+        isolated.sort(key=lambda img: (img.bbox[1] + img.bbox[3]) / 2)
+        isolated_ids = {img.image_id for img in isolated}
+
+        # 6. 从现有绑定中移除所有独立图的绑定，重新按位置分配
+        new_bindings = [b for b in bindings if b.image_id not in isolated_ids]
+        for i, img in enumerate(isolated):
+            _, sku = ren_wei[i]
+            new_bindings.append(BindingResult(
+                sku_id=sku.sku_id,
+                image_id=img.image_id,
+                confidence=0.78,
+                method="column_positional",
+                is_ambiguous=False,
+            ))
+
+        logger.info(
+            "isolated_column_corrected",
+            isolated_count=len(isolated),
+            ren_wei_count=len(ren_wei),
+        )
+        return new_bindings
 
     @staticmethod
     def _bbox_overlap_ratio(bbox1: tuple, bbox2: tuple) -> float:
