@@ -32,9 +32,13 @@ IMPORTANT rules for variant splitting:
 - ONLY split into multiple SKUs when the text explicitly lists multiple sizes/dimensions (e.g. "规格-1500/1800/2000mm" → 3 SKUs).
 - Material and color lines (e.g. "材质-进口橡木 颜色-板栗色/宝马灰") describe the ENTIRE product series, NOT individual variants. Put them in "common_attrs".
 - Do NOT create separate SKUs for different colors or materials.
+- IMPORTANT: When the page lists N size variants (e.g. "1人位/2人位/3人位" with different dimensions), you MUST create exactly N SKUs — do NOT skip any variant.
 
 Extract these attributes where visible: product_name, model_number, price, material, color, size, weight, description.
 Put series-shared attributes (material, color) in "common_attrs". Put variant-specific attributes (size) in each SKU entry.
+
+Raw OCR text from the page (authoritative — use this to ensure ALL size variants are captured):
+{raw_text}
 
 Boundaries: {boundaries}
 
@@ -142,8 +146,19 @@ class TwoStageExtractor:
             for b in boundaries
         ]
 
+        # 从 pdfplumber 提取的原始文本块（比 LLM 生成的 text_content 更完整准确）
+        raw_text_lines = []
+        for tb in (raw.text_blocks or []):
+            t = getattr(tb, "text", "") or ""
+            if t.strip():
+                raw_text_lines.append(t.strip())
+        raw_text = "\n".join(raw_text_lines)[:2000] if raw_text_lines else "(none)"
+
         try:
-            prompt = ATTR_PROMPT.format(boundaries=str(boundary_desc))
+            prompt = ATTR_PROMPT.format(
+                boundaries=str(boundary_desc),
+                raw_text=raw_text,
+            )
             resp = await self._llm.call_llm(
                 operation="extract_sku_attrs",
                 prompt=prompt,

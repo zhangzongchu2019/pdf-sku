@@ -278,7 +278,14 @@ class PageProcessor:
             avg_bind_conf = (sum(b.confidence for b in bindings) / len(bindings)) if bindings else 0
             low_quality_bind = avg_bind_conf < 0.5 and len(skus) >= 2
             few_text = len(raw.text_blocks) <= 3
-            if ((few_text or low_quality_bind)
+            # 多图页但所有 SKU 都绑到同一张图 → 空间绑定失效（SKU 共享同一 text-block bbox）
+            all_same_single_image = (
+                len(eligible_images) > 1
+                and len(skus) > 1
+                and bool(bindings)
+                and len({b.image_id for b in bindings if b.image_id}) == 1
+            )
+            if ((few_text or low_quality_bind or all_same_single_image)
                     and len(eligible_images) >= 1
                     and len(skus) >= 2 and screenshot and self._llm):
                 vlm_bindings = await self._vlm_rebind_composites(
@@ -664,6 +671,15 @@ class PageProcessor:
             except Exception:
                 font = ImageFont.load_default()
 
+            # 按阅读顺序（上→下、左→右）排序，使 IMG 编号与视觉位置一致
+            composites = sorted(
+                composites,
+                key=lambda img: (
+                    round((img.bbox[1] + img.bbox[3]) / 2 / 200) * 200,  # 分200px行
+                    (img.bbox[0] + img.bbox[2]) / 2,                      # 同行内左→右
+                ) if len(img.bbox) >= 4 else (0, 0),
+            )
+
             for idx, comp in enumerate(composites):
                 x0, y0, x1, y1 = [int(c) for c in comp.bbox[:4]]
                 draw.rectangle([x0, y0, x1, y1], outline="red", width=4)
@@ -675,17 +691,22 @@ class PageProcessor:
             pil_img.save(buf, format="PNG")
             annotated = buf.getvalue()
 
-            # 构建 SKU 描述
+            # 构建 SKU 描述（含 variant_label 帮助 VLM 区分座位数等变体）
             sku_lines = []
             for i, sku in enumerate(skus):
                 name = sku.attributes.get("product_name", "?")
                 model = sku.attributes.get("model_number", "")
                 size = sku.attributes.get("size", "")
-                sku_lines.append(f"SKU-{i}: {model} {name} {size}".strip())
+                label = sku.variant_label or ""
+                parts = [p for p in [model, name, label, size] if p]
+                sku_lines.append(f"SKU-{i}: {' '.join(parts)}")
 
             prompt = f"""This product catalog page has {len(composites)} product images highlighted with red rectangles labeled IMG-0 to IMG-{len(composites) - 1}.
 
-Match each SKU to the image that shows that product. Multiple SKUs can share the same image (e.g., size variants of the same product).
+Match each SKU to every image that represents it. Rules:
+1. If an image is a "set/scene" photo showing the full product family (room setting with multiple pieces), link it to ALL SKU variants.
+2. If an image is an isolated product shot of a specific size (white background, single piece), link it only to the matching SKU.
+3. Return one [sku_index, image_index] pair for EACH valid association — a SKU may appear in multiple pairs.
 
 SKUs:
 {chr(10).join(sku_lines)}
