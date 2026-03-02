@@ -28,16 +28,24 @@ Respond with ONLY a JSON array:
 ATTR_PROMPT = """Extract products and their SKU variants for each boundary region.
 Each boundary may contain one or more products. Each product may have multiple SKU variants.
 
-IMPORTANT rules for variant splitting:
-- ONLY split into multiple SKUs when the text explicitly lists multiple sizes/dimensions (e.g. "规格-1500/1800/2000mm" → 3 SKUs).
-- Material and color lines (e.g. "材质-进口橡木 颜色-板栗色/宝马灰") describe the ENTIRE product series, NOT individual variants. Put them in "common_attrs".
+CRITICAL rule — how to count products:
+- If raw OCR text is available (not "(none)"), count every distinct "型号：" / "型号:" entry.
+  Each distinct 型号 entry = one separate product/SKU — even when two entries share the same
+  model prefix (e.g. "A105*铁艺茶几" and "A105*功夫茶几" are TWO different products).
+  NEVER merge different 型号 entries into a single SKU.
+- If raw OCR text is "(none)" or empty, extract all visible products from the image/screenshot.
+- Only expand a SINGLE 型号 into multiple variant SKUs when that same 型号 has multiple
+  different sizes/dimensions listed (e.g. "型号：WS-100 规格：1500/1800/2000mm" → 3 SKUs).
+
+Additional rules:
+- Material and color lines describe the ENTIRE product series, NOT individual variants → put in "common_attrs".
 - Do NOT create separate SKUs for different colors or materials.
-- IMPORTANT: When the page lists N size variants (e.g. "1人位/2人位/3人位" with different dimensions), you MUST create exactly N SKUs — do NOT skip any variant.
+- When a single product has N size variants (e.g. "1人位/2人位/3人位"), create exactly N SKUs.
 
 Extract these attributes where visible: product_name, model_number, price, material, color, size, weight, description.
 Put series-shared attributes (material, color) in "common_attrs". Put variant-specific attributes (size) in each SKU entry.
 
-Raw OCR text from the page (authoritative — use this to ensure ALL size variants are captured):
+Raw OCR text from the page:
 {raw_text}
 
 Boundaries: {boundaries}
