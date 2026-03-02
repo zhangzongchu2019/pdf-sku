@@ -186,7 +186,83 @@ class SKUImageBinder:
                              sku_id=sku.sku_id, top_k=len(candidates[:TOP_K]))
         # 同一 product_id 的 SKU 统一绑定到组内最高置信度图片
         self._unify_product_bindings(skus, results)
+        # 去重修正: SKU 数 == 图片数时强制 1:1 唯一分配
+        results = self._resolve_duplicate_bindings(results, skus, deliverable)
         return results
+
+    def _resolve_duplicate_bindings(
+        self,
+        results: list[BindingResult],
+        skus: list[SKUResult],
+        deliverable: list[ImageInfo],
+    ) -> list[BindingResult]:
+        """去重修正: 当 SKU 数 == 可交付图片数（期望 1:1）时，
+        若多个 SKU 被分配到同一图片且存在未绑定图片，则将重复绑定的 SKU
+        重新分配到最近的空闲图片。
+
+        触发条件: len(skus) == len(deliverable) 且存在重复绑定 + 空闲图片。
+        不触发条件: SKU < 图片（每 SKU 多图合理）或 SKU > 图片（已无空闲图）。
+        """
+        if len(skus) != len(deliverable):
+            return results  # 非 1:1 场景，不做修正
+
+        from collections import defaultdict
+
+        # 找重复绑定的图片 (image_id → 绑定列表)
+        img_to_results: dict[str, list] = defaultdict(list)
+        for r in results:
+            if r.image_id:
+                img_to_results[r.image_id].append(r)
+
+        overassigned = {img_id: rs for img_id, rs in img_to_results.items() if len(rs) > 1}
+        if not overassigned:
+            return results
+
+        # 找空闲图片 (未被任何 SKU 绑定的)
+        bound_ids = set(img_to_results.keys())
+        free_images = [img for img in deliverable if img.image_id not in bound_ids]
+        if not free_images:
+            return results
+
+        sku_map = {sku.sku_id: sku for sku in skus}
+        new_results = list(results)
+
+        for img_id, dupe_list in overassigned.items():
+            if not free_images:
+                break
+            # 按置信度排序，保留最高的，重新分配其余的
+            dupe_list.sort(key=lambda r: r.confidence, reverse=True)
+            for br in dupe_list[1:]:
+                if not free_images:
+                    break
+                sku = sku_map.get(br.sku_id)
+                if not sku:
+                    continue
+                # 找最近的空闲图片
+                nearest = min(
+                    free_images,
+                    key=lambda img: self._bbox_distance(sku.source_bbox, img.bbox),
+                )
+                # 更新结果列表中对应的 BindingResult
+                for i, r in enumerate(new_results):
+                    if r is br:
+                        new_results[i] = BindingResult(
+                            sku_id=br.sku_id,
+                            image_id=nearest.image_id,
+                            confidence=round(br.confidence * 0.85, 3),
+                            method="dedup_reassign",
+                            is_ambiguous=True,
+                        )
+                        break
+                free_images.remove(nearest)
+                logger.info(
+                    "binding_dedup_reassigned",
+                    sku_id=br.sku_id,
+                    from_img=img_id,
+                    to_img=nearest.image_id,
+                )
+
+        return new_results
 
     @staticmethod
     def _find_contained_images(
