@@ -2,10 +2,10 @@
 Excel 导出器 — 将 Job 的 SKU 识别结果导出为两个 Excel 文件。
 
 File 1 (full_export.xlsx):   商品子图 + 所有提取到的 SKU 属性（动态列）
-File 2 (keywords_export.xlsx): 固定 22 列关键词模板（平台导入格式）
+File 2 (keywords_export.xlsx): 固定关键词模板（平台导入格式）
 
-多图支持 (keywords_export): 同一 SKU 的多张商品子图各展开为独立行，
-  列名固定为"商品图片"（不编号）。
+多图支持 (keywords_export): 同一 SKU 的多张商品子图各占一列，
+  列名均为"商品图片"（不编号，可重复）。
 """
 from __future__ import annotations
 
@@ -467,13 +467,17 @@ class ExcelExporter:
         else:
             logger.info("keywords_excel_using_fallback_mapping")
 
+        # 确定最多图片数（决定"商品图片"重复列数）
+        n_img_cols = max((len(row.images) for row in rows), default=1)
+        n_img_cols = max(n_img_cols, 1)
+
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "关键词导出"
 
-        # 固定: 首列"商品图片" + 21 个关键词列
-        headers = ["商品图片"] + [kf[0] for kf in KEYWORD_FIELDS]
-        _apply_header_style(ws, headers, n_img_cols=1)
+        # N 张图片 → N 个同名"商品图片"列 + 21 个关键词列
+        headers = ["商品图片"] * n_img_cols + [kf[0] for kf in KEYWORD_FIELDS]
+        _apply_header_style(ws, headers, n_img_cols=n_img_cols)
 
         # 备用候选键（fallback）
         _FALLBACK_CANDIDATES: dict[str, list[str]] = {
@@ -489,8 +493,7 @@ class ExcelExporter:
             '自动下架时间':  ['auto_offline_time', '下架时间', 'offline_time'],
         }
 
-        row_idx = 2
-        for row in rows:
+        for row_idx, row in enumerate(rows, 2):
             attrs = row.attributes
 
             # 商品名称/描述 = 型号 + 规格
@@ -522,25 +525,22 @@ class ExcelExporter:
                     candidates = _FALLBACK_CANDIDATES.get(col_name, [])
                     kw_data.append(_get_field_value(attrs, candidates))
 
-            # 多图展开: 每张图片写一行（无图则写一行空图片行）
-            imgs_to_write = row.images if row.images else [None]
-            for img_bytes in imgs_to_write:
-                # 写关键词列（第 2 列起）
-                for col_offset, val in enumerate(kw_data):
-                    ws.cell(
-                        row=row_idx,
-                        column=2 + col_offset,
-                        value=val,
-                    ).alignment = Alignment(vertical="center", wrap_text=True)
+            # 写关键词列（从第 n_img_cols+1 列开始）
+            for col_offset, val in enumerate(kw_data):
+                ws.cell(
+                    row=row_idx,
+                    column=n_img_cols + 1 + col_offset,
+                    value=val,
+                ).alignment = Alignment(vertical="center", wrap_text=True)
 
-                # 嵌入图片（第 1 列）
+            # 嵌入图片（每张各占一列，列名均为"商品图片"）
+            has_image = False
+            for img_idx, img_bytes in enumerate(row.images[:n_img_cols]):
                 if img_bytes:
-                    _embed_image(ws, img_bytes, row_idx, col=1, max_px=60)
-                    ws.row_dimensions[row_idx].height = 60
-                else:
-                    ws.row_dimensions[row_idx].height = 15
+                    _embed_image(ws, img_bytes, row_idx, col=img_idx + 1, max_px=60)
+                    has_image = True
 
-                row_idx += 1
+            ws.row_dimensions[row_idx].height = 60 if has_image else 15
 
         buf = io.BytesIO()
         wb.save(buf)
