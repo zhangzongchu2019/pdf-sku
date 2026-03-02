@@ -496,10 +496,16 @@ class ExcelExporter:
         for row_idx, row in enumerate(rows, 2):
             attrs = row.attributes
 
-            # 商品名称/描述 = 型号 + 规格
+            # 商品名称/描述 = 型号 + 品名（若与型号不重复）+ 规格
             model = _get_field_value(attrs, ['model_number', 'model', '型号'])
+            pname = _get_field_value(attrs, ['product_name', '产品名称', '品名', 'name'])
             size  = _get_field_value(attrs, ['size', 'spec', 'specification', '规格', '尺寸'])
-            product_name_val = " ".join(p for p in [model, size] if p)
+            # pname 与 model 相同时跳过，避免重复（如 product_name="WS X-685" == model_number）
+            name_parts = [model]
+            if pname and pname != model:
+                name_parts.append(pname)
+            name_parts.append(size)
+            product_name_val = " ".join(p for p in name_parts if p)
 
             # 构建每个关键词列的值（固定顺序，对应 KEYWORD_FIELDS）
             kw_data: list[str] = []
