@@ -326,7 +326,7 @@ class LLMService:
                     await asyncio.sleep(backoff)
                     continue
                 raise RetryableError(
-                    f"LLM call to {client_name} failed after {max_retries + 1} attempts: {e}")
+                    f"LLM call to {client_name} failed after {max_retries + 1} attempts: {repr(e)}")
 
         raise RetryableError(f"LLM call to {client_name} exhausted all retries")
 

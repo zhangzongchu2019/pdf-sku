@@ -265,8 +265,13 @@ class ExcelExporter:
         self._job_data_dir = Path(job_data_dir)
 
     async def load_job_data(self, db: AsyncSession, job_id: UUID) -> list[ExportRow]:
-        """查询 SKU + 绑定图片（每 SKU 可多图），构建导出行列表。"""
+        """
+        查询 SKU + 绑定图片（每 SKU 可多图），构建导出行列表。
+        对于没有 SKU 绑定的商品子图（search_eligible=True），
+        额外追加图片专属行（sku_id="" / attributes={}），确保图片不漏出。
+        """
         from pdf_sku.common.models import SKU, SKUImageBinding, Image, PDFJob
+        from collections import defaultdict
 
         # 1. 所有非 superseded 的 SKU，按页码 + 插入顺序排序
         skus = (await db.execute(
@@ -275,48 +280,43 @@ class ExcelExporter:
             .order_by(SKU.page_number, SKU.id)
         )).scalars().all()
 
-        if not skus:
-            return []
-
         sku_ids = [s.sku_id for s in skus]
 
         # 2. 每个 SKU 的所有有效图片绑定（不限 rank），按置信度降序
-        bindings = (await db.execute(
-            select(SKUImageBinding)
-            .where(
-                SKUImageBinding.job_id == job_id,
-                SKUImageBinding.sku_id.in_(sku_ids),
-                SKUImageBinding.is_latest == True,
-                SKUImageBinding.image_id.isnot(None),
-            )
-            .order_by(
-                SKUImageBinding.sku_id,
-                SKUImageBinding.binding_confidence.desc(),
-                SKUImageBinding.image_id,
-            )
-        )).scalars().all()
-
-        # 3. 按 SKU 分组，保留有序去重的 image_id 列表
-        from collections import defaultdict
         sku_image_ids: dict[str, list[str]] = defaultdict(list)
-        for b in bindings:
-            if b.image_id and b.image_id not in sku_image_ids[b.sku_id]:
-                sku_image_ids[b.sku_id].append(b.image_id)
+        if sku_ids:
+            bindings = (await db.execute(
+                select(SKUImageBinding)
+                .where(
+                    SKUImageBinding.job_id == job_id,
+                    SKUImageBinding.sku_id.in_(sku_ids),
+                    SKUImageBinding.is_latest == True,
+                    SKUImageBinding.image_id.isnot(None),
+                )
+                .order_by(
+                    SKUImageBinding.sku_id,
+                    SKUImageBinding.binding_confidence.desc(),
+                    SKUImageBinding.image_id,
+                )
+            )).scalars().all()
 
-        # 4. 批量查询图片元数据
-        all_image_ids = list({iid for ids in sku_image_ids.values() for iid in ids})
+            for b in bindings:
+                if b.image_id and b.image_id not in sku_image_ids[b.sku_id]:
+                    sku_image_ids[b.sku_id].append(b.image_id)
+
+        # 3. 批量查询已绑定图片的元数据
+        all_bound_image_ids = list({iid for ids in sku_image_ids.values() for iid in ids})
         images: dict[str, object] = {}
-        if all_image_ids:
+        if all_bound_image_ids:
             img_rows = (await db.execute(
                 select(Image)
-                .where(Image.job_id == job_id, Image.image_id.in_(all_image_ids))
+                .where(Image.job_id == job_id, Image.image_id.in_(all_bound_image_ids))
             )).scalars().all()
             images = {img.image_id: img for img in img_rows}
 
-        # 5. 读取图片文件，构建导出行
         job_dir = self._job_data_dir / str(job_id)
 
-        # 5a. 查询 PDF 原始文件名（用于"来源"列）
+        # 4. 查询 PDF 原始文件名（用于"来源"列）
         source_filename = ""
         try:
             pdf_job = (await db.execute(
@@ -329,6 +329,7 @@ class ExcelExporter:
 
         rows: list[ExportRow] = []
 
+        # 5. 构建 SKU 行（含各自的绑定图片）
         for sku in skus:
             image_ids = sku_image_ids.get(sku.sku_id, [])
             image_bytes_list: list[bytes] = []
@@ -353,7 +354,41 @@ class ExcelExporter:
                 source_text=source_filename,
             ))
 
-        logger.info("excel_export_rows_loaded", job_id=str(job_id), count=len(rows))
+        # 6. 查询未绑定的商品子图（search_eligible=True），为每张追加独立图片行
+        unbound_q = (
+            select(Image)
+            .where(Image.job_id == job_id, Image.search_eligible == True)
+            .order_by(Image.page_number, Image.image_id)
+        )
+        if all_bound_image_ids:
+            unbound_q = unbound_q.where(Image.image_id.notin_(all_bound_image_ids))
+        unbound_imgs = (await db.execute(unbound_q)).scalars().all()
+
+        for img in unbound_imgs:
+            img_path = job_dir / img.extracted_path
+            img_bytes = b""
+            try:
+                img_bytes = img_path.read_bytes()
+            except Exception as e:
+                logger.warning(
+                    "excel_export_unbound_image_read_failed",
+                    image_id=img.image_id, path=str(img_path), error=str(e),
+                )
+            rows.append(ExportRow(
+                page_number=img.page_number,
+                sku_id="",
+                attributes={},
+                images=[img_bytes] if img_bytes else [],
+                image_ids=[img.image_id],
+                source_text=source_filename,
+            ))
+
+        # 按页码排序（SKU 行在前，图片专属行在后）
+        rows.sort(key=lambda r: (r.page_number, 0 if r.sku_id else 1))
+
+        logger.info("excel_export_rows_loaded",
+                    job_id=str(job_id), sku_rows=len(skus),
+                    unbound_image_rows=len(unbound_imgs))
         return rows
 
     def build_full_excel(self, rows: list[ExportRow]) -> io.BytesIO:

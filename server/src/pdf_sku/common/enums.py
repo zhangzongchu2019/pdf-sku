@@ -163,7 +163,7 @@ class SSEEventType(StrEnum):
     PAGES_BATCH_UPDATE = "pages_batch_update"; JOB_COMPLETED = "job_completed"
     JOB_FAILED = "job_failed"; HUMAN_NEEDED = "human_needed"
     SLA_ESCALATED = "sla_escalated"; SLA_AUTO_RESOLVE = "sla_auto_resolve"
-    SLA_AUTO_ACCEPTED = "sla_auto_accepted"
+    SLA_AUTO_ACCEPTED = "sla_auto_accepted"; JOB_DELETED = "job_deleted"
 
 
 # ===================================================================

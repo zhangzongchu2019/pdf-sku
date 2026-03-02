@@ -257,8 +257,8 @@ class Orchestrator:
             )
         )
 
-        # 持久化 SKU + Image + Binding
-        if result.skus:
+        # 持久化 SKU + Image + Binding（即使无 SKU，也保留商品子图）
+        if result.skus or result.images:
             await self._persist_skus(db, job.job_id, page_no, result)
 
         # 发布事件

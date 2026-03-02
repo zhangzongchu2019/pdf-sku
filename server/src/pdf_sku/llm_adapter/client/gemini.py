@@ -72,7 +72,13 @@ class GeminiClient(BaseLLMClient):
         effective_timeout = httpx.Timeout(timeout) if timeout else None
         resp = await self._client.post(url, json=body, timeout=effective_timeout)
         latency = (time.monotonic() - start) * 1000
-        resp.raise_for_status()
+        if resp.is_error:
+            body_text = resp.text[:500]
+            raise httpx.HTTPStatusError(
+                f"HTTP {resp.status_code} from Gemini ({self._model}): {body_text}",
+                request=resp.request,
+                response=resp,
+            )
         data = resp.json()
 
         candidates = data.get("candidates", [])

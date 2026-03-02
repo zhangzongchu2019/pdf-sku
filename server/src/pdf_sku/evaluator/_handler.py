@@ -25,6 +25,17 @@ _db_session_factory = None
 
 EVAL_TIMEOUT_SECONDS = 300  # 5 分钟超时
 
+# 正在运行的评估任务注册表 job_id → asyncio.Task
+_active_tasks: dict[str, asyncio.Task] = {}
+
+
+def cancel_job(job_id: str) -> None:
+    """取消指定 job 正在运行的评估任务。"""
+    task = _active_tasks.pop(job_id, None)
+    if task and not task.done():
+        task.cancel()
+        logger.info("eval_task_cancelled_by_delete", job_id=job_id)
+
 
 def init_handler(evaluator_service, session_factory) -> None:
     """初始化并注册事件监听。"""
@@ -51,7 +62,8 @@ async def _on_job_created(data: dict) -> None:
 
     # 启动异步评估 (不阻塞事件总线)
     task = asyncio.create_task(_run_evaluation(job_id, data.get("prescan", {})))
-    task.add_done_callback(lambda t: _on_eval_task_done(t, job_id))
+    _active_tasks[job_id] = task
+    task.add_done_callback(lambda t, jid=job_id: (_active_tasks.pop(jid, None), _on_eval_task_done(t, jid)))
 
 
 def _on_eval_task_done(task: asyncio.Task, job_id: str) -> None:

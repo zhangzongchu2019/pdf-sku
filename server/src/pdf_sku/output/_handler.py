@@ -32,6 +32,11 @@ def init_output_handler(
     logger.info("output_handler_registered")
 
 
+def get_importer() -> IncrementalImporter | None:
+    """返回当前 importer 实例（供删除时清理背压内存）。"""
+    return _importer
+
+
 async def _on_page_completed(event: dict) -> None:
     """Pipeline 页面完成 → 增量导入。"""
     if not _importer or not _session_factory:

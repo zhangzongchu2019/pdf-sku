@@ -33,6 +33,7 @@ from pdf_sku.common.models import (
     Image,
     SKUImageBinding,
     StateTransition,
+    ImportDedup,
 )
 from pdf_sku.common.enums import (
     JobInternalStatus, JobUserStatus, compute_user_status, ACTION_HINT_MAP,
@@ -295,14 +296,24 @@ async def requeue_job(job_id: uuid.UUID, db: DBSession, redis: RedisClient):
     return {"job_id": str(job_id), "status": job.status, "user_status": job.user_status}
 
 
-@router.delete("/ops/jobs/{job_id}")
-async def delete_job(job_id: uuid.UUID, db: DBSession):
-    """物理删除 Job 及其关联数据。"""
-    result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
-    job = result.scalar_one_or_none()
-    if not job:
-        raise JobNotFoundError(f"Job {job_id} not found")
+async def _perform_job_deletion(job_id: uuid.UUID, db: AsyncSession, redis) -> None:
+    """完整删除一个 Job 的所有状态（DB + Redis + 内存 + SSE + 任务取消）。"""
+    from pdf_sku.evaluator import _handler as eval_handler
+    from pdf_sku.pipeline import _handler as pipeline_handler
+    from pdf_sku.output._handler import get_importer
 
+    # 1. 取消正在运行的异步任务
+    eval_handler.cancel_job(str(job_id))
+    pipeline_handler.cancel_job(str(job_id))
+
+    # 2. SSE 通知 + 关闭连接
+    sse_mgr = get_sse_manager()
+    await sse_mgr.close_and_notify_job(str(job_id))
+
+    # 3. 发布事件（其他订阅方同步）
+    await event_bus.publish("JobDeleted", {"job_id": str(job_id)})
+
+    # 4. DB 清理
     task_ids = (await db.execute(
         select(HumanTask.task_id).where(HumanTask.job_id == job_id)
     )).scalars().all()
@@ -319,6 +330,7 @@ async def delete_job(job_id: uuid.UUID, db: DBSession):
         StateTransition.entity_type == "job",
         StateTransition.entity_id == str(job_id),
     ))
+    await db.execute(delete(ImportDedup).where(ImportDedup.job_id == job_id))
     await db.execute(delete(Annotation).where(Annotation.job_id == job_id))
     await db.execute(delete(HumanTask).where(HumanTask.job_id == job_id))
     await db.execute(delete(SKUImageBinding).where(SKUImageBinding.job_id == job_id))
@@ -329,10 +341,56 @@ async def delete_job(job_id: uuid.UUID, db: DBSession):
     await db.execute(delete(PDFJob).where(PDFJob.job_id == job_id))
     await db.commit()
 
+    # 5. Redis 清理
+    await redis.delete(
+        f"job_worker:{job_id}",
+        f"orphan:requeue_count:{job_id}",
+    )
+
+    # 6. BackpressureMonitor 内存清理
+    importer = get_importer()
+    if importer and hasattr(importer, "_bp"):
+        importer._bp.clear(str(job_id))
+
+    # 7. 磁盘清理
     job_dir = Path(settings.job_data_dir) / str(job_id)
     if job_dir.exists():
         shutil.rmtree(job_dir, ignore_errors=True)
 
+
+@router.delete("/jobs/{job_id}", status_code=200)
+async def delete_job_by_user(
+    job_id: uuid.UUID,
+    db: DBSession,
+    redis: RedisClient,
+    user: UploaderUser,
+):
+    """用户删除 Job（只能删自己 merchant 下的；admin 可删任意）。"""
+    from fastapi import HTTPException
+    result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise JobNotFoundError(f"Job {job_id} not found")
+    if user.role != "admin" and job.merchant_id != (user.merchant_id or ""):
+        raise HTTPException(status_code=403, detail="无权删除该 Job")
+
+    await _perform_job_deletion(job_id, db, redis)
+    return {"job_id": str(job_id), "deleted": True}
+
+
+@router.delete("/ops/jobs/{job_id}")
+async def delete_job(
+    job_id: uuid.UUID,
+    db: DBSession,
+    redis: RedisClient,
+    _admin: AdminUser,
+):
+    """管理员物理删除 Job 及其关联数据。"""
+    result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
+    if not result.scalar_one_or_none():
+        raise JobNotFoundError(f"Job {job_id} not found")
+
+    await _perform_job_deletion(job_id, db, redis)
     return {"job_id": str(job_id), "deleted": True}
 
 

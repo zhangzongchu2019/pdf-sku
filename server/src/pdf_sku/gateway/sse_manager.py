@@ -45,7 +45,7 @@ class SSEManager:
         """订阅 EventBus 事件 → 分发到对应 Job 的 SSE 队列。"""
         for evt in [
             "PageStatusChanged", "JobStatusChanged", "JobFailed",
-            "HumanNeeded", "SLAEscalated",
+            "HumanNeeded", "SLAEscalated", "JobDeleted",
         ]:
             event_bus.subscribe(evt, self._dispatch_event)
 
@@ -95,6 +95,8 @@ class SSEManager:
 
                     # 检查终态
                     status = data.get("status", "")
+                    if status == "DELETED":
+                        break
                     if status in TERMINAL_STATUSES:
                         yield self._make_sse(
                             SSEEventType.JOB_COMPLETED if status == JobInternalStatus.FULL_IMPORTED.value
@@ -110,9 +112,14 @@ class SSEManager:
         except asyncio.CancelledError:
             logger.info("sse_cancelled", job_id=job_id)
         finally:
-            self._connections[job_id].remove(queue)
-            if not self._connections[job_id]:
-                del self._connections[job_id]
+            conns = self._connections.get(job_id)
+            if conns is not None:
+                try:
+                    conns.remove(queue)
+                except ValueError:
+                    pass
+                if not conns:
+                    self._connections.pop(job_id, None)
             logger.info("sse_disconnected", job_id=job_id)
 
     def _map_event_type(self, data: dict) -> str:
@@ -124,6 +131,7 @@ class SSEManager:
             "JobFailed": SSEEventType.JOB_FAILED,
             "HumanNeeded": SSEEventType.HUMAN_NEEDED,
             "SLAEscalated": SSEEventType.SLA_ESCALATED,
+            "JobDeleted": SSEEventType.JOB_DELETED,
         }
         return mapping.get(evt, SSEEventType.HEARTBEAT)
 
@@ -134,6 +142,23 @@ class SSEManager:
         clean = {k: v for k, v in data.items() if not k.startswith("_")}
         json_str = orjson.dumps(clean).decode()
         return ServerSentEvent(data=json_str, event=event_type)
+
+    async def close_and_notify_job(self, job_id: str) -> None:
+        """向该 job 所有 SSE 客户端推送 job_deleted 终态事件，并清理连接表。"""
+        queues = list(self._connections.get(job_id, []))
+        for q in queues:
+            if q.full():
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                q.put_nowait({"_event_type": "JobDeleted", "job_id": job_id, "status": "DELETED"})
+            except asyncio.QueueFull:
+                pass
+        # 清空连接表（generator 的 finally 块会处理 queue 自身）
+        self._connections.pop(job_id, None)
+        logger.info("sse_job_deleted_notified", job_id=job_id, clients=len(queues))
 
     @property
     def active_connections(self) -> int:

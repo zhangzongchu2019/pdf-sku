@@ -90,7 +90,13 @@ class OpenAICompatClient(BaseLLMClient):
         resp = await self._client.post(
             url, json=body, headers=headers, timeout=effective_timeout)
         latency = (time.monotonic() - start) * 1000
-        resp.raise_for_status()
+        if resp.is_error:
+            body_text = resp.text[:500]
+            raise httpx.HTTPStatusError(
+                f"HTTP {resp.status_code} from {self._provider_name or self._api_base}: {body_text}",
+                request=resp.request,
+                response=resp,
+            )
         data = resp.json()
 
         choices = data.get("choices", [])

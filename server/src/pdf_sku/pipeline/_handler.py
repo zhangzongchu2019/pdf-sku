@@ -22,6 +22,17 @@ _orchestrator = None
 _db_session_factory = None
 _task_manager: TaskManager | None = None
 
+# 正在运行的 Pipeline 任务注册表 job_id → asyncio.Task
+_active_tasks: dict[str, asyncio.Task] = {}
+
+
+def cancel_job(job_id: str) -> None:
+    """取消指定 job 正在运行的 Pipeline 任务。"""
+    task = _active_tasks.pop(job_id, None)
+    if task and not task.done():
+        task.cancel()
+        logger.info("pipeline_task_cancelled_by_delete", job_id=job_id)
+
 
 def init_handler(orchestrator, session_factory, task_manager: TaskManager | None = None) -> None:
     """初始化并注册事件监听。"""
@@ -40,10 +51,14 @@ async def _on_evaluation_completed(data: dict) -> None:
 
     # HUMAN_ALL → 不走 Pipeline, 直接进人工
     if route == "HUMAN_ALL":
-        asyncio.create_task(_run_human_all(job_id, data))
+        task = asyncio.create_task(_run_human_all(job_id, data))
+        _active_tasks[job_id] = task
+        task.add_done_callback(lambda t, jid=job_id: _active_tasks.pop(jid, None))
         return
 
-    asyncio.create_task(_run_pipeline(job_id, data))
+    task = asyncio.create_task(_run_pipeline(job_id, data))
+    _active_tasks[job_id] = task
+    task.add_done_callback(lambda t, jid=job_id: _active_tasks.pop(jid, None))
 
 
 async def _run_human_all(job_id: str, eval_data: dict) -> None:
