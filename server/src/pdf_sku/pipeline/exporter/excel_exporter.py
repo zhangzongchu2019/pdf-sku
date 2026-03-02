@@ -479,6 +479,18 @@ class ExcelExporter:
         headers = ["商品图片"] * n_img_cols + [kf[0] for kf in KEYWORD_FIELDS]
         _apply_header_style(ws, headers, n_img_cols=n_img_cols)
 
+        # 预计算: 同一 model_number 下 product_name 是否存在差异
+        # 若存在差异 → product_name 是真正的商品区分符（如"1人位"/"3人位"）
+        # 若所有 SKU 的 product_name 相同 → 是品牌/系列名（如"Wosi furniture"），不加入商品名称
+        from collections import defaultdict
+        _model_pnames: dict[str, set[str]] = defaultdict(set)
+        for _r in rows:
+            _mn = _get_field_value(_r.attributes, ['model_number', 'model', '型号'])
+            _pn = _get_field_value(_r.attributes, ['product_name', '产品名称', '品名', 'name'])
+            if _mn and _pn and _pn != _mn:
+                _model_pnames[_mn].add(_pn)
+        _model_pname_varies: dict[str, bool] = {mn: len(pns) > 1 for mn, pns in _model_pnames.items()}
+
         # 备用候选键（fallback）
         _FALLBACK_CANDIDATES: dict[str, list[str]] = {
             '售价':          ['unit_price', 'price', 'retail_price', '单价', '售价'],
@@ -496,13 +508,14 @@ class ExcelExporter:
         for row_idx, row in enumerate(rows, 2):
             attrs = row.attributes
 
-            # 商品名称/描述 = 型号 + 品名（若与型号不重复）+ 规格
+            # 商品名称/描述 = 型号 + 品名（仅当品名是区分符时）+ 规格
+            # 品名是区分符的判定: 同 model_number 下存在多个不同 product_name
+            # 若全系列 product_name 相同（如"Wosi furniture"），则是品牌名，不加入
             model = _get_field_value(attrs, ['model_number', 'model', '型号'])
             pname = _get_field_value(attrs, ['product_name', '产品名称', '品名', 'name'])
             size  = _get_field_value(attrs, ['size', 'spec', 'specification', '规格', '尺寸'])
-            # pname 与 model 相同时跳过，避免重复（如 product_name="WS X-685" == model_number）
             name_parts = [model]
-            if pname and pname != model:
+            if pname and pname != model and _model_pname_varies.get(model, False):
                 name_parts.append(pname)
             name_parts.append(size)
             product_name_val = " ".join(p for p in name_parts if p)
