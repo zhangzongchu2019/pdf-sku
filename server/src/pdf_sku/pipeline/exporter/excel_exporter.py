@@ -2,9 +2,10 @@
 Excel 导出器 — 将 Job 的 SKU 识别结果导出为两个 Excel 文件。
 
 File 1 (full_export.xlsx):   商品子图 + 所有提取到的 SKU 属性（动态列）
-File 2 (keywords_export.xlsx): 商品子图 + 固定关键词字段映射（LLM 语义匹配）
+File 2 (keywords_export.xlsx): 固定 22 列关键词模板（平台导入格式）
 
-多图支持: 同一 SKU 的多张商品子图各占一列 (商品图片1 / 商品图片2 / ...)。
+多图支持 (keywords_export): 同一 SKU 的多张商品子图各展开为独立行，
+  列名固定为"商品图片"（不编号）。
 """
 from __future__ import annotations
 
@@ -22,23 +23,42 @@ import structlog
 logger = structlog.get_logger()
 
 # ─────────────────────── 关键词列定义 ───────────────────────
-# 每项: (列标题, 语义描述)
+# 平台导入模板列顺序（不含首列"商品图片"）
+# 每项: (列标题, 语义描述)  语义描述为空字符串的列固定留空
 KEYWORD_FIELDS: list[tuple[str, str]] = [
-    ('商品名称/描述', '商品的产品描述、详情介绍文字；优先使用 description 字段，其次 product_name'),
-    ('售价',         '商品零售单价或市场价，面向终端消费者的价格'),
-    ('商品规格',     '商品的规格、尺寸、型号，例如"30×40cm"、"L码"、"500ml"'),
-    ('颜色',         '商品颜色或色号，例如"红色"、"深蓝"'),
-    ('批发价',       '批量采购价格，通常低于零售价'),
-    ('打包价',       '打包装或组合销售价格'),
-    ('代发价',       '供货商代发货价格（dropship），直接发给终端买家'),
-    ('活动价',       '促销、活动或限时优惠价格'),
-    ('库存',         '商品库存数量'),
-    ('重量(kg)',     '商品重量，单位 kg 或 g'),
-    ('自动下架时间', '商品自动下架或到期时间'),
+    ('规格图片',           ''),
+    ('商品名称/描述',       '商品型号 + 规格拼接，例如"WS X-683 950W*760D*850H"'),
+    ('售价',              '商品零售单价或市场价，面向终端消费者'),
+    ('货号',              '商品型号/货号编号，例如"A105#"、"WS X-683"'),
+    ('商品ID',            ''),
+    ('标签',              ''),
+    ('来源(仅自己可见)',    ''),    # 特殊列: PDF 文件名
+    ('商品简称',           ''),
+    ('商品规格',           '商品的规格、尺寸，例如"130x70x55cm"'),
+    ('颜色',              '商品颜色或色号，例如"红色"、"深蓝"'),
+    ('规格编码',           ''),
+    ('批发价',             '批量采购价格，通常低于零售价'),
+    ('打包价',             '打包装或组合销售价格'),
+    ('代发价',             '供货商代发货价格（dropship），直接发给终端买家'),
+    ('拿货价(仅自己可见)', ''),
+    ('活动类型',           ''),
+    ('活动价',             '促销、活动或限时优惠价格'),
+    ('库存',              '商品库存数量'),
+    ('重量(kg)',           '商品重量，单位 kg'),
+    ('备注(公开)',         ''),
+    ('自动下架时间',        '商品自动下架或到期时间'),
 ]
 
-# 关键词导出中的特殊列（不经过 LLM 映射，直接取 ExportRow 字段或置空）
-_SPECIAL_KW_COLS: list[str] = ['来源（仅自己可见）', '规格图片']
+# 固定留空的列
+_EMPTY_KW_COLS: frozenset[str] = frozenset({
+    '规格图片', '商品ID', '标签', '商品简称',
+    '规格编码', '拿货价(仅自己可见)', '活动类型', '备注(公开)',
+})
+
+# 特殊处理列（不走 LLM 映射，从 ExportRow 字段直接计算）
+_SOURCE_COL = '来源(仅自己可见)'   # PDF 文件名
+_NAME_COL   = '商品名称/描述'      # 型号 + 规格
+_MODEL_COL  = '货号'               # 型号
 
 # 固定列的候选键集合（用于从动态列中去除已覆盖的字段）
 _FIXED_CANDIDATES: set[str] = {
@@ -147,14 +167,20 @@ async def build_keyword_mapping_via_llm(
     if not key_samples:
         return {kf[0]: [] for kf in KEYWORD_FIELDS}
 
-    # 2. 构造 LLM prompt
+    # 2. 构造 LLM prompt（仅映射有语义描述的非空列）
+    mappable_fields = [
+        kf for kf in KEYWORD_FIELDS
+        if kf[1]  # 语义描述非空 → 需要 LLM 映射
+        and kf[0] not in (_NAME_COL, _MODEL_COL)  # 这两列直接从属性提取，不走 LLM
+    ]
+
     attr_lines = "\n".join(
         f'  "{k}": {json.dumps(v, ensure_ascii=False)}'
         for k, v in key_samples.items()
     )
     keyword_lines = "\n".join(
         f'  "{kf[0]}": {kf[1]}'
-        for kf in KEYWORD_FIELDS
+        for kf in mappable_fields
     )
 
     prompt = f"""你是一个商品数据结构专家。请根据语义理解，将 SKU 属性字段映射到标准导出列。
@@ -173,9 +199,8 @@ async def build_keyword_mapping_via_llm(
 
 ## 返回格式（严格 JSON，不要有任何额外文字）
 {{
-  "商品名称/描述": ["最匹配的字段名", "次匹配的字段名"],
-  "售价": ["..."],
-  ...（覆盖所有 {len(KEYWORD_FIELDS)} 个标准列）
+  "售价": ["最匹配的字段名", "次匹配的字段名"],
+  ...（覆盖所有 {len(mappable_fields)} 个标准列）
 }}"""
 
     try:
@@ -193,7 +218,7 @@ async def build_keyword_mapping_via_llm(
                 raw = raw[4:]
         mapping: dict = json.loads(raw.strip())
 
-        # 4. 验证并规范化：仅保留 KEYWORD_FIELDS 中存在的列，且值必须是列表
+        # 4. 验证并规范化：仅保留 mappable_fields 中存在的列，且值必须是列表
         result: dict[str, list[str]] = {}
         for col_name, _ in KEYWORD_FIELDS:
             matched = mapping.get(col_name, [])
@@ -424,8 +449,12 @@ class ExcelExporter:
         llm_service=None,
     ) -> io.BytesIO:
         """
-        File 2: 商品图片1 | 商品图片2 | ... | 固定 11 个关键词字段。
-        多图支持: 每张子图占一列，最大列数 = max(len(row.images))。
+        关键词导出 Excel（平台导入格式）:
+          列: 商品图片 | 规格图片 | 商品名称/描述 | 售价 | 货号 | 商品ID | 标签 |
+              来源(仅自己可见) | 商品简称 | 商品规格 | 颜色 | 规格编码 | 批发价 |
+              打包价 | 代发价 | 拿货价(仅自己可见) | 活动类型 | 活动价 | 库存 |
+              重量(kg) | 备注(公开) | 自动下架时间
+          多图: 同一 SKU 的多张图片各展开为独立行，其余列数据重复。
         """
         import openpyxl
         from openpyxl.styles import Alignment
@@ -438,82 +467,80 @@ class ExcelExporter:
         else:
             logger.info("keywords_excel_using_fallback_mapping")
 
-        # 确定最多图片数
-        n_img_cols = max((len(row.images) for row in rows), default=1)
-        n_img_cols = max(n_img_cols, 1)
-
-        if n_img_cols == 1:
-            img_headers = ["商品图片"]
-        else:
-            img_headers = [f"商品图片{i + 1}" for i in range(n_img_cols)]
-
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "关键词导出"
 
-        headers = img_headers + [kf[0] for kf in KEYWORD_FIELDS] + _SPECIAL_KW_COLS
-        _apply_header_style(ws, headers, n_img_cols=n_img_cols)
+        # 固定: 首列"商品图片" + 21 个关键词列
+        headers = ["商品图片"] + [kf[0] for kf in KEYWORD_FIELDS]
+        _apply_header_style(ws, headers, n_img_cols=1)
 
-        # 备用候选键（fallback，与旧逻辑一致）
+        # 备用候选键（fallback）
         _FALLBACK_CANDIDATES: dict[str, list[str]] = {
-            '商品名称/描述': ['description', 'product_name', 'name', '产品名称', '品名'],
-            '售价':         ['unit_price', 'price', 'retail_price', '单价', '售价'],
-            '商品规格':     ['size', 'spec', 'specification', '规格', '尺寸', '型号'],
-            '颜色':         ['color', 'colour', '颜色', '色号'],
-            '批发价':       ['wholesale_price', '批发价', '批发'],
-            '打包价':       ['package_price', '打包价', '打包'],
-            '代发价':       ['dropship_price', '代发价', '代发'],
-            '活动价':       ['promotion_price', 'activity_price', '活动价', '促销价'],
-            '库存':         ['stock', 'inventory', '库存', '数量'],
-            '重量(kg)':     ['weight', '重量', 'weight_kg', '毛重'],
-            '自动下架时间': ['auto_offline_time', '下架时间', 'offline_time'],
+            '售价':          ['unit_price', 'price', 'retail_price', '单价', '售价'],
+            '商品规格':      ['size', 'spec', 'specification', '规格', '尺寸'],
+            '颜色':          ['color', 'colour', '颜色', '色号'],
+            '批发价':        ['wholesale_price', '批发价', '批发'],
+            '打包价':        ['package_price', '打包价', '打包'],
+            '代发价':        ['dropship_price', '代发价', '代发'],
+            '活动价':        ['promotion_price', 'activity_price', '活动价', '促销价'],
+            '库存':          ['stock', 'inventory', '库存', '数量'],
+            '重量(kg)':      ['weight', '重量', 'weight_kg', '毛重'],
+            '自动下架时间':  ['auto_offline_time', '下架时间', 'offline_time'],
         }
 
-        for row_idx, row in enumerate(rows, 2):
+        row_idx = 2
+        for row in rows:
             attrs = row.attributes
 
-            # 商品名称 = 型号 + 规格（以空格拼接，任一字段为空则只取有值的部分）
+            # 商品名称/描述 = 型号 + 规格
             model = _get_field_value(attrs, ['model_number', 'model', '型号'])
             size  = _get_field_value(attrs, ['size', 'spec', 'specification', '规格', '尺寸'])
             product_name_val = " ".join(p for p in [model, size] if p)
 
-            # 关键词列值
+            # 构建每个关键词列的值（固定顺序，对应 KEYWORD_FIELDS）
             kw_data: list[str] = []
-            if keyword_mapping is not None:
-                col_values = _apply_keyword_mapping(attrs, keyword_mapping)
-                for col_name, _ in KEYWORD_FIELDS:
-                    if col_name == '商品名称/描述':
-                        kw_data.append(product_name_val)
-                    else:
-                        kw_data.append(col_values.get(col_name, ""))
-            else:
-                for col_name, _ in KEYWORD_FIELDS:
-                    if col_name == '商品名称/描述':
-                        kw_data.append(product_name_val)
-                    else:
-                        candidates = _FALLBACK_CANDIDATES.get(col_name, [])
-                        kw_data.append(_get_field_value(attrs, candidates))
+            for col_name, _ in KEYWORD_FIELDS:
+                if col_name in _EMPTY_KW_COLS:
+                    kw_data.append("")
+                elif col_name == _SOURCE_COL:
+                    kw_data.append(row.source_text)
+                elif col_name == _NAME_COL:
+                    kw_data.append(product_name_val)
+                elif col_name == _MODEL_COL:
+                    kw_data.append(model)
+                elif keyword_mapping is not None:
+                    candidates = keyword_mapping.get(col_name, [])
+                    value = ""
+                    for key in candidates:
+                        v = attrs.get(key)
+                        if v is not None and str(v).strip():
+                            value = str(v).strip()
+                            break
+                    kw_data.append(value)
+                else:
+                    candidates = _FALLBACK_CANDIDATES.get(col_name, [])
+                    kw_data.append(_get_field_value(attrs, candidates))
 
-            # 特殊列：来源（仅自己可见）= PDF 文件名；规格图片 = 留空
-            kw_data.append(row.source_text)
-            kw_data.append("")
+            # 多图展开: 每张图片写一行（无图则写一行空图片行）
+            imgs_to_write = row.images if row.images else [None]
+            for img_bytes in imgs_to_write:
+                # 写关键词列（第 2 列起）
+                for col_offset, val in enumerate(kw_data):
+                    ws.cell(
+                        row=row_idx,
+                        column=2 + col_offset,
+                        value=val,
+                    ).alignment = Alignment(vertical="center", wrap_text=True)
 
-            # 写关键词列（从第 n_img_cols+1 列开始）
-            for col_offset, val in enumerate(kw_data):
-                ws.cell(
-                    row=row_idx,
-                    column=n_img_cols + 1 + col_offset,
-                    value=val,
-                ).alignment = Alignment(vertical="center", wrap_text=True)
-
-            # 嵌入图片
-            has_image = False
-            for img_idx, img_bytes in enumerate(row.images[:n_img_cols]):
+                # 嵌入图片（第 1 列）
                 if img_bytes:
-                    _embed_image(ws, img_bytes, row_idx, col=img_idx + 1, max_px=60)
-                    has_image = True
+                    _embed_image(ws, img_bytes, row_idx, col=1, max_px=60)
+                    ws.row_dimensions[row_idx].height = 60
+                else:
+                    ws.row_dimensions[row_idx].height = 15
 
-            ws.row_dimensions[row_idx].height = 60 if has_image else 15
+                row_idx += 1
 
         buf = io.BytesIO()
         wb.save(buf)
