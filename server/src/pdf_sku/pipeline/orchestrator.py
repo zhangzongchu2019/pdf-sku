@@ -296,7 +296,10 @@ class Orchestrator:
         old_sku_ids = [row[0] for row in old_sku_ids_result.fetchall()]
         if old_sku_ids:
             await db.execute(
-                delete(SKUImageBinding).where(SKUImageBinding.sku_id.in_(old_sku_ids))
+                delete(SKUImageBinding).where(
+                    SKUImageBinding.sku_id.in_(old_sku_ids),
+                    SKUImageBinding.job_id == job_id,
+                )
             )
             await db.execute(
                 sa_update(SKU).where(

@@ -254,7 +254,7 @@ class SKUImageBinding(Base):
     is_latest: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    __table_args__ = (UniqueConstraint("sku_id", "image_id"),)
+    __table_args__ = (UniqueConstraint("sku_id", "image_id", "job_id", name="uq_sku_image_job"),)
 
 
 class HumanTask(Base):
