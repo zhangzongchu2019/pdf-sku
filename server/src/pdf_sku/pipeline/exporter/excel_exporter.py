@@ -81,6 +81,7 @@ class ExportRow:
     images: list[bytes] = field(default_factory=list)   # 多图：每张占一列
     image_ids: list[str] = field(default_factory=list)
     source_text: str = ""   # PDF 原始 OCR 文字（按页）
+    variant_label: str = ""  # 座位/规格变体标签，如"1人位"/"2人位"
 
 
 # ─────────────────────── 辅助函数 ───────────────────────
@@ -352,6 +353,7 @@ class ExcelExporter:
                 images=image_bytes_list,
                 image_ids=image_ids,
                 source_text=source_filename,
+                variant_label=sku.variant_label or "",
             ))
 
         # 6. 查询未绑定的商品子图（search_eligible=True），为每张追加独立图片行
@@ -429,13 +431,17 @@ class ExcelExporter:
             ("备注",     ["remark", "note", "备注", "说明"]),
             ("重量",     ["weight", "weight_kg", "重量"]),
         ]
+        # 判断是否有 variant_label 数据，有则加入固定列
+        has_variant = any(row.variant_label for row in rows)
 
         # 动态列：排除已被固定列覆盖的键
         extra_keys = [k for k in all_keys_by_freq if k not in _FIXED_CANDIDATES]
 
+        variant_col = ["变体规格"] if has_variant else []
         headers = (
             img_headers
             + ["页码", "SKU ID"]
+            + variant_col
             + [col[0] for col in fixed_cols]
             + extra_keys
         )
@@ -450,6 +456,8 @@ class ExcelExporter:
                 row.page_number,
                 row.sku_id,
             ]
+            if has_variant:
+                text_data.append(row.variant_label)
             for _, candidates in fixed_cols:
                 text_data.append(_get_field_value(attrs, candidates))
             for k in extra_keys:
@@ -543,13 +551,17 @@ class ExcelExporter:
         for row_idx, row in enumerate(rows, 2):
             attrs = row.attributes
 
-            # 商品名称/描述 = 型号 + 品名（仅当品名是区分符时）+ 规格
+            # 商品名称/描述 = 型号 + 变体规格（如"1人位"）+ 品名（仅当品名是区分符时）+ 规格
+            # variant_label 优先作为规格区分符（如"1人位"/"2人位"/"3人位"）
             # 品名是区分符的判定: 同 model_number 下存在多个不同 product_name
             # 若全系列 product_name 相同（如"Wosi furniture"），则是品牌名，不加入
             model = _get_field_value(attrs, ['model_number', 'model', '型号'])
             pname = _get_field_value(attrs, ['product_name', '产品名称', '品名', 'name'])
             size  = _get_field_value(attrs, ['size', 'spec', 'specification', '规格', '尺寸'])
+            variant = row.variant_label  # e.g. "1人位", "2人位", "3人位"
             name_parts = [model]
+            if variant:
+                name_parts.append(variant)
             if pname and pname != model and _model_pname_varies.get(model, False):
                 name_parts.append(pname)
             name_parts.append(size)

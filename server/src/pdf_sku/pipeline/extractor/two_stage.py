@@ -40,7 +40,13 @@ CRITICAL rule — how to count products:
 Additional rules:
 - Material and color lines describe the ENTIRE product series, NOT individual variants → put in "common_attrs".
 - Do NOT create separate SKUs for different colors or materials.
-- When a single product has N size variants (e.g. "1人位/2人位/3人位"), create exactly N SKUs.
+- CRITICAL: When a product has N座位/人位/seater variants listed (e.g. "1人位", "2人位", "3人位"),
+  count every unique 人位/座位 entry in the raw OCR text and create EXACTLY that many SKUs — one per entry.
+  Do NOT skip any entry. Verify your count before responding.
+- When a model number contains a parenthetical descriptor (e.g. "Y11*（圆9分角）", "A105*（铁艺款）"),
+  KEEP the full model number including the parenthetical part in "model_number".
+  ALSO incorporate the descriptor into "product_name": e.g. product_name="圆9分角茶几" (not just "茶几").
+  The descriptor is a key characteristic that distinguishes this product from others in the same series.
 
 Extract these attributes where visible: product_name, model_number, price, material, color, size, weight, description.
 Put series-shared attributes (material, color) in "common_attrs". Put variant-specific attributes (size) in each SKU entry.
@@ -195,6 +201,8 @@ class TwoStageExtractor:
                             confidence=float(item.get("confidence", 0.7)),
                             extraction_method="two_stage",
                         ))
+                # 后处理：从 raw OCR 补充 LLM 遗漏的 N人位 变体
+                results = self._supplement_seat_variants(results, raw_text)
                 return results
         except Exception as e:
             logger.warning("attr_extract_failed", error=str(e))
@@ -233,7 +241,18 @@ class TwoStageExtractor:
                 if isinstance(sku_data, dict):
                     attrs.update(sku_data)
 
-                validity = "valid" if attrs.get("product_name") else "invalid"
+                # 过滤伪 SKU：product_name == model_number 且无尺寸/变体
+                # 这是 LLM 把型号表头（如"WS X-685"）误当成独立产品抽取
+                pn = attrs.get("product_name", "")
+                mn = attrs.get("model_number", "")
+                is_header_artifact = (
+                    pn and mn and pn == mn
+                    and not attrs.get("size")
+                    and not variant_label
+                )
+                validity = "invalid" if is_header_artifact else (
+                    "valid" if pn else "invalid"
+                )
                 results.append(SKUResult(
                     attributes=attrs,
                     source_bbox=bbox,
@@ -243,6 +262,61 @@ class TwoStageExtractor:
                     product_id=temp_product_id,
                     variant_label=variant_label,
                 ))
+        return results
+
+    @staticmethod
+    def _supplement_seat_variants(
+        results: list[SKUResult],
+        raw_text: str,
+    ) -> list[SKUResult]:
+        """
+        后处理：从 raw OCR 文本中正则提取所有 'N人位+尺寸' 条目，
+        补充 LLM 漏提的变体（常见于多列布局中 2人位 被夹在段落文字里）。
+        仅当已有 ≥1 个 variant_label 时才激活，避免干扰非沙发类产品。
+        """
+        import re
+
+        # 只在已有 人位 变体标签的结果中生效
+        existing_variants = {r.variant_label for r in results if r.variant_label}
+        if not existing_variants:
+            return results
+
+        # 匹配 "N人位" + 可选空白 + "WxDxH" 格式（宽容大小写和分隔符）
+        seat_pat = re.compile(
+            r'(\d+人位)\s*(\d+[Ww][*×xX×]\d+[Dd][*×xX×]\d+[Hh])',
+        )
+        found = seat_pat.findall(raw_text)
+        if len(found) <= len(existing_variants):
+            return results  # 没有遗漏
+
+        # 找出 LLM 未提取到的变体
+        missing = [(vl, sz) for vl, sz in found if vl not in existing_variants]
+        if not missing:
+            return results
+
+        # 以第一个 valid 结果为模板，继承公共属性
+        template = next((r for r in results if r.validity == "valid"), None)
+        if not template:
+            return results
+
+        for variant_label, size in missing:
+            new_attrs = {k: v for k, v in template.attributes.items() if k != "size"}
+            new_attrs["size"] = size
+            results.append(SKUResult(
+                attributes=new_attrs,
+                source_bbox=template.source_bbox,
+                validity="valid",
+                confidence=0.65,
+                extraction_method="two_stage_supplemented",
+                product_id=template.product_id,
+                variant_label=variant_label,
+            ))
+
+        logger.info(
+            "seat_variants_supplemented",
+            missing_count=len(missing),
+            variants=[m[0] for m in missing],
+        )
         return results
 
     @staticmethod
