@@ -46,6 +46,7 @@ class ImageInfo:
     role: str = ""  # product_main | product_detail | logo | decoration | unknown
     is_fragmented: bool = False
     is_duplicate: bool = False
+    is_tile_composite: bool = False  # 由 _merge_tile_fragments 聚类创建的复合图片
     image_hash: str = ""
     quality_warning: str = ""
     search_eligible: bool = False

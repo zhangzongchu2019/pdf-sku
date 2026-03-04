@@ -140,15 +140,17 @@ class TwoStageExtractor:
         if not self._llm:
             return self._rule_boundaries(text_blocks, text_roles, images=images)
 
-        # 密集图片目录页: 大量可检索图片（>=20）→ 跳过 LLM 边界识别，直接用图片 bbox 作边界
-        # 页码等少量文字不影响判断（页码文字块存在时 not text_blocks=False 原逻辑会误触发 LLM，
-        # 而 LLM 返回像素坐标边界，Phase 8 再次缩放会导致 source_bbox 双重缩放错误）
+        # 密集图片目录页: 大量瓦片合成图（>=20）→ 跳过 LLM 边界识别，直接用图片 bbox 作边界
+        # 注意: 只计算 is_tile_composite=True 的合成图，不含瓦片页上恢复的大尺寸独立图片
+        # （独立图片用于绑定，但不触发密集页路径，以免干扰 LLM 边界识别）
         eligible_imgs = [img for img in (images or []) if getattr(img, "search_eligible", False)]
-        if len(eligible_imgs) >= 20:
+        tile_composite_imgs = [img for img in eligible_imgs if getattr(img, "is_tile_composite", False)]
+        if len(tile_composite_imgs) >= 20:
             logger.info("dense_imageset_boundary_skip_llm",
-                        image_count=len(eligible_imgs),
+                        tile_composite_count=len(tile_composite_imgs),
+                        eligible_count=len(eligible_imgs),
                         text_block_count=len(text_blocks),
-                        reason="dense images >= 20, using image bboxes as boundaries directly")
+                        reason="tile composites >= 20, using image bboxes as boundaries directly")
             return self._rule_boundaries(text_blocks, text_roles, images=images)
 
         # 获取截图实际尺寸
@@ -203,11 +205,14 @@ class TwoStageExtractor:
         if not self._llm:
             return self._rule_extract(boundaries, raw)
 
-        # 密集图片目录页: 所有 boundary 无文字 + boundary 数 >= 20
-        # → 按行分割截图, 每行单独调 LLM, 避免全页截图太大导致 LLM 漏识别
+        # 密集图片目录页: boundary 数 >= 20 时按行/列分割处理
+        # 无论是否有文字，都使用 _extract_dense_by_rows：
+        #   - 自动检测列间隙（如双页并排），将页面拆为多个子区域
+        #   - 每组 4 格左右，避免 LLM 一次处理 20+ 格导致漏识别或错位
+        #   - source_bbox 精确对应各自图片 bbox，保证绑定正确
         _all_empty_text = all(not b.text_content for b in boundaries)
-        if _all_empty_text and len(boundaries) >= 20 and screenshot:
-            return await self._extract_per_cell(boundaries, raw, screenshot)
+        if len(boundaries) >= 20 and screenshot:
+            return await self._extract_dense_by_rows(boundaries, raw, screenshot)
 
         # 当所有 boundary 都没有文字时（如密集图片目录页），包含归一化 bbox
         # 让 LLM 能在截图中定位每个产品区域

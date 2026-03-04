@@ -1149,10 +1149,22 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
         composite_idx = 0
         for members in clusters.values():
             if len(members) == 1:
-                # 瓦片页中的独立碎片: 标记为碎片，不参与绑定
                 img = images[members[0]]
-                img.is_fragmented = True
-                img.search_eligible = False
+                # 计算该图片在 150 DPI 下的短边
+                if len(img.bbox) >= 4:
+                    _dw = (img.bbox[2] - img.bbox[0]) * dpi_scale
+                    _dh = (img.bbox[3] - img.bbox[1]) * dpi_scale
+                    _single_short = int(min(_dw, _dh))
+                else:
+                    _single_short = img.short_edge or 0
+                if _single_short >= 200:
+                    # 大尺寸独立图片: 不是碎片，保留为商品图
+                    img.is_fragmented = False
+                    img.search_eligible = True
+                else:
+                    # 小碎片: 标记为碎片，不参与绑定
+                    img.is_fragmented = True
+                    img.search_eligible = False
                 merged.append(img)
                 continue
 
@@ -1174,6 +1186,7 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                 height=int(dh),
                 short_edge=short,
                 search_eligible=short >= 200,
+                is_tile_composite=True,
                 role="unknown",
             )
             merged.append(composite)
