@@ -522,18 +522,6 @@ class ExcelExporter:
         headers = ["商品图片"] * n_img_cols + [kf[0] for kf in KEYWORD_FIELDS]
         _apply_header_style(ws, headers, n_img_cols=n_img_cols)
 
-        # 预计算: 同一 model_number 下 product_name 是否存在差异
-        # 若存在差异 → product_name 是真正的商品区分符（如"1人位"/"3人位"）
-        # 若所有 SKU 的 product_name 相同 → 是品牌/系列名（如"Wosi furniture"），不加入商品名称
-        from collections import defaultdict
-        _model_pnames: dict[str, set[str]] = defaultdict(set)
-        for _r in rows:
-            _mn = _get_field_value(_r.attributes, ['model_number', 'model', '型号'])
-            _pn = _get_field_value(_r.attributes, ['product_name', '产品名称', '品名', 'name'])
-            if _mn and _pn and _pn != _mn:
-                _model_pnames[_mn].add(_pn)
-        _model_pname_varies: dict[str, bool] = {mn: len(pns) > 1 for mn, pns in _model_pnames.items()}
-
         # 备用候选键（fallback）
         _FALLBACK_CANDIDATES: dict[str, list[str]] = {
             '售价':          ['unit_price', 'price', 'retail_price', '单价', '售价'],
@@ -551,19 +539,18 @@ class ExcelExporter:
         for row_idx, row in enumerate(rows, 2):
             attrs = row.attributes
 
-            # 商品名称/描述 = 型号 + 变体规格（如"1人位"）+ 品名（仅当品名是区分符时）+ 规格
-            # variant_label 优先作为规格区分符（如"1人位"/"2人位"/"3人位"）
-            # 品名是区分符的判定: 同 model_number 下存在多个不同 product_name
-            # 若全系列 product_name 相同（如"Wosi furniture"），则是品牌名，不加入
+            # 商品名称/描述 = 品名 + 型号 + 变体规格（如"1人位"）+ 规格
+            # 品名（product_name）由大模型识别，始终纳入字段（如"高箱"、"大床"）
             model = _get_field_value(attrs, ['model_number', 'model', '型号'])
             pname = _get_field_value(attrs, ['product_name', '产品名称', '品名', 'name'])
             size  = _get_field_value(attrs, ['size', 'spec', 'specification', '规格', '尺寸'])
             variant = row.variant_label  # e.g. "1人位", "2人位", "3人位"
-            name_parts = [model]
+            name_parts = []
+            if pname and pname != model:
+                name_parts.append(pname)
+            name_parts.append(model)
             if variant:
                 name_parts.append(variant)
-            if pname and pname != model and _model_pname_varies.get(model, False):
-                name_parts.append(pname)
             name_parts.append(size)
             product_name_val = " ".join(p for p in name_parts if p)
 

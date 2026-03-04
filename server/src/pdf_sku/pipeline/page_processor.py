@@ -16,6 +16,7 @@ import asyncio
 import math
 import hashlib
 import re
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 
 from pdf_sku.pipeline.ir import (
@@ -181,8 +182,19 @@ class PageProcessor:
             screenshot = b""
             if self._pool:
                 try:
+                    # 纯图片密集目录页（几乎无可提取文字 + 大量图片）→ 提升渲染 DPI
+                    # 150 DPI 下每个商品格约 5px 字体，LLM 难以读取，216 DPI 可提升 44%
+                    _raw_text_len = len((raw.raw_text or "").strip())
+                    _is_image_only = _raw_text_len < 30
+                    _is_dense = len(raw.images) >= 20
+                    _render_dpi = 216 if (_is_image_only and _is_dense) else 150
                     screenshot = await loop.run_in_executor(
-                        self._pool, _render_page_sync, file_path, page_no)
+                        self._pool, _render_page_sync, file_path, page_no, _render_dpi)
+                    if _render_dpi != 150:
+                        logger.info("screenshot_highres",
+                                    page=page_no, dpi=_render_dpi,
+                                    raw_text_len=_raw_text_len,
+                                    image_count=len(raw.images))
                 except Exception:
                     pass
             cls_result = await self._classifier.classify(
@@ -250,8 +262,13 @@ class PageProcessor:
 
             # ═══ Phase 8: 绑定 ═══
             # 坐标系对齐: image bbox 从 PDF points → 截图像素 (与 SKU source_bbox 同系)
-            RENDER_DPI = 150
-            scale = RENDER_DPI / 72.0
+            # 使用实际截图像素宽度推算缩放比，避免密集图片页以 216dpi 渲染时坐标错位
+            if screenshot and len(screenshot) >= 24 and screenshot[:4] == b'\x89PNG':
+                import struct as _struct
+                _ss_w = _struct.unpack('>I', screenshot[16:20])[0]
+                scale = _ss_w / max(1, raw.metadata.page_width or 1)
+            else:
+                scale = 150 / 72.0
             for img in raw.images:
                 if img.bbox != (0, 0, 0, 0):
                     img.bbox = (
@@ -262,7 +279,13 @@ class PageProcessor:
                     )
             eligible_images = [img for img in raw.images if img.search_eligible]
 
-            # source_bbox 修正: 用 PDF 文本块精确定位 SKU 位置
+            # source_bbox 坐标对齐: PDF pts → 截图像素
+            # 先无条件缩放，再用文字块覆盖有匹配的 SKU（文字块仅是精确修正，不影响无匹配的 SKU）
+            if skus:
+                for sku in skus:
+                    sb = sku.source_bbox
+                    if sb and sb != (0, 0, 0, 0):
+                        sku.source_bbox = (sb[0]*scale, sb[1]*scale, sb[2]*scale, sb[3]*scale)
             if raw.text_blocks and skus:
                 self._refine_sku_bboxes(skus, raw.text_blocks, scale)
 
@@ -285,7 +308,38 @@ class PageProcessor:
                 and bool(bindings)
                 and len({b.image_id for b in bindings if b.image_id}) == 1
             )
-            if ((few_text or low_quality_bind or all_same_single_image)
+            # 多图页但大量 SKU 集中于少数图片，其余图片无绑定 → 空间绑定失效
+            # （LLM boundary 把多个不同产品归入同一大 bbox，binder 全映射到中心最近图片）
+            _bound_img_counts = Counter(b.image_id for b in bindings if b.image_id)
+            _max_single_img_skus = max(_bound_img_counts.values(), default=0)
+            _unbound_img_count = len(eligible_images) - len(_bound_img_counts)
+            overcrowded_binding = (
+                len(eligible_images) >= 3
+                and len(skus) >= 3
+                and _max_single_img_skus > len(skus) * 0.4
+                and _unbound_img_count > 0
+            )
+            # 空间绑定已高质且无歧义 → 跳过 VLM rebind（纯图片密集页 source_bbox=image_bbox 精准匹配）
+            high_quality_spatial = (
+                avg_bind_conf >= 0.85
+                and not all_same_single_image
+                and not overcrowded_binding
+            )
+            logger.info("phase8_bind_decision",
+                        avg_bind_conf=round(avg_bind_conf, 3),
+                        few_text=few_text,
+                        low_quality_bind=low_quality_bind,
+                        all_same_single_image=all_same_single_image,
+                        overcrowded_binding=overcrowded_binding,
+                        max_single_img_skus=_max_single_img_skus,
+                        unbound_img_count=_unbound_img_count,
+                        high_quality_spatial=high_quality_spatial,
+                        n_bindings=len(bindings),
+                        n_skus=len(skus),
+                        n_eligible_imgs=len(eligible_images))
+            if (not high_quality_spatial
+                    and (few_text or low_quality_bind or all_same_single_image
+                         or overcrowded_binding)
                     and len(eligible_images) >= 1
                     and len(skus) >= 2 and screenshot and self._llm):
                 vlm_bindings = await self._vlm_rebind_composites(
@@ -1130,6 +1184,19 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                 images[m].is_fragmented = True
                 images[m].search_eligible = False
                 merged.append(images[m])
+
+        # 若没有任何聚类真正合并（composite_idx==0），说明图片间距较大，
+        # 是密集产品目录页（非真正瓦片页）。恢复原始图片，不做碎片标记。
+        # 同时对 short_edge >= 80 的图片强制 eligible（密集目录页小图也是商品图）。
+        if composite_idx == 0:
+            logger.info("tile_merge_skipped_no_clusters",
+                        original=len(images),
+                        reason="no adjacent fragments found, treating as dense catalog page")
+            for img in images:
+                img.is_fragmented = False
+                if img.short_edge >= 80:
+                    img.search_eligible = True
+            return images
 
         logger.info("tile_merge_result",
                      original=len(images),

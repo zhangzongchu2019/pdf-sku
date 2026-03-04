@@ -14,6 +14,39 @@ import structlog
 logger = structlog.get_logger()
 _parser = ResponseParser()
 
+DENSE_ANNOTATED_PROMPT = """This cropped catalog image shows {n} product cells labeled CELL-1 to CELL-{n} from left to right (red numbered boxes).
+
+Read the product label text beneath each red-boxed image. Each label shows:
+  product type : model_number
+  seat-count (人位) : size_in_mm   (or just "规格 : size")
+
+Return EXACTLY {n} entries in order (CELL-1 first, CELL-{n} last). Do NOT skip any cell.
+
+Respond ONLY with a JSON array:
+[
+  {{"cell": 1, "product_name": "沙发", "model_number": "LF302#", "size": "1110*860*900mm", "variant_label": "单人位"}},
+  {{"cell": 2, "product_name": "沙发", "model_number": "LF302#", "size": "1760*860*900mm", "variant_label": "双人位"}},
+  ...
+]
+
+Rules:
+- Return EXACTLY {n} objects, ordered cell 1 … {n}
+- variant_label: seat-count string if visible (单人位/双人位/三人位/四人位), else ""
+- ONE entry per cell even if label shows multiple sizes — use the size shown for that specific cell
+- If text is unclear, still return an entry; use whatever you can read or infer from the product image"""
+
+SINGLE_CELL_PROMPT = """This cropped catalog image shows a single product cell.
+Read the product label text visible (typically below or beside the product image).
+The label usually shows: product type, model number, variant (人位/seat count), size.
+
+Return ONLY a single JSON object:
+{{"product_name": "沙发", "model_number": "LF302#", "size": "1110*860*900mm", "variant_label": "单人位"}}
+
+Rules:
+- variant_label: seat-count string if visible (单人位/双人位/三人位/四人位), else ""
+- model_number: keep exactly as shown (e.g. "LF302#", "LF303#")
+- If text is unclear, return your best guess — do NOT return null or an empty object"""
+
 BOUNDARY_PROMPT_TEMPLATE = """Identify ALL product boundaries in this PDF catalog page image.
 The image dimensions are {img_w} x {img_h} pixels.
 
@@ -33,7 +66,11 @@ CRITICAL rule — how to count products:
   Each distinct 型号 entry = one separate product/SKU — even when two entries share the same
   model prefix (e.g. "A105*铁艺茶几" and "A105*功夫茶几" are TWO different products).
   NEVER merge different 型号 entries into a single SKU.
-- If raw OCR text is "(none)" or empty, extract all visible products from the image/screenshot.
+- If raw OCR text is "(none)" or empty (dense image-only page):
+  Each boundary has a "bbox_norm" field with normalized [x0, y0, x1, y1] coordinates (0.0-1.0)
+  indicating WHERE on the screenshot that product is located. Use this to locate and read the
+  product label/text in that specific region of the screenshot. Extract ONE product per boundary.
+  You MUST return an entry for EVERY boundary_id, even if the text is hard to read — do your best.
 - Only expand a SINGLE 型号 into multiple variant SKUs when that same 型号 has multiple
   different sizes/dimensions listed (e.g. "型号：WS-100 规格：1500/1800/2000mm" → 3 SKUs).
 
@@ -103,6 +140,17 @@ class TwoStageExtractor:
         if not self._llm:
             return self._rule_boundaries(text_blocks, text_roles, images=images)
 
+        # 密集图片目录页: 大量可检索图片（>=20）→ 跳过 LLM 边界识别，直接用图片 bbox 作边界
+        # 页码等少量文字不影响判断（页码文字块存在时 not text_blocks=False 原逻辑会误触发 LLM，
+        # 而 LLM 返回像素坐标边界，Phase 8 再次缩放会导致 source_bbox 双重缩放错误）
+        eligible_imgs = [img for img in (images or []) if getattr(img, "search_eligible", False)]
+        if len(eligible_imgs) >= 20:
+            logger.info("dense_imageset_boundary_skip_llm",
+                        image_count=len(eligible_imgs),
+                        text_block_count=len(text_blocks),
+                        reason="dense images >= 20, using image bboxes as boundaries directly")
+            return self._rule_boundaries(text_blocks, text_roles, images=images)
+
         # 获取截图实际尺寸
         img_w, img_h = image_size or (0, 0)
         if (not img_w or not img_h) and screenshot:
@@ -155,10 +203,29 @@ class TwoStageExtractor:
         if not self._llm:
             return self._rule_extract(boundaries, raw)
 
-        boundary_desc = [
-            {"boundary_id": b.boundary_id, "text": b.text_content[:1000]}
-            for b in boundaries
-        ]
+        # 密集图片目录页: 所有 boundary 无文字 + boundary 数 >= 20
+        # → 按行分割截图, 每行单独调 LLM, 避免全页截图太大导致 LLM 漏识别
+        _all_empty_text = all(not b.text_content for b in boundaries)
+        if _all_empty_text and len(boundaries) >= 20 and screenshot:
+            return await self._extract_per_cell(boundaries, raw, screenshot)
+
+        # 当所有 boundary 都没有文字时（如密集图片目录页），包含归一化 bbox
+        # 让 LLM 能在截图中定位每个产品区域
+        _all_empty_text = all(not b.text_content for b in boundaries)
+        _pw = (raw.metadata.page_width or 1)
+        _ph = (raw.metadata.page_height or 1)
+        boundary_desc = []
+        for b in boundaries:
+            item: dict = {"boundary_id": b.boundary_id, "text": b.text_content[:1000]}
+            if _all_empty_text and b.bbox and b.bbox != (0, 0, 0, 0):
+                # 归一化坐标 [0,1] (x0, y0, x1, y1)
+                item["bbox_norm"] = [
+                    round(b.bbox[0] / _pw, 3),
+                    round(b.bbox[1] / _ph, 3),
+                    round(b.bbox[2] / _pw, 3),
+                    round(b.bbox[3] / _ph, 3),
+                ]
+            boundary_desc.append(item)
 
         # 从 pdfplumber 提取的原始文本块（比 LLM 生成的 text_content 更完整准确）
         raw_text_lines = []
@@ -208,6 +275,445 @@ class TwoStageExtractor:
             logger.warning("attr_extract_failed", error=str(e))
 
         return self._rule_extract(boundaries, raw)
+
+    async def _extract_dense_by_rows(
+        self,
+        boundaries: list[SKUBoundary],
+        raw: ParsedPageIR,
+        screenshot: bytes,
+    ) -> list[SKUResult]:
+        """密集图片目录页按行/列分组提取。
+
+        将 boundary 按 Y 坐标分组为多行，并检测垂直列间隙（如双页并排 PDF）。
+        若检测到列分隔则每行再按左/右列分别裁剪，使每次 LLM 只看 ~4 个产品，
+        识别率显著优于全行 8 产品处理。
+        """
+        import io
+        try:
+            from PIL import Image as PILImage
+        except ImportError:
+            logger.warning("PIL not available, falling back to full-page extraction")
+            return await self._extract_full_page(boundaries, raw, screenshot)
+
+        # 检测垂直列间隙（如双页并排 PDF）
+        col_split_x = self._detect_column_split(boundaries)
+
+        # 按行分组: 自适应 gap = 边界框高度中位数 × 0.3（最小 15pt）
+        heights = [b.bbox[3] - b.bbox[1] for b in boundaries if b.bbox[3] > b.bbox[1]]
+        heights.sort()
+        median_h = heights[len(heights) // 2] if heights else 80.0
+        adaptive_gap = max(15.0, median_h * 0.3)
+        rows = self._group_boundaries_by_row(boundaries, gap=adaptive_gap)
+        logger.info("dense_row_split", page=raw.page_no,
+                    total_boundaries=len(boundaries), row_count=len(rows),
+                    adaptive_gap=round(adaptive_gap, 1),
+                    col_split_x=round(col_split_x, 1) if col_split_x is not None else None)
+
+        # 页面/截图尺寸及缩放比
+        img = PILImage.open(io.BytesIO(screenshot))
+        img_w, img_h = img.size
+        pw = raw.metadata.page_width or 1
+        ph = raw.metadata.page_height or 1
+        scale_x = img_w / pw
+        scale_y = img_h / ph
+
+        # 文字标签在图片下方的估算高度（向下扩展以包含型号/尺寸文字）
+        TEXT_MARGIN_PT = 70
+
+        all_results: list[SKUResult] = []
+
+        for row_idx, row_bounds in enumerate(rows):
+            # 行在 PDF 坐标中的范围
+            row_y0 = min(b.bbox[1] for b in row_bounds)
+            row_y1 = max(b.bbox[3] for b in row_bounds)
+            crop_y0_pt = max(0.0, row_y0 - 5)
+            crop_y1_pt = min(ph, row_y1 + TEXT_MARGIN_PT)
+            row_h_pt = max(1.0, crop_y1_pt - crop_y0_pt)
+            crop_py0 = max(0, int(crop_y0_pt * scale_y))
+            crop_py1 = min(img_h, int(crop_y1_pt * scale_y))
+
+            # 按列分组: 有列间隙则左/右各一组，否则整行一组
+            if col_split_x is not None:
+                col_groups = [
+                    [b for b in row_bounds if (b.bbox[0] + b.bbox[2]) / 2 < col_split_x],
+                    [b for b in row_bounds if (b.bbox[0] + b.bbox[2]) / 2 >= col_split_x],
+                ]
+            else:
+                col_groups = [row_bounds]
+
+            for col_idx, group_bounds in enumerate(col_groups):
+                if not group_bounds:
+                    continue
+
+                # 列组 X 范围（略向两侧扩展以包含边框/文字）
+                grp_x0_pt = max(0.0, min(b.bbox[0] for b in group_bounds) - 5)
+                grp_x1_pt = min(pw, max(b.bbox[2] for b in group_bounds) + 5)
+                grp_w_pt = max(1.0, grp_x1_pt - grp_x0_pt)
+                crop_px0 = max(0, int(grp_x0_pt * scale_x))
+                crop_px1 = min(img_w, int(grp_x1_pt * scale_x))
+
+                row_img = img.crop((crop_px0, crop_py0, crop_px1, crop_py1))
+
+                # 在裁剪图上标注编号红框（提高 LLM 对每个产品格的定位精度）
+                annotated_img, cell_map = self._annotate_group_cells(
+                    row_img,
+                    group_bounds,
+                    grp_x0_pt, crop_y0_pt, grp_w_pt, row_h_pt,
+                )
+                buf = io.BytesIO()
+                annotated_img.save(buf, format="PNG")
+                row_screenshot = buf.getvalue()
+
+                n = len(cell_map)
+                prompt = DENSE_ANNOTATED_PROMPT.format(n=n)
+
+                try:
+                    resp = await self._llm.call_llm(
+                        operation="extract_sku_dense_annotated",
+                        prompt=prompt,
+                        images=[row_screenshot],
+                    )
+                    parsed = _parser.parse(resp.text, expected_type="array")
+                    if parsed.success and isinstance(parsed.data, list):
+                        # LLM 按顺序返回 CELL-1…CELL-N；按索引对应 cell_map（左→右）
+                        for cell_idx, boundary in enumerate(cell_map):
+                            if cell_idx >= len(parsed.data):
+                                break
+                            item = parsed.data[cell_idx]
+                            bbox = boundary.bbox
+                            bid = boundary.boundary_id
+                            if "products" in item:
+                                all_results.extend(
+                                    self._parse_products(item["products"], bid, bbox))
+                            else:
+                                attrs: dict = {}
+                                for key in ("product_name", "model_number", "size",
+                                            "material", "color", "price"):
+                                    v = item.get(key, "")
+                                    if v:
+                                        attrs[key] = str(v)
+                                variant_label = item.get("variant_label", "")
+                                validity = "valid" if (
+                                    attrs.get("model_number") or attrs.get("size")
+                                ) else "invalid"
+                                all_results.append(SKUResult(
+                                    attributes=attrs,
+                                    source_bbox=bbox,
+                                    validity=validity,
+                                    confidence=0.75,
+                                    extraction_method="two_stage_dense_annotated",
+                                    variant_label=variant_label if isinstance(
+                                        variant_label, str) else "",
+                                ))
+                        logger.info("dense_row_col_extracted",
+                                    page=raw.page_no, row=row_idx + 1, col=col_idx + 1,
+                                    boundaries=n, returned=len(parsed.data),
+                                    total_so_far=len(all_results))
+                except Exception as e:
+                    logger.warning("dense_row_extract_failed",
+                                   page=raw.page_no, row=row_idx + 1,
+                                   col=col_idx + 1, error=str(e))
+
+        return all_results
+
+    @staticmethod
+    def _annotate_group_cells(
+        img: "PILImage",
+        group_bounds: list[SKUBoundary],
+        grp_x0_pt: float,
+        crop_y0_pt: float,
+        grp_w_pt: float,
+        row_h_pt: float,
+    ) -> tuple["PILImage", list[SKUBoundary]]:
+        """在裁剪图上按左→右顺序标注编号红框（CELL-1, CELL-2, ...）。
+
+        按 X 坐标从左到右排序 group_bounds，在每个 boundary 对应的像素区域
+        绘制红色矩形框和 CELL-N 标签，帮助 LLM 明确识别每个产品格。
+        标注框从图片顶部延伸到裁剪图底部（含文字标签区域）。
+
+        Returns:
+            (annotated_image, sorted_boundaries_left_to_right)
+        """
+        try:
+            from PIL import ImageDraw, ImageFont
+        except ImportError:
+            return img, group_bounds
+
+        img_w, img_h = img.size
+        scale_x = img_w / max(1.0, grp_w_pt)
+        scale_y = img_h / max(1.0, row_h_pt)
+
+        # 按 X 中心从左到右排序
+        sorted_bounds = sorted(
+            group_bounds,
+            key=lambda b: (b.bbox[0] + b.bbox[2]) / 2,
+        )
+
+        annotated = img.copy()
+        draw = ImageDraw.Draw(annotated)
+        try:
+            font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
+        except Exception:
+            font = ImageFont.load_default()
+
+        for idx, b in enumerate(sorted_bounds):
+            # PDF pt → 裁剪图像素
+            px0 = max(0, int((b.bbox[0] - grp_x0_pt) * scale_x))
+            py0 = max(0, int((b.bbox[1] - crop_y0_pt) * scale_y))
+            px1 = min(img_w, int((b.bbox[2] - grp_x0_pt) * scale_x))
+            # 延伸到裁剪图底部，包含图片下方的文字标签区域
+            py1 = img_h
+            label = f"CELL-{idx + 1}"
+            draw.rectangle([px0, py0, px1, py1], outline="red", width=3)
+            lbl_w = max(80, len(label) * 14)
+            draw.rectangle([px0, py0, px0 + lbl_w, py0 + 30], fill="red")
+            draw.text((px0 + 4, py0 + 4), label, fill="white", font=font)
+
+        return annotated, sorted_bounds
+
+    @staticmethod
+    def _detect_column_split(boundaries: list[SKUBoundary]) -> float | None:
+        """检测 boundary 集合中是否存在垂直列间隙（如双页并排 PDF）。
+
+        扫描所有 boundary 的 X 范围，找最宽的无覆盖间隔：
+        - 间隔宽度 > 50pt
+        - 间隔中心位于页面横向 30%~70% 之间
+        满足以上条件时返回间隔中点 X 坐标作为列分隔线；否则返回 None。
+        """
+        if not boundaries:
+            return None
+
+        x_intervals = [
+            (b.bbox[0], b.bbox[2]) for b in boundaries
+            if len(b.bbox) >= 4 and b.bbox[2] > b.bbox[0]
+        ]
+        if not x_intervals:
+            return None
+
+        x_min = min(x for x, _ in x_intervals)
+        x_max = max(x for _, x in x_intervals)
+        page_width = x_max - x_min
+        if page_width < 100:
+            return None
+
+        # 以 10pt 分辨率构建 X 轴覆盖位图
+        BIN = 10
+        n_bins = int(page_width / BIN) + 2
+        covered = [False] * n_bins
+        for x0, x1 in x_intervals:
+            b0 = max(0, int((x0 - x_min) / BIN))
+            b1 = min(n_bins - 1, int((x1 - x_min) / BIN))
+            for b in range(b0, b1 + 1):
+                covered[b] = True
+
+        # 找最宽的连续空白段
+        best_gap_start = -1.0
+        best_gap_end = -1.0
+        best_gap_width = 0.0
+        in_gap = False
+        gap_start_bin = 0
+        for i, is_covered in enumerate(covered):
+            if not is_covered:
+                if not in_gap:
+                    in_gap = True
+                    gap_start_bin = i
+            else:
+                if in_gap:
+                    in_gap = False
+                    gap_w = (i - gap_start_bin) * BIN
+                    if gap_w > best_gap_width:
+                        best_gap_width = gap_w
+                        best_gap_start = gap_start_bin * BIN + x_min
+                        best_gap_end = i * BIN + x_min
+        if in_gap:
+            gap_w = (n_bins - gap_start_bin) * BIN
+            if gap_w > best_gap_width:
+                best_gap_width = gap_w
+                best_gap_start = gap_start_bin * BIN + x_min
+                best_gap_end = n_bins * BIN + x_min
+
+        if best_gap_width < 50:
+            return None
+
+        gap_center = (best_gap_start + best_gap_end) / 2
+        gap_pos = (gap_center - x_min) / page_width
+        if not (0.3 <= gap_pos <= 0.7):
+            return None
+
+        return gap_center
+
+    async def _extract_full_page(
+        self,
+        boundaries: list[SKUBoundary],
+        raw: ParsedPageIR,
+        screenshot: bytes,
+    ) -> list[SKUResult]:
+        """全页提取（_extract_dense_by_rows 的 fallback）。"""
+        pw = raw.metadata.page_width or 1
+        ph = raw.metadata.page_height or 1
+        boundary_desc = []
+        for b in boundaries:
+            item: dict = {"boundary_id": b.boundary_id, "text": ""}
+            if b.bbox and b.bbox != (0, 0, 0, 0):
+                item["bbox_norm"] = [
+                    round(b.bbox[0] / pw, 3),
+                    round(b.bbox[1] / ph, 3),
+                    round(b.bbox[2] / pw, 3),
+                    round(b.bbox[3] / ph, 3),
+                ]
+            boundary_desc.append(item)
+        try:
+            prompt = ATTR_PROMPT.format(boundaries=str(boundary_desc), raw_text="(none)")
+            resp = await self._llm.call_llm(
+                operation="extract_sku_attrs",
+                prompt=prompt,
+                images=[screenshot],
+            )
+            parsed = _parser.parse(resp.text, expected_type="array")
+            if parsed.success and isinstance(parsed.data, list):
+                results = []
+                for item in parsed.data:
+                    bid = item.get("boundary_id", 0)
+                    boundary = next((b for b in boundaries if b.boundary_id == bid), None)
+                    bbox = boundary.bbox if boundary else (0, 0, 0, 0)
+                    if "products" in item:
+                        results.extend(self._parse_products(item["products"], bid, bbox))
+                    else:
+                        attrs = item.get("attributes", {})
+                        validity = "valid" if attrs.get("product_name") else "invalid"
+                        results.append(SKUResult(
+                            attributes=attrs, source_bbox=bbox, validity=validity,
+                            extraction_method="two_stage",
+                        ))
+                return results
+        except Exception as e:
+            logger.warning("full_page_extract_failed", error=str(e))
+        return self._rule_extract(boundaries, raw)
+
+    async def _extract_per_cell(
+        self,
+        boundaries: list[SKUBoundary],
+        raw: ParsedPageIR,
+        screenshot: bytes,
+    ) -> list[SKUResult]:
+        """密集图片目录页逐格提取：每个 boundary 单独裁剪 + 单独 LLM 调用。
+
+        相比分组方式（4格/次），逐格方式消除了 LLM 跳格或错位的风险，
+        确保每个 SKU 都有独立的 LLM 调用且 source_bbox 精确对应。
+        """
+        import io
+        try:
+            from PIL import Image as PILImage
+        except ImportError:
+            logger.warning("PIL not available, falling back to full-page extraction")
+            return await self._extract_full_page(boundaries, raw, screenshot)
+
+        img = PILImage.open(io.BytesIO(screenshot))
+        img_w, img_h = img.size
+        pw = raw.metadata.page_width or 1
+        ph = raw.metadata.page_height or 1
+        scale_x = img_w / pw
+        scale_y = img_h / ph
+
+        TEXT_MARGIN_PT = 70  # 向下扩展包含图片下方文字标签
+
+        # 按 Y 后 X 排序（从左上到右下）
+        sorted_bounds = sorted(boundaries, key=lambda b: (b.bbox[1], b.bbox[0]))
+
+        all_results: list[SKUResult] = []
+        for cell_idx, boundary in enumerate(sorted_bounds):
+            x0, y0, x1, y1 = boundary.bbox
+            crop_y1_pt = min(ph, y1 + TEXT_MARGIN_PT)
+
+            px0 = max(0, int(x0 * scale_x))
+            py0 = max(0, int(y0 * scale_y))
+            px1 = min(img_w, int(x1 * scale_x))
+            py1 = min(img_h, int(crop_y1_pt * scale_y))
+
+            if px1 <= px0 or py1 <= py0:
+                logger.warning("per_cell_zero_size", cell=cell_idx + 1,
+                               boundary_id=boundary.boundary_id)
+                continue
+
+            cell_img = img.crop((px0, py0, px1, py1))
+            buf = io.BytesIO()
+            cell_img.save(buf, format="PNG")
+            cell_screenshot = buf.getvalue()
+
+            try:
+                resp = await self._llm.call_llm(
+                    operation="extract_sku_single_cell",
+                    prompt=SINGLE_CELL_PROMPT,
+                    images=[cell_screenshot],
+                )
+                parsed = _parser.parse(resp.text, expected_type="object")
+                # 兼容 LLM 返回单元素数组的情况
+                item = None
+                if parsed.success and isinstance(parsed.data, dict):
+                    item = parsed.data
+                elif parsed.success and isinstance(parsed.data, list) and len(parsed.data) == 1:
+                    item = parsed.data[0]
+
+                if item:
+                    attrs: dict = {}
+                    for key in ("product_name", "model_number", "size",
+                                "material", "color", "price"):
+                        v = item.get(key, "")
+                        if v:
+                            attrs[key] = str(v)
+                    variant_label = item.get("variant_label", "")
+                    validity = "valid" if (
+                        attrs.get("model_number") or attrs.get("size")
+                    ) else "invalid"
+                    all_results.append(SKUResult(
+                        attributes=attrs,
+                        source_bbox=boundary.bbox,
+                        validity=validity,
+                        confidence=0.8,
+                        extraction_method="two_stage_per_cell",
+                        variant_label=variant_label if isinstance(variant_label, str) else "",
+                    ))
+                    logger.info("per_cell_extracted",
+                                page=raw.page_no, cell=cell_idx + 1,
+                                total=len(sorted_bounds),
+                                boundary_id=boundary.boundary_id,
+                                model_number=attrs.get("model_number", ""),
+                                variant_label=variant_label)
+                else:
+                    logger.warning("per_cell_parse_failed",
+                                   cell=cell_idx + 1,
+                                   boundary_id=boundary.boundary_id,
+                                   raw_text=resp.text[:200] if resp.text else "")
+            except Exception as e:
+                logger.warning("per_cell_extract_failed",
+                               cell=cell_idx + 1,
+                               boundary_id=boundary.boundary_id,
+                               error=str(e))
+
+        logger.info("per_cell_complete",
+                    page=raw.page_no,
+                    total_boundaries=len(sorted_bounds),
+                    total_skus=len(all_results))
+        return all_results
+
+    @staticmethod
+    def _group_boundaries_by_row(
+        boundaries: list[SKUBoundary],
+        gap: float = 60,
+    ) -> list[list[SKUBoundary]]:
+        """按 Y 坐标将 boundary 分组为行（相邻 boundary Y 间距 > gap 则换行）。"""
+        if not boundaries:
+            return []
+        sorted_b = sorted(boundaries, key=lambda b: b.bbox[1])
+        rows: list[list[SKUBoundary]] = [[sorted_b[0]]]
+        for b in sorted_b[1:]:
+            prev_y_bottom = max(bb.bbox[3] for bb in rows[-1])
+            if b.bbox[1] - prev_y_bottom > gap:
+                rows.append([b])
+            else:
+                rows[-1].append(b)
+        return rows
 
     @staticmethod
     def _parse_products(
@@ -399,20 +905,22 @@ class TwoStageExtractor:
         images: list | None = None,
     ) -> list[SKUBoundary]:
         """规则兜底: 优先用图片锚点聚类，否则 Y-gap 分组。"""
-        if not text_blocks:
-            return []
-
-        # 筛选锚点图片: search_eligible 且非重复
+        # 纯图片页（无文字）: 不过滤 is_duplicate，因为密集目录中相同外观的图
+        # 可能对应不同尺寸规格，每张图片位置都代表一个独立 SKU
+        is_text_empty = not text_blocks
         anchors = [
             img for img in (images or [])
             if getattr(img, "search_eligible", False)
-            and not getattr(img, "is_duplicate", False)
+            and (is_text_empty or not getattr(img, "is_duplicate", False))
         ]
 
         if len(anchors) >= 2:
-            result = self._image_anchor_boundaries(text_blocks, anchors)
+            result = self._image_anchor_boundaries(text_blocks or [], anchors)
             if result:
                 return result
+
+        if not text_blocks:
+            return []
 
         # 退回 Y-gap 法
         return self._ygap_boundaries(text_blocks)
@@ -530,6 +1038,12 @@ class TwoStageExtractor:
         for i, anchor in enumerate(anchors):
             blocks = groups[i]
             if not blocks:
+                # 无关联文字块时: 直接用图片 bbox 作边界（密集图片目录页）
+                boundaries.append(SKUBoundary(
+                    boundary_id=len(boundaries) + 1,
+                    bbox=anchor.bbox,
+                    text_content="",
+                ))
                 continue
             # 合并图片 bbox 与文字 bbox
             all_x0 = min(anchor.bbox[0], min(b.bbox[0] for b in blocks))
