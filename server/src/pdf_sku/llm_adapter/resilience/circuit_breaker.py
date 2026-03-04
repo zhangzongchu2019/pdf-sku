@@ -24,10 +24,10 @@ class CircuitState(StrEnum):
 class CircuitBreaker:
     def __init__(
         self,
-        failure_threshold: int = 5,
+        failure_threshold: int = 30,
         success_threshold: int = 2,
         open_timeout: float = 60.0,
-        window_size: int = 20,
+        window_size: int = 60,
     ) -> None:
         self._failure_threshold = failure_threshold
         self._success_threshold = success_threshold

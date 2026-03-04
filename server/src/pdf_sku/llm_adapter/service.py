@@ -15,7 +15,8 @@ from pdf_sku.llm_adapter.resilience.budget_guard import BudgetGuard
 from pdf_sku.llm_adapter.resilience.rate_limiter import RateLimiter
 from pdf_sku.evaluator.scorer import PageScore
 from pdf_sku.llm_adapter.provider_config import get_provider_config, get_provider_entries
-from pdf_sku.common.exceptions import LLMCircuitOpenError, RetryableError
+from pdf_sku.common.exceptions import LLMCircuitOpenError, LLMRateLimitedError, RetryableError
+import httpx
 import structlog
 
 logger = structlog.get_logger()
@@ -188,10 +189,17 @@ class LLMService:
                 )
                 self._last_used_provider = provider_name
                 return resp
-            except LLMCircuitOpenError:
-                raise  # 不 fallback
+            except LLMCircuitOpenError as e:
+                # 熔断器开启时，fallback 到下一个 provider，而非立即失败
+                last_error = e
+                logger.warning("llm_provider_circuit_open_fallback",
+                               provider=provider_name, operation=operation)
+                continue
             except Exception as e:
                 last_error = e
+                # provider 真实失败（非熔断器拒绝）→ 记录一次熔断失败
+                # 注意: 若下一个 provider 成功，此失败已记录但后续 record_success 会推动恢复
+                self._circuit.record_failure()
                 logger.warning("llm_provider_failed",
                                provider=provider_name, operation=operation,
                                error=repr(e))
@@ -315,13 +323,21 @@ class LLMService:
 
             except LLMCircuitOpenError:
                 raise  # 不重试
+            except LLMRateLimitedError:
+                raise  # 内部限流不计入熔断失败，直接上抛
             except Exception as e:
-                self._circuit.record_failure()
+                # HTTP 429: 外部 API 速率限制，不计入熔断，使用更长退避重试
+                is_rate_limit = (
+                    isinstance(e, httpx.HTTPStatusError)
+                    and e.response.status_code == 429
+                )
+                # 熔断失败由 _call_llm 在 provider 完全放弃时统一记录，此处不记
                 if attempt < max_retries:
-                    backoff = 2 ** attempt * 3  # 3s, 6s
+                    backoff = (2 ** attempt * 15) if is_rate_limit else (2 ** attempt * 3)
                     logger.warning("llm_call_retry",
                                     attempt=attempt + 1, error=repr(e),
                                     operation=operation, backoff_s=backoff,
+                                    is_rate_limit=is_rate_limit,
                                     provider=client_name)
                     await asyncio.sleep(backoff)
                     continue

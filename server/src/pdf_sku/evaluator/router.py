@@ -163,7 +163,7 @@ class EvaluatorService:
         sample_pages = self._sampler.select_pages(
             total=job.total_pages,
             blank_pages=job.blank_pages or [],
-            threshold=40,
+            threshold=5,
         )
         if not sample_pages:
             return await self._create_degraded(

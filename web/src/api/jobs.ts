@@ -64,6 +64,8 @@ export const jobsApi = {
 
   cancel: (jobId: string) => api.post<Job>(`/jobs/${jobId}/cancel`),
   retry: (jobId: string) => api.post<Job>(`/jobs/${jobId}/requeue`),
+  reprocessAI: (jobId: string) =>
+    api.post<{ job_id: string; queued: boolean; route: string }>(`/ops/jobs/${jobId}/reprocess-ai`),
   delete: (jobId: string) => api.delete<void>(`/ops/jobs/${jobId}`),
 
   getPages: async (jobId: string) => {

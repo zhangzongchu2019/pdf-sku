@@ -23,7 +23,7 @@ logger = structlog.get_logger()
 _evaluator_service = None
 _db_session_factory = None
 
-EVAL_TIMEOUT_SECONDS = 300  # 5 分钟超时
+EVAL_TIMEOUT_SECONDS = 1200  # 20 分钟超时 (最大40页采样 / 3张每批 ≈ 14批 × 最长180s/批)
 
 # 正在运行的评估任务注册表 job_id → asyncio.Task
 _active_tasks: dict[str, asyncio.Task] = {}

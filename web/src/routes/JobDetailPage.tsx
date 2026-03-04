@@ -106,6 +106,7 @@ export default function JobDetailPage() {
   const [showTimeline, setShowTimeline] = useState(false);
   const [activities, setActivities] = useState<ActivityEntry[]>([]);
   const [exporting, setExporting] = useState(false);
+  const [reprocessing, setReprocessing] = useState(false);
   const actIdRef = useRef(0);
 
   // 裁剪模式状态
@@ -229,7 +230,39 @@ export default function JobDetailPage() {
           <Link to="/jobs" className="back-link">← 返回列表</Link>
           <h2>{job.source_file}</h2>
         </div>
-        <StatusBadge status={job.user_status} />
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <StatusBadge status={job.user_status} />
+          <button
+            onClick={async () => {
+              if (reprocessing || !jobId) return;
+              if (!window.confirm("确认重新分析该 PDF？将清空现有 SKU 和图片数据后重新提取。")) return;
+              setReprocessing(true);
+              try {
+                await jobsApi.reprocessAI(jobId);
+                await fetchJob(jobId);
+                await fetchPages(jobId);
+              } catch (e) {
+                console.error("重新分析失败:", e);
+                alert("重新分析失败，请稍后重试");
+              } finally {
+                setReprocessing(false);
+              }
+            }}
+            disabled={reprocessing}
+            style={{
+              padding: "5px 14px",
+              backgroundColor: reprocessing ? "#1E293B" : "#1D4ED8",
+              border: "none",
+              borderRadius: 4,
+              color: reprocessing ? "#475569" : "#fff",
+              cursor: reprocessing ? "not-allowed" : "pointer",
+              fontSize: 13,
+              fontWeight: 500,
+            }}
+          >
+            {reprocessing ? "⏳ 提交中..." : "🔄 重新分析"}
+          </button>
+        </div>
       </div>
 
       <div className="job-meta">

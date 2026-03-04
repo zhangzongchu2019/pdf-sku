@@ -148,19 +148,29 @@ class PageProcessor:
                                 page_height=round(page_h, 1))
 
             # ═══ Phase 2a3: 过滤全页背景图 ═══
-            # 覆盖 >80% 页面面积的图片是页面背景/装饰，不应绑定给 SKU
+            # 覆盖 >80% 页面面积的图片通常是装饰背景，不应绑定给 SKU。
+            # 但若该图是页面上的唯一商品图（全页商品展示图），则保留为商品图。
             page_w = raw.metadata.page_width
             page_area = max(1.0, page_w * page_h)
+            eligible_imgs = [i for i in raw.images if i.search_eligible and len(i.bbox) >= 4]
             for img in raw.images:
                 if not img.search_eligible or len(img.bbox) < 4:
                     continue
                 img_area = abs(img.bbox[2] - img.bbox[0]) * abs(img.bbox[3] - img.bbox[1])
                 if img_area / page_area > 0.8:
-                    img.search_eligible = False
-                    img.role = "background"
-                    logger.info("image_fullpage_background_excluded",
-                                page=page_no, image_id=img.image_id,
-                                coverage=round(img_area / page_area, 2))
+                    # 仅当页面上还有其他合格图片时才视为背景并过滤
+                    # 若是唯一合格图片，保留为商品展示图
+                    other_eligible = [i for i in eligible_imgs if i.image_id != img.image_id]
+                    if other_eligible:
+                        img.search_eligible = False
+                        img.role = "background"
+                        logger.info("image_fullpage_background_excluded",
+                                    page=page_no, image_id=img.image_id,
+                                    coverage=round(img_area / page_area, 2))
+                    else:
+                        logger.info("image_fullpage_product_kept",
+                                    page=page_no, image_id=img.image_id,
+                                    coverage=round(img_area / page_area, 2))
 
             # ═══ Phase 2b: 瓦片碎片聚类合并 ═══
             raw.images = self._merge_tile_fragments(raw.images, page_no)

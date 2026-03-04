@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useJobStore } from "../stores/jobStore";
+import { jobsApi } from "../api/jobs";
 import StatusBadge from "../components/common/StatusBadge";
 import Pagination from "../components/common/Pagination";
 import Loading from "../components/common/Loading";
@@ -13,6 +14,22 @@ export default function JobListPage() {
   const { jobs, total, loading, fetchJobs, cancelJob, deleteJob } = useJobStore();
   const [filter, setFilter] = useState("");
   const [page, setPage] = useState(1);
+  const [reprocessingId, setReprocessingId] = useState<string | null>(null);
+
+  const handleReprocess = async (jobId: string) => {
+    if (reprocessingId) return;
+    if (!window.confirm("确认重新分析该 PDF？将清空现有 SKU 和图片数据后重新提取。")) return;
+    setReprocessingId(jobId);
+    try {
+      await jobsApi.reprocessAI(jobId);
+      await fetchJobs({ status: filter || undefined, page });
+    } catch (e) {
+      console.error("重新分析失败:", e);
+      alert("重新分析失败，请稍后重试");
+    } finally {
+      setReprocessingId(null);
+    }
+  };
 
   useEffect(() => {
     fetchJobs({ status: filter || undefined, page });
@@ -69,8 +86,16 @@ export default function JobListPage() {
                       <button className="btn btn-text btn-sm" onClick={() => useJobStore.getState().retryJob(job.job_id)}>重试</button>
                     )}
                     <button
+                      className="btn btn-text btn-sm"
+                      style={{ marginLeft: 4, color: "#60A5FA" }}
+                      disabled={reprocessingId === job.job_id}
+                      onClick={() => handleReprocess(job.job_id)}
+                    >
+                      {reprocessingId === job.job_id ? "⏳" : "🔄 重新分析"}
+                    </button>
+                    <button
                       className="btn btn-danger btn-sm"
-                      style={{ marginLeft: 8 }}
+                      style={{ marginLeft: 4 }}
                       onClick={async () => {
                         if (!window.confirm("确认删除该任务？将同时删除关联页面/SKU/标注数据，且不可恢复")) return;
                         await deleteJob(job.job_id);
