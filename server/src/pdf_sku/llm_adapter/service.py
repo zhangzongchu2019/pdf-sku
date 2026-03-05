@@ -224,9 +224,10 @@ class LLMService:
         if entries:
             # 按 Redis 优先级构建链（已按 priority 排序）
             chain: list[str] = []
-            if client_name:
-                # 指定的 client 优先
-                chain.append(client_name)
+            # 指定的 client 或 default_client 优先
+            preferred = client_name or self._default_client
+            if preferred:
+                chain.append(preferred)
             for entry in entries:
                 if entry.enabled and entry.name not in chain:
                     chain.append(entry.name)
@@ -250,6 +251,8 @@ class LLMService:
     ) -> LLMResponse:
         """Call a single provider with retries."""
         client = get_client(client_name)
+        if client is None:
+            raise RetryableError(f"LLM client '{client_name}' not registered")
 
         # Dynamic per-provider config:
         # 优先从 pdf_sku:llm_providers（按 entry.name 精确匹配），

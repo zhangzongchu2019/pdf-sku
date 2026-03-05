@@ -12,7 +12,12 @@ interface JobRowProps {
 }
 
 export function JobRow({ job, selected, onSelect, onClick }: JobRowProps) {
-  const completedCount = job.ai_pages.length + job.human_pages.length;
+  const completedCount =
+    job.blank_pages.length +
+    job.ai_pages.length +
+    job.human_pages.length +
+    (job.failed_pages?.length ?? 0) +
+    (job.skipped_pages?.length ?? 0);
   const progress =
     job.total_pages > 0
       ? Math.round((completedCount / job.total_pages) * 100)

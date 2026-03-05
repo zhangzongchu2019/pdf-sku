@@ -81,34 +81,33 @@ async def _run_evaluation(job_id: str, prescan_data: dict) -> None:
         logger.error("evaluator_not_initialized")
         return
 
+    async def _do_eval():
+        async with _db_session_factory() as db:
+            async with db.begin():
+                await update_job_status(
+                    db, job_id, JobInternalStatus.EVALUATING.value,
+                    trigger="eval_start")
+
+                result = await db.execute(
+                    select(PDFJob).where(PDFJob.job_id == UUID(job_id))
+                )
+                job = result.scalar_one_or_none()
+                if not job:
+                    logger.error("eval_job_not_found", job_id=job_id)
+                    return
+
+                eval_result = await _evaluator_service.evaluate(
+                    db=db, job=job, prescan_data=prescan_data)
+
+                logger.info("eval_task_complete",
+                            job_id=job_id,
+                            route=eval_result.get("route"),
+                            c_doc=eval_result.get("doc_confidence"))
+
     try:
-        async with asyncio.timeout(EVAL_TIMEOUT_SECONDS):
-            async with _db_session_factory() as db:
-                async with db.begin():
-                    # 更新状态: UPLOADED → EVALUATING
-                    await update_job_status(
-                        db, job_id, JobInternalStatus.EVALUATING.value,
-                        trigger="eval_start")
+        await asyncio.wait_for(_do_eval(), timeout=EVAL_TIMEOUT_SECONDS)
 
-                    # 获取 Job
-                    result = await db.execute(
-                        select(PDFJob).where(PDFJob.job_id == UUID(job_id))
-                    )
-                    job = result.scalar_one_or_none()
-                    if not job:
-                        logger.error("eval_job_not_found", job_id=job_id)
-                        return
-
-                    # 执行评估
-                    eval_result = await _evaluator_service.evaluate(
-                        db=db, job=job, prescan_data=prescan_data)
-
-                    logger.info("eval_task_complete",
-                                job_id=job_id,
-                                route=eval_result.get("route"),
-                                c_doc=eval_result.get("doc_confidence"))
-
-    except TimeoutError:
+    except asyncio.TimeoutError:
         logger.error("eval_task_timeout", job_id=job_id,
                       timeout_sec=EVAL_TIMEOUT_SECONDS)
         await _mark_eval_failed(job_id, "Evaluation timed out after "

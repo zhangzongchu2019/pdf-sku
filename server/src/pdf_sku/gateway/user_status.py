@@ -84,15 +84,8 @@ async def refresh_job_page_stats(db: AsyncSession, job_id: str) -> PDFJob:
         status_pages[row[0]] = sorted(row[1])
 
     job.blank_pages = status_pages.get(PageStatus.BLANK.value, [])
-    job.ai_pages = sorted(
-        status_pages.get(PageStatus.AI_COMPLETED.value, []) +
-        status_pages.get(PageStatus.AI_PROCESSING.value, [])
-    )
-    job.human_pages = sorted(
-        status_pages.get(PageStatus.HUMAN_QUEUED.value, []) +
-        status_pages.get(PageStatus.HUMAN_PROCESSING.value, []) +
-        status_pages.get(PageStatus.HUMAN_COMPLETED.value, [])
-    )
+    job.ai_pages = status_pages.get(PageStatus.AI_COMPLETED.value, [])
+    job.human_pages = status_pages.get(PageStatus.HUMAN_COMPLETED.value, [])
     job.skipped_pages = status_pages.get(PageStatus.SKIPPED.value, [])
     job.failed_pages = sorted(
         status_pages.get(PageStatus.AI_FAILED.value, []) +

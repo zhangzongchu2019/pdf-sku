@@ -272,7 +272,7 @@ export function SKUList({ skus, jobId, onReconcile, onSkuUpdated }: SKUListProps
                       <img
                         key={img.image_id}
                         src={imgUrl(img.image_id)}
-                        style={{ width: 64, height: 64, objectFit: "cover", borderRadius: 3, border: "1px solid #E5E7EB", cursor: "pointer" }}
+                        style={{ width: 120, height: 120, objectFit: "cover", borderRadius: 3, border: "1px solid #E5E7EB", cursor: "pointer" }}
                         onClick={(e) => { e.stopPropagation(); setLightboxImg(imgUrl(img.image_id)); }}
                       />
                     ))}

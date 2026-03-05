@@ -1,5 +1,11 @@
 """全系统 28 种枚举 — 单一真理源。对齐: 数据字典 V1.0 §2"""
-from enum import StrEnum
+import sys
+if sys.version_info >= (3, 11):
+    from enum import StrEnum
+else:
+    from enum import Enum
+    class StrEnum(str, Enum):
+        pass
 
 # §2.1 核心实体状态
 class JobInternalStatus(StrEnum):

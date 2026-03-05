@@ -66,6 +66,8 @@ export const jobsApi = {
   retry: (jobId: string) => api.post<Job>(`/jobs/${jobId}/requeue`),
   reprocessAI: (jobId: string) =>
     api.post<{ job_id: string; queued: boolean; route: string }>(`/ops/jobs/${jobId}/reprocess-ai`),
+  reprocessPage: (jobId: string, pageNo: number) =>
+    api.post<{ page_number: number; status: string }>(`/ops/jobs/${jobId}/reprocess-page/${pageNo}`),
   delete: (jobId: string) => api.delete<void>(`/ops/jobs/${jobId}`),
 
   getPages: async (jobId: string) => {
@@ -97,7 +99,7 @@ export const jobsApi = {
     return `${base}/jobs/${jobId}/images/${imageId}`;
   },
 
-  updateSku: (jobId: string, skuId: string, data: { attributes?: Record<string, string>; validity?: string }) =>
+  updateSku: (jobId: string, skuId: string, data: { attributes?: Record<string, string | null>; validity?: string }) =>
     api.patch<{ sku_id: string; attributes: Record<string, string>; validity: string; status: string }>(
       `/jobs/${jobId}/skus/${skuId}`, data
     ),
@@ -106,6 +108,23 @@ export const jobsApi = {
     api.patch<{ sku_id: string; new_image_id: string; old_image_ids: string[] }>(
       `/jobs/${jobId}/skus/${skuId}/binding`, { image_id: imageId }
     ),
+
+  addSkuBinding: (jobId: string, skuId: string, imageId: string) =>
+    api.post<{ sku_id: string; image_id: string }>(`/jobs/${jobId}/skus/${skuId}/bindings`, { image_id: imageId }),
+
+  removeSkuBinding: (jobId: string, skuId: string, imageId: string) =>
+    api.delete<void>(`/jobs/${jobId}/skus/${skuId}/bindings/${imageId}`),
+
+  deleteImage: (jobId: string, pageNo: number, imageId: string) =>
+    api.delete<void>(`/jobs/${jobId}/pages/${pageNo}/images/${imageId}`),
+
+  createSku: (jobId: string, pageNo: number, attributes?: Record<string, string>) =>
+    api.post<{ sku_id: string; page_number: number; attributes: Record<string, string>; validity: string }>(
+      `/jobs/${jobId}/pages/${pageNo}/skus`, { attributes: attributes ?? {} }
+    ),
+
+  deleteSku: (jobId: string, skuId: string) =>
+    api.delete<void>(`/jobs/${jobId}/skus/${skuId}`),
 
   markReviewComplete: (jobId: string, pageNo: number, reviewTimeSec?: number) =>
     api.post<{ page_number: number; needs_review: boolean }>(

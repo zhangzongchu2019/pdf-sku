@@ -261,6 +261,18 @@ class Orchestrator:
         if result.skus or result.images:
             await self._persist_skus(db, job.job_id, page_no, result)
 
+        # 将处理时使用的截图缓存到磁盘，保证坐标系与 bbox 一致
+        # （密集页面使用 216dpi 渲染，不落盘则 API 会以 150dpi 重新渲染导致 bbox 错位）
+        if result.screenshot:
+            import os as _os
+            _job_dir = Path(_os.environ.get("JOB_DATA_DIR", "/data/jobs")) / str(job.job_id)
+            _ss_dir = _job_dir / "screenshots"
+            _ss_dir.mkdir(parents=True, exist_ok=True)
+            (_ss_dir / f"page-{page_no}.png").write_bytes(result.screenshot)
+
+        # 同步更新 Job 级别的页面统计数组，保持与前端进度条一致
+        await refresh_job_page_stats(db, str(job.job_id))
+
         # 发布事件
         await event_bus.publish("PageCompleted", {
             "job_id": str(job.job_id),

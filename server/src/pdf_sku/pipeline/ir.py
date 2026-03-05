@@ -189,6 +189,7 @@ class PageResult:
     fallback_reason: str | None = None
     degrade_reason: str | None = None
     error: str | None = None
+    screenshot: bytes = field(default_factory=bytes)
 
     def to_dict(self) -> dict:
         return {

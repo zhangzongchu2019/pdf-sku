@@ -13,7 +13,6 @@ import { SKUList } from "../components/dashboard/SKUList";
 import { TimelineDrawer } from "../components/dashboard/TimelineDrawer";
 import { formatDate, formatPercent } from "../utils/format";
 import type { PageHeatmapCell } from "../components/dashboard/PageHeatmap";
-import ImageCropOverlay from "../components/annotation/ImageCropOverlay";
 
 // ── 实时活动面板 ──
 interface ActivityEntry {
@@ -91,6 +90,531 @@ function LiveActivityPanel({ activities, sseStatus }: { activities: ActivityEntr
   );
 }
 
+// ── 属性标签映射 ──────────────────────────────────────────────────────────────
+const PAGE_ATTR_LABELS: Record<string, string> = {
+  product_name: "名称", model_number: "型号", model: "型号",
+  name: "名称", brand: "品牌", color: "颜色", size: "尺寸",
+  price: "价格", material: "材质",
+};
+
+// ── SKU 验证卡片 ──────────────────────────────────────────────────────────────
+function SkuVerifyCard({
+  sku, jobId, pageImages, imageUrlFn, onLightbox, onUpdated, onHover, onLeave, onDeleteSku, onDeleteImage,
+}: {
+  sku: PageDetail["skus"][number];
+  jobId: string;
+  pageImages: PageDetail["images"];
+  imageUrlFn: (imageId: string) => string;
+  onLightbox: (url: string) => void;
+  onUpdated: () => Promise<void>;
+  onHover?: () => void;
+  onLeave?: () => void;
+  onDeleteSku: () => void;
+  onDeleteImage: (imageId: string) => void;
+}) {
+  const [binding, setBinding] = useState(false);
+  const [hovered, setHovered] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [editingKey, setEditingKey] = useState<string | null>(null);
+  const [editingVal, setEditingVal] = useState("");
+  const [addingAttr, setAddingAttr] = useState(false);
+  const [newAttrKey, setNewAttrKey] = useState("");
+  const [newAttrVal, setNewAttrVal] = useState("");
+  const [attrSaving, setAttrSaving] = useState(false);
+  const boundImageIds = new Set(sku.images.map((i) => i.image_id));
+
+  const handleSaveAttr = async (key: string, value: string) => {
+    if (attrSaving) return;
+    setAttrSaving(true);
+    try {
+      await jobsApi.updateSku(jobId, sku.sku_id, { attributes: { [key]: value } });
+      await onUpdated();
+      setEditingKey(null);
+    } catch (err) { console.error("保存属性失败:", err); }
+    finally { setAttrSaving(false); }
+  };
+
+  const handleDeleteAttr = async (key: string) => {
+    if (attrSaving) return;
+    setAttrSaving(true);
+    try {
+      await jobsApi.updateSku(jobId, sku.sku_id, { attributes: { [key]: null } });
+      await onUpdated();
+    } catch (err) { console.error("删除属性失败:", err); }
+    finally { setAttrSaving(false); }
+  };
+
+  const handleAddAttr = async () => {
+    const k = newAttrKey.trim();
+    if (!k || attrSaving) return;
+    setAttrSaving(true);
+    try {
+      await jobsApi.updateSku(jobId, sku.sku_id, { attributes: { [k]: newAttrVal.trim() } });
+      await onUpdated();
+      setAddingAttr(false); setNewAttrKey(""); setNewAttrVal("");
+    } catch (err) { console.error("添加属性失败:", err); }
+    finally { setAttrSaving(false); }
+  };
+
+  const handleAddBinding = async (imageId: string) => {
+    try {
+      await jobsApi.addSkuBinding(jobId, sku.sku_id, imageId);
+      await onUpdated();
+    } catch (err) { console.error("添加绑定失败:", err); }
+  };
+
+  const handleUnbindImage = async (imageId: string) => {
+    try {
+      await jobsApi.removeSkuBinding(jobId, sku.sku_id, imageId);
+      await onUpdated();
+    } catch (err) { console.error("解绑失败:", err); }
+  };
+
+  const handleToggleValidity = async () => {
+    if (saving) return;
+    const next = sku.validity === "valid" ? "invalid" : "valid";
+    setSaving(true);
+    try {
+      await jobsApi.updateSku(jobId, sku.sku_id, { validity: next });
+      await onUpdated();
+    } catch (err) {
+      console.error("SKU 更新失败:", err);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const vc = sku.validity === "valid" ? "#22C55E" : sku.validity === "invalid" ? "#EF4444" : "#F59E0B";
+  const vl = sku.validity === "valid" ? "有效" : sku.validity === "invalid" ? "无效" : "待审";
+  const attr = sku.attributes as Record<string, any> | undefined;
+  // All attribute entries (deduplicated by label for display, keep raw key for editing)
+  const allAttrEntries: [string, string][] = Object.entries(attr ?? {}).filter(
+    ([, v]) => v != null && String(v).trim() !== ""
+  ).map(([k, v]) => [k, String(v)]);
+
+  return (
+    <div
+      onMouseEnter={() => { setHovered(true); onHover?.(); }}
+      onMouseLeave={() => { setHovered(false); onLeave?.(); }}
+      style={{ marginBottom: 10, padding: 12, backgroundColor: hovered ? "#1F2E45" : "#1B2233", borderRadius: 6, border: `1px solid ${hovered ? "#22D3EE55" : "#2D3548"}`, transition: "background-color 0.15s, border-color 0.15s" }}
+    >
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", minWidth: 0 }}>
+          <span style={{ padding: "1px 6px", fontSize: 11, borderRadius: 3, flexShrink: 0, backgroundColor: `${vc}18`, border: `1px solid ${vc}33`, color: vc }}>
+            {vl}
+          </span>
+          <span style={{ fontSize: 13, fontWeight: 600, color: "#E2E8F0" }}>
+            {attr?.model_number || attr?.model || sku.sku_id}
+            {(attr?.product_name || attr?.name) ? ` ${attr.product_name || attr.name}` : ""}
+            {attr?.size ? ` | ${attr.size}` : ""}
+          </span>
+        </div>
+        <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
+          <button
+            onClick={(e) => { e.stopPropagation(); handleToggleValidity(); }}
+            disabled={saving}
+            style={{
+              padding: "2px 8px", fontSize: 11, cursor: saving ? "not-allowed" : "pointer",
+              backgroundColor: sku.validity === "valid" ? "#EF444418" : "#22C55E18",
+              border: `1px solid ${sku.validity === "valid" ? "#EF444433" : "#22C55E33"}`,
+              borderRadius: 3, color: sku.validity === "valid" ? "#EF4444" : "#22C55E",
+            }}
+          >
+            {sku.validity === "valid" ? "标记无效" : "标记有效"}
+          </button>
+          <button
+            onClick={(e) => { e.stopPropagation(); onDeleteSku(); }}
+            style={{ padding: "2px 6px", fontSize: 11, cursor: "pointer", backgroundColor: "#EF444418", border: "1px solid #EF444433", borderRadius: 3, color: "#EF4444" }}
+            title="删除SKU"
+          >🗑</button>
+        </div>
+      </div>
+      {/* ── 属性编辑区 ── */}
+      <div style={{ marginBottom: 10 }}>
+        {allAttrEntries.map(([key, val]) => (
+          <div key={key} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3, fontSize: 12 }}>
+            <span style={{ width: 80, flexShrink: 0, color: "#64748B", fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={key}>
+              {PAGE_ATTR_LABELS[key] || key}
+            </span>
+            {editingKey === key ? (
+              <>
+                <input
+                  autoFocus
+                  value={editingVal}
+                  onChange={(e) => setEditingVal(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") handleSaveAttr(key, editingVal); if (e.key === "Escape") setEditingKey(null); }}
+                  style={{ flex: 1, padding: "1px 6px", fontSize: 12, backgroundColor: "#0F172A", border: "1px solid #22D3EE44", borderRadius: 3, color: "#E2E8F0", outline: "none" }}
+                />
+                <button onClick={() => handleSaveAttr(key, editingVal)} disabled={attrSaving}
+                  style={{ padding: "1px 6px", fontSize: 11, cursor: "pointer", backgroundColor: "#22C55E18", border: "1px solid #22C55E44", borderRadius: 3, color: "#22C55E", flexShrink: 0 }}>✓</button>
+                <button onClick={() => setEditingKey(null)}
+                  style={{ padding: "1px 6px", fontSize: 11, cursor: "pointer", backgroundColor: "transparent", border: "1px solid #2D3548", borderRadius: 3, color: "#64748B", flexShrink: 0 }}>✕</button>
+              </>
+            ) : (
+              <>
+                <span
+                  onClick={() => { setEditingKey(key); setEditingVal(val); }}
+                  style={{ flex: 1, color: "#CBD5E1", cursor: "text", padding: "1px 4px", borderRadius: 3, border: "1px solid transparent" }}
+                  onMouseEnter={(e) => { (e.target as HTMLElement).style.borderColor = "#2D3548"; }}
+                  onMouseLeave={(e) => { (e.target as HTMLElement).style.borderColor = "transparent"; }}
+                  title="点击编辑"
+                >{val}</span>
+                <button onClick={() => { setEditingKey(key); setEditingVal(val); }}
+                  style={{ padding: "1px 5px", fontSize: 10, cursor: "pointer", backgroundColor: "transparent", border: "1px solid #2D3548", borderRadius: 3, color: "#475569", flexShrink: 0 }}>✏</button>
+                <button onClick={() => handleDeleteAttr(key)} disabled={attrSaving}
+                  style={{ padding: "1px 5px", fontSize: 10, cursor: "pointer", backgroundColor: "#EF444418", border: "1px solid #EF444433", borderRadius: 3, color: "#EF4444", flexShrink: 0 }}>✕</button>
+              </>
+            )}
+          </div>
+        ))}
+        {/* ── 添加新属性 ── */}
+        {addingAttr ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 4, fontSize: 12 }}>
+            <input
+              autoFocus
+              placeholder="属性名"
+              value={newAttrKey}
+              onChange={(e) => setNewAttrKey(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") handleAddAttr(); if (e.key === "Escape") { setAddingAttr(false); setNewAttrKey(""); setNewAttrVal(""); } }}
+              style={{ width: 80, flexShrink: 0, padding: "1px 6px", fontSize: 12, backgroundColor: "#0F172A", border: "1px solid #22D3EE44", borderRadius: 3, color: "#E2E8F0", outline: "none" }}
+            />
+            <input
+              placeholder="属性值"
+              value={newAttrVal}
+              onChange={(e) => setNewAttrVal(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") handleAddAttr(); if (e.key === "Escape") { setAddingAttr(false); setNewAttrKey(""); setNewAttrVal(""); } }}
+              style={{ flex: 1, padding: "1px 6px", fontSize: 12, backgroundColor: "#0F172A", border: "1px solid #22D3EE44", borderRadius: 3, color: "#E2E8F0", outline: "none" }}
+            />
+            <button onClick={handleAddAttr} disabled={attrSaving || !newAttrKey.trim()}
+              style={{ padding: "1px 6px", fontSize: 11, cursor: "pointer", backgroundColor: "#22C55E18", border: "1px solid #22C55E44", borderRadius: 3, color: "#22C55E", flexShrink: 0 }}>✓</button>
+            <button onClick={() => { setAddingAttr(false); setNewAttrKey(""); setNewAttrVal(""); }}
+              style={{ padding: "1px 6px", fontSize: 11, cursor: "pointer", backgroundColor: "transparent", border: "1px solid #2D3548", borderRadius: 3, color: "#64748B", flexShrink: 0 }}>✕</button>
+          </div>
+        ) : (
+          <button
+            onClick={(e) => { e.stopPropagation(); setAddingAttr(true); }}
+            style={{ marginTop: 4, padding: "1px 8px", fontSize: 11, cursor: "pointer", backgroundColor: "transparent", border: "1px dashed #2D3548", borderRadius: 3, color: "#475569" }}
+          >+ 添加属性</button>
+        )}
+      </div>
+      <div style={{ display: "flex", alignItems: "flex-start", gap: 8, flexWrap: "wrap" }}>
+        {sku.images.map((img) => (
+          <div key={img.image_id} style={{ position: "relative", display: "inline-block" }}>
+            <img
+              src={imageUrlFn(img.image_id)}
+              style={{ width: 130, height: 130, objectFit: "cover", borderRadius: 4, border: "1px solid #2D3548", cursor: "pointer", display: "block" }}
+              onClick={(e) => { e.stopPropagation(); onLightbox(imageUrlFn(img.image_id)); }}
+            />
+            <button
+              onClick={(e) => { e.stopPropagation(); handleUnbindImage(img.image_id); }}
+              style={{ position: "absolute", top: 4, right: 4, width: 20, height: 20, backgroundColor: "#EF4444CC", border: "none", borderRadius: "50%", color: "#fff", fontSize: 11, cursor: "pointer", padding: 0, lineHeight: "20px", textAlign: "center" }}
+              title="解除绑定"
+            >✕</button>
+          </div>
+        ))}
+        <button
+          onClick={(e) => { e.stopPropagation(); setBinding(!binding); }}
+          style={{
+            padding: "4px 10px", fontSize: 11, cursor: "pointer", alignSelf: "flex-end",
+            backgroundColor: binding ? "#F59E0B22" : "transparent",
+            border: `1px solid ${binding ? "#F59E0B44" : "#2D3548"}`,
+            borderRadius: 3, color: binding ? "#F59E0B" : "#64748B",
+          }}
+        >
+          {binding ? "取消" : "+ 添加图片"}
+        </button>
+      </div>
+      {binding && pageImages && pageImages.length > 0 && (
+        <div style={{ marginTop: 8, padding: 8, backgroundColor: "#151C2C", borderRadius: 4, border: "1px dashed #F59E0B44" }}>
+          <div style={{ fontSize: 11, color: "#F59E0B", marginBottom: 6 }}>
+            点击图片添加绑定（绿色=已绑定，再次点击可解绑）
+          </div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {pageImages.map((img) => {
+              const isBound = boundImageIds.has(img.image_id);
+              return (
+                <div key={img.image_id} style={{ position: "relative", display: "inline-block" }}>
+                  <img
+                    src={imageUrlFn(img.image_id)}
+                    style={{ width: 80, height: 80, objectFit: "cover", borderRadius: 3, border: `2px solid ${isBound ? "#22C55E" : "#2D3548"}`, cursor: "pointer", display: "block" }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (isBound) { handleUnbindImage(img.image_id); } else { handleAddBinding(img.image_id); }
+                    }}
+                    onMouseEnter={(e) => { (e.target as HTMLImageElement).style.borderColor = "#22D3EE"; }}
+                    onMouseLeave={(e) => { (e.target as HTMLImageElement).style.borderColor = isBound ? "#22C55E" : "#2D3548"; }}
+                  />
+                  <button
+                    onClick={(e) => { e.stopPropagation(); onDeleteImage(img.image_id); }}
+                    style={{ position: "absolute", top: 2, right: 2, width: 16, height: 16, backgroundColor: "#EF4444CC", border: "none", borderRadius: "50%", color: "#fff", fontSize: 9, cursor: "pointer", padding: 0, lineHeight: "16px", textAlign: "center" }}
+                    title="删除图片"
+                  >✕</button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── 页面验证面板 ──────────────────────────────────────────────────────────────
+function PageVerifyPanel({
+  page, pageDetail, pages, reviewCompleting, jobId,
+  screenshotUrl, imageUrl, onReviewComplete, onNavigate, onLightbox, onUpdated,
+}: {
+  page: { page_number: number; sku_count: number; needs_review: boolean; [key: string]: any };
+  pageDetail: PageDetail | null;
+  pages: Array<{ page_number: number; [key: string]: any }>;
+  reviewCompleting: boolean;
+  jobId: string;
+  screenshotUrl: (pageNo: number) => string;
+  imageUrl: (imageId: string) => string;
+  onReviewComplete: (pageNo: number) => void;
+  onNavigate: (pageNo: number) => void;
+  onLightbox: (url: string) => void;
+  onUpdated: () => Promise<void>;
+}) {
+  const idx = pages.findIndex((pp) => pp.page_number === page.page_number);
+  const prevPage = idx > 0 ? pages[idx - 1] : null;
+  const nextPage = idx < pages.length - 1 ? pages[idx + 1] : null;
+
+  const [hoveredSkuId, setHoveredSkuId] = useState<string | null>(null);
+  const [naturalSize, setNaturalSize] = useState<[number, number] | null>(null);
+  const [cropMode, setCropMode] = useState(false);
+  const [drawing, setDrawing] = useState<{ sx: number; sy: number; ex: number; ey: number } | null>(null);
+  const [cropping, setCropping] = useState(false);
+  const screenshotImgRef = useRef<HTMLImageElement>(null);
+
+  let hoveredBboxes: number[][] = [];
+  if (hoveredSkuId && pageDetail) {
+    const hovSku = pageDetail.skus.find((s) => s.sku_id === hoveredSkuId);
+    if (hovSku) {
+      const boundIds = new Set(hovSku.images.map((i) => i.image_id));
+      hoveredBboxes = pageDetail.images
+        .filter((img) => boundIds.has(img.image_id) && img.bbox)
+        .map((img) => img.bbox as number[]);
+    }
+  }
+
+  const toImgCoords = (clientX: number, clientY: number) => {
+    const img = screenshotImgRef.current;
+    if (!img) return null;
+    const rect = img.getBoundingClientRect();
+    const dispX = Math.max(0, Math.min(clientX - rect.left, rect.width));
+    const dispY = Math.max(0, Math.min(clientY - rect.top, rect.height));
+    return { dispX, dispY, imgX: Math.round(dispX * img.naturalWidth / rect.width), imgY: Math.round(dispY * img.naturalHeight / rect.height) };
+  };
+
+  const handleCropMouseDown = (e: React.MouseEvent) => {
+    e.preventDefault(); e.stopPropagation();
+    const c = toImgCoords(e.clientX, e.clientY);
+    if (c) setDrawing({ sx: c.dispX, sy: c.dispY, ex: c.dispX, ey: c.dispY });
+  };
+
+  const handleCropMouseMove = (e: React.MouseEvent) => {
+    if (!drawing) return;
+    const c = toImgCoords(e.clientX, e.clientY);
+    if (c) setDrawing((d) => d ? { ...d, ex: c.dispX, ey: c.dispY } : d);
+  };
+
+  const handleCropMouseUp = async (e: React.MouseEvent) => {
+    if (!drawing) return;
+    e.stopPropagation();
+    const img = screenshotImgRef.current;
+    if (!img) { setDrawing(null); return; }
+    const rect = img.getBoundingClientRect();
+    const x1 = Math.round(Math.min(drawing.sx, drawing.ex) * img.naturalWidth / rect.width);
+    const y1 = Math.round(Math.min(drawing.sy, drawing.ey) * img.naturalHeight / rect.height);
+    const x2 = Math.round(Math.max(drawing.sx, drawing.ex) * img.naturalWidth / rect.width);
+    const y2 = Math.round(Math.max(drawing.sy, drawing.ey) * img.naturalHeight / rect.height);
+    setDrawing(null);
+    if (x2 - x1 < 20 || y2 - y1 < 20) return;
+    setCropping(true);
+    try {
+      await jobsApi.cropImage(jobId, page.page_number, [x1, y1, x2, y2]);
+      await onUpdated(); setCropMode(false);
+    } catch (err) { console.error("框选失败:", err); }
+    finally { setCropping(false); }
+  };
+
+  const handleDeleteImage = async (imageId: string) => {
+    try { await jobsApi.deleteImage(jobId, page.page_number, imageId); await onUpdated(); }
+    catch (err) { console.error("删除图片失败:", err); }
+  };
+
+  const handleCreateSku = async () => {
+    try { await jobsApi.createSku(jobId, page.page_number); await onUpdated(); }
+    catch (err) { console.error("新增SKU失败:", err); }
+  };
+
+  const handleDeleteSku = async (skuId: string) => {
+    if (!window.confirm("确认删除该 SKU？")) return;
+    try { await jobsApi.deleteSku(jobId, skuId); await onUpdated(); }
+    catch (err) { console.error("删除SKU失败:", err); }
+  };
+
+  return (
+    <div style={{ backgroundColor: "#151C2C", borderBottom: "2px solid #22D3EE33" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "8px 16px", borderBottom: "1px solid #1E293B", backgroundColor: "#0F172A" }}>
+        <span style={{ fontSize: 12, color: "#94A3B8", fontWeight: 600 }}>
+          ⚒ 第 {page.page_number} 页 · {pageDetail?.skus.length ?? page.sku_count} 个 SKU
+        </span>
+        <div style={{ flex: 1 }} />
+        <button
+          onClick={() => { setCropMode(!cropMode); setDrawing(null); }}
+          style={{
+            padding: "3px 10px", fontSize: 11, cursor: "pointer",
+            backgroundColor: cropMode ? "#22D3EE22" : "transparent",
+            border: `1px solid ${cropMode ? "#22D3EE44" : "#2D3548"}`,
+            borderRadius: 3, color: cropMode ? "#22D3EE" : "#94A3B8",
+          }}
+        >
+          {cropping ? "裁剪中..." : cropMode ? "取消框选" : "✏ 框选子图"}
+        </button>
+        <button
+          onClick={(e) => { e.stopPropagation(); prevPage && onNavigate(prevPage.page_number); }}
+          disabled={!prevPage}
+          style={{ padding: "3px 10px", fontSize: 11, cursor: prevPage ? "pointer" : "not-allowed", backgroundColor: "transparent", border: "1px solid #2D3548", borderRadius: 3, color: prevPage ? "#94A3B8" : "#374151" }}
+        >
+          ← 上一页
+        </button>
+        <button
+          onClick={(e) => { e.stopPropagation(); nextPage && onNavigate(nextPage.page_number); }}
+          disabled={!nextPage}
+          style={{ padding: "3px 10px", fontSize: 11, cursor: nextPage ? "pointer" : "not-allowed", backgroundColor: "transparent", border: "1px solid #2D3548", borderRadius: 3, color: nextPage ? "#94A3B8" : "#374151" }}
+        >
+          下一页 →
+        </button>
+        {page.needs_review && (
+          <button
+            onClick={(e) => { e.stopPropagation(); onReviewComplete(page.page_number); }}
+            disabled={reviewCompleting}
+            style={{ padding: "4px 14px", fontSize: 12, cursor: "pointer", backgroundColor: "#22C55E22", border: "1px solid #22C55E44", borderRadius: 4, color: "#22C55E", fontWeight: 500 }}
+          >
+            {reviewCompleting ? "提交中..." : "审核完成"}
+          </button>
+        )}
+      </div>
+      <div style={{ display: "flex" }}>
+        <div style={{ width: 380, flexShrink: 0, padding: 16, borderRight: "1px solid #1E293B" }}>
+          <div
+            style={{ position: "relative", cursor: cropMode ? "crosshair" : "default", userSelect: "none" }}
+            onMouseDown={cropMode ? handleCropMouseDown : undefined}
+            onMouseMove={cropMode ? handleCropMouseMove : undefined}
+            onMouseUp={cropMode ? handleCropMouseUp : undefined}
+            onMouseLeave={cropMode ? () => setDrawing(null) : undefined}
+          >
+            <img
+              ref={screenshotImgRef}
+              src={screenshotUrl(page.page_number)}
+              alt={`page-${page.page_number}`}
+              style={{ width: "100%", borderRadius: 4, border: "1px solid #2D3548", cursor: cropMode ? "crosshair" : "pointer", display: "block" }}
+              onClick={(e) => { e.stopPropagation(); if (!cropMode) onLightbox(screenshotUrl(page.page_number)); }}
+              onLoad={(e) => { const img = e.target as HTMLImageElement; setNaturalSize([img.naturalWidth, img.naturalHeight]); }}
+              draggable={false}
+            />
+            {naturalSize && hoveredBboxes.map((bbox, i) => (
+              <div key={i} style={{
+                position: "absolute",
+                left: `${(bbox[0] / naturalSize[0]) * 100}%`,
+                top: `${(bbox[1] / naturalSize[1]) * 100}%`,
+                width: `${((bbox[2] - bbox[0]) / naturalSize[0]) * 100}%`,
+                height: `${((bbox[3] - bbox[1]) / naturalSize[1]) * 100}%`,
+                border: "2px solid #22D3EE", borderRadius: 2,
+                pointerEvents: "none", boxShadow: "0 0 0 2px #22D3EE33",
+              }} />
+            ))}
+            {cropMode && drawing && (
+              <div style={{
+                position: "absolute",
+                left: Math.min(drawing.sx, drawing.ex),
+                top: Math.min(drawing.sy, drawing.ey),
+                width: Math.abs(drawing.ex - drawing.sx),
+                height: Math.abs(drawing.ey - drawing.sy),
+                border: "2px dashed #22D3EE", backgroundColor: "#22D3EE18",
+                borderRadius: 2, pointerEvents: "none",
+              }} />
+            )}
+            {cropping && (
+              <div style={{ position: "absolute", inset: 0, backgroundColor: "#00000055", display: "flex", alignItems: "center", justifyContent: "center", borderRadius: 4 }}>
+                <span style={{ color: "#fff", fontSize: 12, fontWeight: 500 }}>裁剪中...</span>
+              </div>
+            )}
+          </div>
+          <div style={{ textAlign: "center", fontSize: 11, color: "#475569", marginTop: 6 }}>第 {page.page_number} 页（点击放大）</div>
+        </div>
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 560, maxHeight: 700 }}>
+          {/* ── 页面子图展示区 ── */}
+          <div style={{ padding: "10px 16px 10px", borderBottom: "1px solid #1E293B", flexShrink: 0 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+              <span style={{ fontSize: 12, color: "#94A3B8", fontWeight: 600 }}>
+                页面子图 ({pageDetail?.images.length ?? 0})
+              </span>
+              <span style={{ fontSize: 11, color: "#475569" }}>
+                {cropMode ? "在左侧截图上拖拽框选新图" : "点击放大 · ✕ 删除"}
+              </span>
+            </div>
+            {!pageDetail && <span style={{ fontSize: 11, color: "#475569" }}>加载中...</span>}
+            {pageDetail && pageDetail.images.length === 0 && (
+              <span style={{ fontSize: 11, color: "#475569" }}>暂无子图，使用工具栏「✏ 框选子图」添加</span>
+            )}
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {pageDetail?.images.map((img) => (
+                <div key={img.image_id} style={{ position: "relative", display: "inline-block" }}>
+                  <img
+                    src={imageUrl(img.image_id)}
+                    style={{ width: 80, height: 80, objectFit: "cover", borderRadius: 3, border: "1px solid #2D3548", cursor: "pointer", display: "block" }}
+                    onClick={(e) => { e.stopPropagation(); onLightbox(imageUrl(img.image_id)); }}
+                  />
+                  <button
+                    onClick={(e) => { e.stopPropagation(); handleDeleteImage(img.image_id); }}
+                    style={{ position: "absolute", top: 2, right: 2, width: 16, height: 16, backgroundColor: "#EF4444CC", border: "none", borderRadius: "50%", color: "#fff", fontSize: 9, cursor: "pointer", padding: 0, lineHeight: "16px", textAlign: "center" }}
+                    title="删除子图"
+                  >✕</button>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* ── SKU 列表 ── */}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 16px 0", flexShrink: 0 }}>
+            <span style={{ fontSize: 12, color: "#64748B" }}>
+              {pageDetail ? `${pageDetail.skus.length} 个 SKU` : ""}
+            </span>
+            <button
+              onClick={handleCreateSku}
+              style={{ padding: "3px 10px", fontSize: 11, cursor: "pointer", backgroundColor: "#22C55E18", border: "1px solid #22C55E44", borderRadius: 3, color: "#22C55E" }}
+            >
+              + 新增 SKU
+            </button>
+          </div>
+          <div style={{ flex: 1, padding: 16, overflowY: "auto" }}>
+            {!pageDetail && <span style={{ fontSize: 12, color: "#64748B" }}>加载中...</span>}
+            {pageDetail && pageDetail.skus.length === 0 && <span style={{ fontSize: 12, color: "#64748B" }}>该页无 SKU</span>}
+            {pageDetail?.skus.map((sku) => (
+              <SkuVerifyCard
+                key={sku.sku_id}
+                sku={sku}
+                jobId={jobId}
+                pageImages={pageDetail.images}
+                imageUrlFn={imageUrl}
+                onLightbox={onLightbox}
+                onUpdated={onUpdated}
+                onHover={() => setHoveredSkuId(sku.sku_id)}
+                onLeave={() => setHoveredSkuId(null)}
+                onDeleteSku={() => handleDeleteSku(sku.sku_id)}
+                onDeleteImage={handleDeleteImage}
+              />
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function JobDetailPage() {
   const { jobId } = useParams<{ jobId: string }>();
   const { currentJob, pages, skus, fetchJob, fetchPages, fetchSkus, loading } = useJobStore();
@@ -100,23 +624,14 @@ export default function JobDetailPage() {
   const [pageDetail, setPageDetail] = useState<PageDetail | null>(null);
   const [lightboxImg, setLightboxImg] = useState<string | null>(null);
   const [reviewCompleting, setReviewCompleting] = useState(false);
-  const [bindingSku, setBindingSku] = useState<string | null>(null);
   const [reviewStartTime] = useState<Record<number, number>>({});
   const [tab, setTab] = useState<"pages" | "skus" | "heatmap" | "eval">("pages");
   const [showTimeline, setShowTimeline] = useState(false);
   const [activities, setActivities] = useState<ActivityEntry[]>([]);
   const [exporting, setExporting] = useState(false);
   const [reprocessing, setReprocessing] = useState(false);
+  const [reprocessingPage, setReprocessingPage] = useState<number | null>(null);
   const actIdRef = useRef(0);
-
-  // 裁剪模式状态
-  const [cropState, setCropState] = useState<{
-    pageNo: number;
-    mode: "add" | "adjust";
-    imageId?: string;
-    skuId?: string;
-    initialBbox?: number[];
-  } | null>(null);
 
   const addActivity = useCallback((event: string, data: any) => {
     // 心跳事件不记录，避免刷屏
@@ -183,6 +698,28 @@ export default function JobDetailPage() {
     }
   };
 
+  const handleReprocessPage = async (pageNo: number) => {
+    if (!jobId || reprocessingPage !== null) return;
+    setReprocessingPage(pageNo);
+    try {
+      await jobsApi.reprocessPage(jobId, pageNo);
+      await fetchPages(jobId);
+      await fetchJob(jobId);
+      // 如果当前展开的就是这一页，刷新详情
+      if (expandedPage === pageNo) {
+        try {
+          const detail = await jobsApi.getPageDetail(jobId, pageNo);
+          setPageDetail(detail);
+        } catch { /* ignore */ }
+      }
+    } catch (e) {
+      console.error("单页重新分析失败:", e);
+      alert("重新分析失败，请稍后重试");
+    } finally {
+      setReprocessingPage(null);
+    }
+  };
+
   const handleReviewComplete = async (pageNo: number) => {
     if (!jobId || reviewCompleting) return;
     setReviewCompleting(true);
@@ -199,27 +736,14 @@ export default function JobDetailPage() {
     }
   };
 
-  const handleBindImage = async (skuId: string, imageId: string) => {
-    if (!jobId) return;
-    try {
-      await jobsApi.updateSkuBinding(jobId, skuId, imageId);
-      if (expandedPage !== null) {
-        const detail = await jobsApi.getPageDetail(jobId, expandedPage);
-        setPageDetail(detail);
-      }
-    } catch (e) {
-      console.error("绑定修正失败:", e);
-    } finally {
-      setBindingSku(null);
-    }
-  };
 
   if (loading && !currentJob) return <Loading />;
   if (!currentJob) return <div className="page"><h2>Job 不存在</h2></div>;
 
   const job = currentJob;
   const completedPages = pages.filter((p) =>
-    ["AI_COMPLETED", "HUMAN_COMPLETED", "IMPORTED_CONFIRMED", "IMPORTED_ASSUMED", "BLANK"].includes(p.status)
+    ["AI_COMPLETED", "HUMAN_COMPLETED", "IMPORTED_CONFIRMED", "IMPORTED_ASSUMED", "BLANK",
+     "AI_FAILED", "IMPORT_FAILED", "DEAD_LETTER", "SKIPPED"].includes(p.status)
   ).length;
   const progress = job.total_pages > 0 ? completedPages / job.total_pages : 0;
 
@@ -343,6 +867,7 @@ export default function JobDetailPage() {
               <th style={{ width: 70 }}>缩略图</th>
               <th>页码</th><th>状态</th><th>类型</th><th>SKU数</th>
               <th>置信度</th><th style={{ width: 70 }}>需介入</th><th>提取方式</th><th>LLM模型</th>
+              <th style={{ width: 90 }}>操作</th>
             </tr>
           </thead>
           <tbody>
@@ -375,143 +900,43 @@ export default function JobDetailPage() {
                   </td>
                   <td>{p.extraction_method || "-"}</td>
                   <td>{p.llm_model_used || "-"}</td>
+                  <td onClick={(e) => e.stopPropagation()}>
+                    <button
+                      onClick={() => handleReprocessPage(p.page_number)}
+                      disabled={reprocessingPage !== null}
+                      title="重新分析该页"
+                      style={{
+                        padding: "2px 8px", fontSize: 11, cursor: reprocessingPage !== null ? "not-allowed" : "pointer",
+                        backgroundColor: "transparent", border: "1px solid #2D3548", borderRadius: 3,
+                        color: reprocessingPage === p.page_number ? "#F59E0B" : "#94A3B8",
+                      }}
+                    >
+                      {reprocessingPage === p.page_number ? "⏳" : "🔄"}
+                    </button>
+                  </td>
                 </tr>
                 {expandedPage === p.page_number && (
                   <tr key={`detail-${p.id}`}>
-                    <td colSpan={9} style={{ padding: 0 }}>
-                      {/* Review toolbar for needs_review pages */}
-                      {p.needs_review && (
-                        <div style={{
-                          display: "flex", alignItems: "center", gap: 12,
-                          padding: "8px 16px",
-                          backgroundColor: "#1A1520",
-                          borderBottom: "1px solid #EF444433",
-                        }}>
-                          <span style={{ fontSize: 12, color: "#F59E0B", fontWeight: 600 }}>
-                            &#9873; 审核修正
-                          </span>
-                          <span style={{ fontSize: 11, color: "#64748B" }}>
-                            修改 SKU 属性请使用 SKU Tab 编辑功能
-                          </span>
-                          <div style={{ flex: 1 }} />
-                          <button
-                            onClick={() => handleReviewComplete(p.page_number)}
-                            disabled={reviewCompleting}
-                            style={{
-                              padding: "4px 14px", fontSize: 12, cursor: "pointer",
-                              backgroundColor: "#22C55E22", border: "1px solid #22C55E44",
-                              borderRadius: 4, color: "#22C55E", fontWeight: 500,
-                            }}
-                          >
-                            {reviewCompleting ? "提交中..." : "审核完成"}
-                          </button>
-                        </div>
-                      )}
-                      <div style={{ display: "flex", gap: 16, padding: 16, backgroundColor: "#151C2C", borderBottom: "2px solid #22D3EE33" }}>
-                        {/* Left: large screenshot */}
-                        <div style={{ flexShrink: 0 }}>
-                          <img
-                            src={screenshotUrl(p.page_number)}
-                            alt={`page-${p.page_number}`}
-                            style={{ width: 300, borderRadius: 4, border: "1px solid #2D3548", cursor: "pointer" }}
-                            onClick={() => setLightboxImg(screenshotUrl(p.page_number))}
-                          />
-                        </div>
-                        {/* Right: SKUs with images */}
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <h4 style={{ margin: "0 0 8px", fontSize: 13, color: "#94A3B8" }}>
-                            页面 SKU ({pageDetail?.skus.length ?? 0})
-                          </h4>
-                          {pageDetail?.skus.map((sku) => (
-                            <div key={sku.sku_id} style={{ marginBottom: 10, padding: 8, backgroundColor: "#1B2233", borderRadius: 6, border: "1px solid #2D3548" }}>
-                              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
-                                <span style={{ color: "#E2E8F4" }}>
-                                  {sku.attributes?.model_number || sku.attributes?.model || sku.sku_id}
-                                  {sku.attributes?.product_name || sku.attributes?.name ? ` ${sku.attributes.product_name || sku.attributes.name}` : ""}
-                                  {sku.attributes?.size ? ` | ${sku.attributes.size}` : ""}
-                                </span>
-                                <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-                                  <span style={{ color: "#64748B", fontSize: 11 }}>{sku.attribute_source === "HUMAN_CORRECTED" ? "已修正" : ""}</span>
-                                  <span style={{ color: "#64748B" }}>{sku.validity}</span>
-                                </div>
-                              </div>
-                              {/* SKU images with binding correction */}
-                              <div style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
-                                {sku.images.slice(0, 3).map((img) => (
-                                  <img
-                                    key={img.image_id}
-                                    src={imageUrl(img.image_id)}
-                                    style={{
-                                      width: 48, height: 48, objectFit: "cover", borderRadius: 3,
-                                      border: bindingSku === sku.sku_id ? "2px solid #F59E0B" : "1px solid #2D3548",
-                                      cursor: "pointer",
-                                    }}
-                                    onClick={(e) => { e.stopPropagation(); setLightboxImg(imageUrl(img.image_id)); }}
-                                  />
-                                ))}
-                                {sku.images.length > 3 && (
-                                  <span style={{ display: "flex", alignItems: "center", fontSize: 11, color: "#64748B" }}>
-                                    +{sku.images.length - 3}
-                                  </span>
-                                )}
-                                {p.needs_review && (
-                                  <button
-                                    onClick={(e) => { e.stopPropagation(); setBindingSku(bindingSku === sku.sku_id ? null : sku.sku_id); }}
-                                    style={{
-                                      padding: "2px 6px", fontSize: 10, cursor: "pointer",
-                                      backgroundColor: bindingSku === sku.sku_id ? "#F59E0B22" : "transparent",
-                                      border: `1px solid ${bindingSku === sku.sku_id ? "#F59E0B44" : "#2D3548"}`,
-                                      borderRadius: 3,
-                                      color: bindingSku === sku.sku_id ? "#F59E0B" : "#64748B",
-                                    }}
-                                  >
-                                    {bindingSku === sku.sku_id ? "取消" : "换图"}
-                                  </button>
-                                )}
-                              </div>
-                              {/* Binding selection: show all page images to pick from */}
-                              {bindingSku === sku.sku_id && pageDetail?.images && (
-                                <div style={{ marginTop: 6, padding: 6, backgroundColor: "#151C2C", borderRadius: 4, border: "1px dashed #F59E0B44" }}>
-                                  <div style={{ fontSize: 11, color: "#F59E0B", marginBottom: 4 }}>选择正确的图片:</div>
-                                  <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                                    {pageDetail.images.map((img) => (
-                                      <img
-                                        key={img.image_id}
-                                        src={imageUrl(img.image_id)}
-                                        style={{
-                                          width: 56, height: 56, objectFit: "cover", borderRadius: 3,
-                                          border: "2px solid #2D3548", cursor: "pointer",
-                                        }}
-                                        onClick={(e) => { e.stopPropagation(); handleBindImage(sku.sku_id, img.image_id); }}
-                                        onMouseEnter={(e) => { (e.target as HTMLImageElement).style.borderColor = "#22D3EE"; }}
-                                        onMouseLeave={(e) => { (e.target as HTMLImageElement).style.borderColor = "#2D3548"; }}
-                                      />
-                                    ))}
-                                  </div>
-                                </div>
-                              )}
-                            </div>
-                          ))}
-                          {pageDetail?.images && pageDetail.images.length > 0 && (
-                            <>
-                              <h4 style={{ margin: "12px 0 8px", fontSize: 13, color: "#94A3B8" }}>
-                                页面图片 ({pageDetail.images.length})
-                              </h4>
-                              <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                                {pageDetail.images.map((img) => (
-                                  <img
-                                    key={img.image_id}
-                                    src={imageUrl(img.image_id)}
-                                    style={{ width: 48, height: 48, objectFit: "cover", borderRadius: 3, border: "1px solid #2D3548", cursor: "pointer" }}
-                                    onClick={() => setLightboxImg(imageUrl(img.image_id))}
-                                  />
-                                ))}
-                              </div>
-                            </>
-                          )}
-                          {!pageDetail && <span style={{ fontSize: 12, color: "#64748B" }}>加载中...</span>}
-                        </div>
-                      </div>
+                    <td colSpan={10} style={{ padding: 0 }}>
+                      <PageVerifyPanel
+                        page={p}
+                        pageDetail={pageDetail}
+                        pages={pages}
+                        reviewCompleting={reviewCompleting}
+                        jobId={jobId!}
+                        screenshotUrl={screenshotUrl}
+                        imageUrl={imageUrl}
+                        onReviewComplete={handleReviewComplete}
+                        onNavigate={toggleExpand}
+                        onLightbox={setLightboxImg}
+                        onUpdated={async () => {
+                          if (!jobId || expandedPage === null) return;
+                          try {
+                            const detail = await jobsApi.getPageDetail(jobId, expandedPage);
+                            setPageDetail(detail);
+                          } catch { /* ignore */ }
+                        }}
+                      />
                     </td>
                   </tr>
                 )}

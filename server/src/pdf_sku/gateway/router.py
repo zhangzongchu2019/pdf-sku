@@ -560,16 +560,51 @@ async def get_page_screenshot(
     job_dir = Path(settings.job_data_dir) / str(job_id)
     cache_path = job_dir / "screenshots" / f"page-{page_number}.png"
 
-    # 优先返回已缓存的截图
-    if cache_path.exists():
+    # 查询该页 bbox 最大 x2/y2，用于判断缓存截图的 DPI 是否与坐标系匹配
+    from sqlalchemy import text as _text
+    bbox_result = await db.execute(
+        _text(
+            "SELECT MAX(bbox[3]), MAX(bbox[4]) FROM images "
+            "WHERE job_id = :jid AND page_number = :pn AND bbox IS NOT NULL"
+        ),
+        {"jid": str(job_id), "pn": page_number},
+    )
+    _bbox_row = bbox_result.one_or_none()
+    max_bbox_x = float(_bbox_row[0] or 0) if _bbox_row else 0
+    max_bbox_y = float(_bbox_row[1] or 0) if _bbox_row else 0
+
+    def _cached_screenshot_valid(path: Path) -> bool:
+        """返回 True 当缓存截图的宽高能容纳所有 bbox 坐标（含 10px 容差）。"""
+        if not path.exists():
+            return False
+        try:
+            import struct as _s
+            data = path.read_bytes()
+            if len(data) < 24 or data[:4] != b'\x89PNG':
+                return False
+            w = _s.unpack('>I', data[16:20])[0]
+            h = _s.unpack('>I', data[20:24])[0]
+            return max_bbox_x <= w + 10 and max_bbox_y <= h + 10
+        except Exception:
+            return False
+
+    # 优先返回有效的缓存截图
+    if _cached_screenshot_valid(cache_path):
         return FileResponse(str(cache_path), media_type="image/png")
+
+    # 缓存不存在或 DPI 不匹配时删除旧缓存，重新渲染
+    if cache_path.exists():
+        try:
+            cache_path.unlink()
+        except Exception:
+            pass
 
     # 显式指定的截图路径
     if page.screenshot_path:
         explicit = Path(page.screenshot_path)
         if not explicit.is_absolute():
             explicit = job_dir / explicit
-        if explicit.exists():
+        if explicit.exists() and _cached_screenshot_valid(explicit):
             return FileResponse(str(explicit), media_type="image/png")
 
     source_pdf = job_dir / "source.pdf"
@@ -580,7 +615,7 @@ async def get_page_screenshot(
         })
 
     try:
-        import fitz
+        import fitz, struct as _struct
 
         doc = fitz.open(source_pdf)
         try:
@@ -590,8 +625,20 @@ async def get_page_screenshot(
                     "message": f"Page {page_number} is out of range",
                 })
 
-            zoom = 150 / 72
-            pix = doc[page_number - 1].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+            pdf_page = doc[page_number - 1]
+            page_w_pts = pdf_page.rect.width or 595.0
+
+            # bbox x 坐标超出 150dpi 截图宽度时，用 x2_max / page_width 反推实际 DPI
+            px_at_150 = page_w_pts * (150 / 72)
+            if max_bbox_x > px_at_150 * 1.05:
+                inferred_dpi = round(max_bbox_x / page_w_pts * 72)
+                # 对齐到常用 DPI 档位 (150 / 216 / 300)
+                render_dpi = min([150, 216, 300], key=lambda d: abs(d - inferred_dpi))
+            else:
+                render_dpi = 150
+
+            zoom = render_dpi / 72
+            pix = pdf_page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
             png_bytes = pix.tobytes("png")
         finally:
             doc.close()
@@ -819,7 +866,12 @@ async def update_sku(
 
     if attributes is not None:
         old_attrs = dict(sku.attributes or {})
-        new_attrs = {**old_attrs, **attributes}
+        new_attrs = dict(old_attrs)
+        for k, v in attributes.items():
+            if v is None:
+                new_attrs.pop(k, None)  # delete key
+            else:
+                new_attrs[k] = v
         # Compute diff: only changed fields
         diff = {k: {"old": old_attrs.get(k), "new": v}
                 for k, v in attributes.items() if old_attrs.get(k) != v}
@@ -944,6 +996,102 @@ async def update_sku_binding(
 
     await db.commit()
     return {"sku_id": sku_id, "new_image_id": new_image_id, "old_image_ids": old_image_ids}
+
+
+@router.post("/jobs/{job_id}/skus/{sku_id}/bindings")
+async def add_sku_binding(
+    request: Request,
+    job_id: uuid.UUID,
+    sku_id: str,
+    db: DBSession,
+):
+    """追加一张图片的绑定，不影响其他已有绑定。"""
+    body = await request.json()
+    new_image_id = body.get("image_id")
+    annotator = body.get("annotator", "")
+
+    if not new_image_id:
+        return JSONResponse(status_code=400, content={"error_code": "MISSING_IMAGE_ID", "message": "image_id is required"})
+
+    sku_result = await db.execute(
+        select(SKU).where(SKU.job_id == job_id, SKU.sku_id == sku_id, SKU.superseded == False)
+    )
+    sku = sku_result.scalar_one_or_none()
+    if not sku:
+        return JSONResponse(status_code=404, content={"error_code": "SKU_NOT_FOUND", "message": f"SKU {sku_id} not found"})
+
+    img_result = await db.execute(
+        select(Image).where(Image.job_id == job_id, Image.image_id == new_image_id)
+    )
+    if not img_result.scalar_one_or_none():
+        return JSONResponse(status_code=404, content={"error_code": "IMAGE_NOT_FOUND", "message": f"Image {new_image_id} not found"})
+
+    # Get current bindings to compute rank
+    all_bind_result = await db.execute(
+        select(SKUImageBinding).where(SKUImageBinding.sku_id == sku_id, SKUImageBinding.job_id == job_id)
+    )
+    all_bindings = all_bind_result.scalars().all()
+    max_revision = max((b.revision for b in all_bindings), default=0)
+    max_rank = max((b.rank for b in all_bindings if b.is_latest), default=0)
+
+    # Check if this image is already bound (is_latest)
+    existing = next((b for b in all_bindings if b.image_id == new_image_id), None)
+    if existing:
+        if existing.is_latest:
+            return {"sku_id": sku_id, "image_id": new_image_id, "message": "already bound"}
+        # Re-activate the old binding row
+        existing.is_latest = True
+        existing.binding_method = "human_correction"
+        existing.binding_confidence = 1.0
+        existing.rank = max_rank + 1
+        existing.revision = max_revision + 1
+    else:
+        db.add(SKUImageBinding(
+            sku_id=sku_id,
+            image_id=new_image_id,
+            job_id=job_id,
+            image_role="PRODUCT_MAIN",
+            binding_method="human_correction",
+            binding_confidence=1.0,
+            is_ambiguous=False,
+            rank=max_rank + 1,
+            revision=max_revision + 1,
+            is_latest=True,
+        ))
+
+    db.add(Annotation(
+        job_id=job_id,
+        page_number=sku.page_number,
+        annotator=annotator,
+        type="BINDING_ADDED",
+        payload={"sku_id": sku_id, "image_id": new_image_id},
+    ))
+    await db.commit()
+    return {"sku_id": sku_id, "image_id": new_image_id}
+
+
+@router.delete("/jobs/{job_id}/skus/{sku_id}/bindings/{image_id}", status_code=204)
+async def remove_sku_binding(
+    job_id: uuid.UUID,
+    sku_id: str,
+    image_id: str,
+    db: DBSession,
+):
+    """移除 SKU 与某张图片的绑定关系（不删除图片本身）。"""
+    bind_result = await db.execute(
+        select(SKUImageBinding).where(
+            SKUImageBinding.sku_id == sku_id,
+            SKUImageBinding.job_id == job_id,
+            SKUImageBinding.image_id == image_id,
+            SKUImageBinding.is_latest == True,
+        )
+    )
+    binding = bind_result.scalar_one_or_none()
+    if not binding:
+        return JSONResponse(status_code=404, content={"error_code": "BINDING_NOT_FOUND", "message": "Binding not found"})
+
+    binding.is_latest = False
+    await db.commit()
 
 
 @router.post("/jobs/{job_id}/pages/{page_number}/review-complete")
@@ -1507,6 +1655,113 @@ async def crop_image(
     }
 
 
+@router.delete("/jobs/{job_id}/pages/{page_number}/images/{image_id}", status_code=204)
+async def delete_page_image(
+    job_id: uuid.UUID,
+    db: DBSession,
+    page_number: int = PathParam(..., ge=1),
+    image_id: str = PathParam(...),
+):
+    """删除页面商品子图，同时清除关联绑定。"""
+    job_result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
+    if not job_result.scalar_one_or_none():
+        raise JobNotFoundError(f"Job {job_id} not found")
+
+    img_result = await db.execute(
+        select(Image).where(Image.job_id == job_id, Image.image_id == image_id, Image.page_number == page_number)
+    )
+    img_row = img_result.scalar_one_or_none()
+    if not img_row:
+        return JSONResponse(status_code=404, content={
+            "error_code": "IMAGE_NOT_FOUND",
+            "message": f"Image {image_id} not found on page {page_number}",
+        })
+
+    job_dir = Path(settings.job_data_dir) / str(job_id)
+    file_path = job_dir / img_row.extracted_path
+    if file_path.exists():
+        file_path.unlink()
+
+    await db.execute(delete(SKUImageBinding).where(
+        SKUImageBinding.job_id == job_id, SKUImageBinding.image_id == image_id
+    ))
+    await db.execute(delete(Image).where(Image.job_id == job_id, Image.image_id == image_id))
+    db.add(Annotation(
+        job_id=job_id, page_number=page_number, annotator="",
+        type="IMAGE_DELETED", payload={"image_id": image_id},
+    ))
+    await db.commit()
+    logger.info("image_deleted", job_id=str(job_id), image_id=image_id, page=page_number)
+    return Response(status_code=204)
+
+
+@router.post("/jobs/{job_id}/pages/{page_number}/skus")
+async def create_page_sku(
+    request: Request,
+    job_id: uuid.UUID,
+    db: DBSession,
+    page_number: int = PathParam(..., ge=1),
+):
+    """在指定页面手动新增 SKU。"""
+    job_result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
+    if not job_result.scalar_one_or_none():
+        raise JobNotFoundError(f"Job {job_id} not found")
+
+    body = await request.json()
+    attributes = body.get("attributes", {})
+
+    from nanoid import generate as nanoid
+    sku_id = f"p{page_number}_manual_{nanoid(size=6)}"
+
+    db.add(SKU(
+        sku_id=sku_id, job_id=job_id, page_number=page_number,
+        validity="valid", attributes=attributes,
+        attribute_source="HUMAN_CREATED", status="EXTRACTED",
+    ))
+    db.add(Annotation(
+        job_id=job_id, page_number=page_number, annotator="",
+        type="SKU_CREATED", payload={"sku_id": sku_id},
+    ))
+    await db.commit()
+    logger.info("sku_created", job_id=str(job_id), sku_id=sku_id, page=page_number)
+    return {
+        "sku_id": sku_id, "page_number": page_number,
+        "attributes": attributes, "validity": "valid",
+        "attribute_source": "HUMAN_CREATED", "status": "EXTRACTED",
+    }
+
+
+@router.delete("/jobs/{job_id}/skus/{sku_id}", status_code=204)
+async def delete_sku(
+    job_id: uuid.UUID,
+    sku_id: str,
+    db: DBSession,
+):
+    """软删除 SKU（superseded=True），清除关联绑定。"""
+    sku_result = await db.execute(
+        select(SKU).where(SKU.job_id == job_id, SKU.sku_id == sku_id, SKU.superseded == False)
+    )
+    sku = sku_result.scalar_one_or_none()
+    if not sku:
+        return JSONResponse(status_code=404, content={
+            "error_code": "SKU_NOT_FOUND",
+            "message": f"SKU {sku_id} not found in job {job_id}",
+        })
+
+    page_number = sku.page_number
+    sku.superseded = True
+    await db.execute(delete(SKUImageBinding).where(
+        SKUImageBinding.job_id == job_id, SKUImageBinding.sku_id == sku_id
+    ))
+    db.add(Annotation(
+        job_id=job_id, page_number=page_number, annotator="",
+        type="SKU_DELETED", payload={"sku_id": sku_id},
+    ))
+    await db.commit()
+    logger.info("sku_deleted", job_id=str(job_id), sku_id=sku_id)
+    return Response(status_code=204)
+
+
 # ───────────────────────── LLM Accounts ─────────────────────────
 
 @router.get("/system/llm-accounts")
@@ -1804,6 +2059,8 @@ def _job_to_dict(job: PDFJob, detail: bool = False) -> dict:
         "blank_pages": job.blank_pages or [],
         "ai_pages": job.ai_pages or [],
         "human_pages": job.human_pages or [],
+        "failed_pages": job.failed_pages or [],
+        "skipped_pages": job.skipped_pages or [],
         "review_pages": job.review_pages or [],
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,

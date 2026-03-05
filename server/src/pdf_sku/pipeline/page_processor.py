@@ -394,6 +394,7 @@ class PageProcessor:
                 llm_model_used=self._llm.current_model_name if self._llm else None,
                 fallback_reason=fallback_reason,
                 page_confidence=page_confidence,
+                screenshot=screenshot,
             )
 
         except Exception as e:
