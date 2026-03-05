@@ -629,6 +629,12 @@ export default function JobDetailPage() {
   const [showTimeline, setShowTimeline] = useState(false);
   const [activities, setActivities] = useState<ActivityEntry[]>([]);
   const [exporting, setExporting] = useState(false);
+  const [includeRaw, setIncludeRaw] = useState(false);
+  const [exportProgress, setExportProgress] = useState<{
+    progress: number;
+    message: string;
+    step: string;
+  } | null>(null);
   const [reprocessing, setReprocessing] = useState(false);
   const [reprocessingPage, setReprocessingPage] = useState<number | null>(null);
   const actIdRef = useRef(0);
@@ -749,6 +755,46 @@ export default function JobDetailPage() {
 
   return (
     <div className="page job-detail-page">
+      {/* 导出进度浮层 */}
+      {exportProgress && (
+        <div style={{
+          position: "fixed", inset: 0, zIndex: 9999,
+          background: "rgba(0,0,0,0.55)", display: "flex", alignItems: "center", justifyContent: "center",
+        }}>
+          <div style={{
+            background: "#1E293B", border: "1px solid #2D3548", borderRadius: 12,
+            padding: "28px 36px", width: 340, boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
+          }}>
+            <div style={{ fontSize: 15, fontWeight: 600, color: "#E2E8F0", marginBottom: 16 }}>
+              {exportProgress.step === "error" ? "导出失败" : "正在导出 Excel…"}
+            </div>
+            {exportProgress.step !== "error" && (
+              <div style={{ background: "#0F172A", borderRadius: 6, height: 8, marginBottom: 12, overflow: "hidden" }}>
+                <div style={{
+                  height: "100%", borderRadius: 6,
+                  width: `${Math.max(0, exportProgress.progress)}%`,
+                  background: exportProgress.step === "done" ? "#22C55E" : "#38BDF8",
+                  transition: "width 0.4s ease",
+                }} />
+              </div>
+            )}
+            <div style={{ fontSize: 13, color: exportProgress.step === "error" ? "#F87171" : "#94A3B8" }}>
+              {exportProgress.message}
+            </div>
+            {(exportProgress.step === "error") && (
+              <button
+                onClick={() => { setExportProgress(null); setExporting(false); }}
+                style={{
+                  marginTop: 16, padding: "6px 18px", borderRadius: 6, border: "none",
+                  background: "#334155", color: "#E2E8F0", cursor: "pointer", fontSize: 13,
+                }}
+              >
+                关闭
+              </button>
+            )}
+          </div>
+        </div>
+      )}
       <div className="page-header">
         <div>
           <Link to="/jobs" className="back-link">← 返回列表</Link>
@@ -825,18 +871,58 @@ export default function JobDetailPage() {
           评估
         </button>
         <div style={{ flex: 1 }} />
+        <label
+          style={{
+            display: "flex", alignItems: "center", gap: 4,
+            fontSize: 12, color: "#94A3B8", cursor: "pointer", marginRight: 4,
+            userSelect: "none",
+          }}
+          title="打开后同时导出原始全量 Excel"
+        >
+          <input
+            type="checkbox"
+            checked={includeRaw}
+            onChange={(e) => setIncludeRaw(e.target.checked)}
+            style={{ cursor: "pointer" }}
+          />
+          含原始数据
+        </label>
         <button
           onClick={async () => {
             if (exporting || !jobId) return;
             setExporting(true);
+            setExportProgress({ progress: 0, message: "准备中...", step: "starting" });
             try {
-              await jobsApi.exportExcel(jobId, `${job.source_file.replace(/\.pdf$/i, "")}_export.zip`);
-            } catch (e) {
+              const taskId = await jobsApi.startExportTask(jobId, includeRaw);
+              const apiBase = (import.meta.env.VITE_API_BASE as string) || "/api/v1";
+              await new Promise<void>((resolve, reject) => {
+                const es = new EventSource(`${apiBase}/jobs/${jobId}/export/excel/${taskId}/events`);
+                es.onmessage = (e) => {
+                  try {
+                    const data = JSON.parse(e.data);
+                    setExportProgress({ progress: data.progress, message: data.message, step: data.step });
+                    if (data.step === "done") {
+                      es.close();
+                      resolve();
+                    } else if (data.step === "error") {
+                      es.close();
+                      reject(new Error(data.message || "导出失败"));
+                    }
+                  } catch { /* ignore parse errors */ }
+                };
+                es.onerror = () => { es.close(); reject(new Error("SSE 连接断开")); };
+              });
+              const baseName = job.source_file.replace(/\.pdf$/i, "");
+              const filename = includeRaw ? `${baseName}_export.zip` : `${baseName}_export.xlsx`;
+              await jobsApi.downloadExportTask(jobId, taskId, filename);
+            } catch (e: any) {
               console.error("导出失败:", e);
-              alert("导出失败，请稍后重试");
+              setExportProgress({ progress: -1, message: e.message || "导出失败，请稍后重试", step: "error" });
+              return;
             } finally {
               setExporting(false);
             }
+            setTimeout(() => setExportProgress(null), 1500);
           }}
           disabled={exporting}
           style={{

@@ -5,7 +5,8 @@ Dashboard 增强 — 实时指标 + 系统健康。
 from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 
-from sqlalchemy import select, func
+import uuid as uuid_mod
+from sqlalchemy import select, func, or_, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from pdf_sku.common.models import (
@@ -17,23 +18,39 @@ import structlog
 logger = structlog.get_logger()
 
 
+def _build_ownership_filter(owner_id: uuid_mod.UUID | None, legacy_uploaded_by: str | None):
+    """Build SQLAlchemy filter for job ownership. Returns None when no filter needed (admin)."""
+    if owner_id is None:
+        return None
+    return or_(
+        PDFJob.owner_id == owner_id,
+        and_(PDFJob.owner_id.is_(None), PDFJob.uploaded_by == legacy_uploaded_by),
+    )
+
+
 class DashboardService:
 
-    async def get_overview(self, db: AsyncSession) -> dict:
+    async def get_overview(
+        self,
+        db: AsyncSession,
+        owner_id: uuid_mod.UUID | None = None,
+        legacy_uploaded_by: str | None = None,
+    ) -> dict:
+        ownership = _build_ownership_filter(owner_id, legacy_uploaded_by)
         return {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "job_stats": await self._job_stats(db),
-            "page_stats": await self._page_stats(db),
+            "job_stats": await self._job_stats(db, ownership),
+            "page_stats": await self._page_stats(db, ownership),
             "task_stats": await self._task_stats(db),
             "import_stats": await self._import_stats(db),
             "calibration_stats": await self._calibration_stats(db),
         }
 
-    async def _job_stats(self, db: AsyncSession) -> dict:
-        result = await db.execute(
-            select(PDFJob.status, func.count().label("cnt"))
-            .group_by(PDFJob.status)
-        )
+    async def _job_stats(self, db: AsyncSession, ownership_filter=None) -> dict:
+        q = select(PDFJob.status, func.count().label("cnt")).group_by(PDFJob.status)
+        if ownership_filter is not None:
+            q = q.where(ownership_filter)
+        result = await db.execute(q)
         by_status = {r.status or "unknown": r.cnt for r in result.all()}
         total = sum(by_status.values())
         active = sum(v for k, v in by_status.items()
@@ -46,11 +63,11 @@ class DashboardService:
             "by_status": by_status,
         }
 
-    async def _page_stats(self, db: AsyncSession) -> dict:
-        result = await db.execute(
-            select(Page.status, func.count().label("cnt"))
-            .group_by(Page.status)
-        )
+    async def _page_stats(self, db: AsyncSession, ownership_filter=None) -> dict:
+        q = select(Page.status, func.count().label("cnt")).group_by(Page.status)
+        if ownership_filter is not None:
+            q = q.join(PDFJob, Page.job_id == PDFJob.job_id).where(ownership_filter)
+        result = await db.execute(q)
         dist = {r.status or "unknown": r.cnt for r in result.all()}
         total = sum(dist.values())
         completed = sum(v for k, v in dist.items()

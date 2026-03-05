@@ -36,6 +36,7 @@ class SecurityEncryptedError(PDFSKUError):
 
 class FileHashDuplicateError(PDFSKUError):
     code = "FILE_HASH_DUPLICATE"; http_status = 409
+    existing_job_id: str | None = None
 
 
 # === Job 操作 ===

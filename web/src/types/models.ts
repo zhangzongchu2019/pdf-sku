@@ -39,6 +39,7 @@ export interface Job {
   updated_at: string;
   eval_completed_at?: string;
   process_completed_at?: string;
+  is_duplicate?: boolean;
 }
 
 export interface JobDetail extends Job {

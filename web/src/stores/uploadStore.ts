@@ -21,7 +21,7 @@ interface UploadState {
   category: string;
   setMerchantId: (v: string) => void;
   setCategory: (v: string) => void;
-  addFile: (file: File, profileId?: string) => void;
+  addFile: (file: File, profileId?: string) => string;
   startUpload: (id: string) => Promise<string>;
   updateProgress: (uploadId: string, progress: number) => void;
   setStatus: (uploadId: string, status: UploadStatus) => void;
@@ -51,6 +51,7 @@ export const useUploadStore = create<UploadState>()(
             status: "pending",
           });
         });
+        return id;
       },
 
       updateProgress: (uploadId, percentage) => set((s) => {

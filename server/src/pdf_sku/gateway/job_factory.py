@@ -50,6 +50,7 @@ class JobFactory:
         merchant_id: str,
         category: str | None = None,
         uploaded_by: str = "",
+        owner_id: uuid.UUID | None = None,
     ) -> PDFJob:
         """
         创建 Job 主流程 (对齐 Gateway 详设 §4.1 Step 1-8):
@@ -76,16 +77,24 @@ class JobFactory:
 
         # === Step 3: 计算文件 hash + 去重检查 ===
         file_hash = await self._compute_file_hash(upload_file_path)
+        dup_filters = [
+            PDFJob.file_hash == file_hash,
+            PDFJob.status.notin_(["CANCELLED", "REJECTED"]),
+        ]
+        # 按上传者去重：有 owner_id 则限定同一用户，否则限定同一商户
+        if owner_id:
+            dup_filters.append(PDFJob.owner_id == owner_id)
+        else:
+            dup_filters.append(PDFJob.merchant_id == merchant_id)
         existing = await db.execute(
-            select(PDFJob).where(
-                PDFJob.file_hash == file_hash,
-                PDFJob.merchant_id == merchant_id,
-                PDFJob.status.notin_(["CANCELLED", "REJECTED"]),
-            ).limit(1)
+            select(PDFJob).where(*dup_filters).limit(1)
         )
-        if existing.scalar_one_or_none():
-            raise FileHashDuplicateError(
+        existing_job = existing.scalar_one_or_none()
+        if existing_job:
+            err = FileHashDuplicateError(
                 f"Duplicate file detected for merchant {merchant_id}")
+            err.existing_job_id = str(existing_job.job_id)
+            raise err
 
         # === Step 4: 冻结配置版本 ===
         config_version = "default"  # 初始默认, 运行时由 ConfigProvider 返回活跃版本
@@ -110,6 +119,7 @@ class JobFactory:
             merchant_id=merchant_id,
             category=category,
             uploaded_by=uploaded_by,
+            owner_id=owner_id,
             status=initial_status.value,
             user_status=user_status.value,
             action_hint=action_hint,

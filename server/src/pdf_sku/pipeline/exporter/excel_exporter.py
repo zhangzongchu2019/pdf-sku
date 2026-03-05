@@ -95,26 +95,64 @@ def _get_field_value(attrs: dict, candidates: list[str]) -> str:
     return ""
 
 
-def _embed_image(ws, img_bytes: bytes, row: int, col: int = 1, max_px: int = 60) -> None:
-    """将图片 bytes 缩放后嵌入到指定单元格。"""
+def _preprocess_image(img_bytes: bytes, max_px: int = 60) -> bytes | None:
+    """PIL 缩放图片为 PNG bytes，线程安全，可并行执行。"""
     if not img_bytes:
-        return
+        return None
     try:
-        from openpyxl.drawing.image import Image as XLImage
-        from openpyxl.utils import get_column_letter
         from PIL import Image as PILImage
-
         pil = PILImage.open(io.BytesIO(img_bytes))
         pil.thumbnail((max_px, max_px))
         buf = io.BytesIO()
         pil.save(buf, format="PNG")
-        buf.seek(0)
+        return buf.getvalue()
+    except Exception as e:
+        logger.warning("excel_preprocess_image_failed", error=str(e))
+        return None
 
-        xl_img = XLImage(buf)
+
+def _embed_png(ws, png_bytes: bytes, row: int, col: int) -> None:
+    """将已预处理的 PNG bytes 嵌入单元格（非线程安全，须在主线程顺序调用）。"""
+    try:
+        from openpyxl.drawing.image import Image as XLImage
+        from openpyxl.utils import get_column_letter
+        xl_img = XLImage(io.BytesIO(png_bytes))
         xl_img.anchor = f"{get_column_letter(col)}{row}"
         ws.add_image(xl_img)
     except Exception as e:
         logger.warning("excel_embed_image_failed", row=row, col=col, error=str(e))
+
+
+def _embed_image(ws, img_bytes: bytes, row: int, col: int = 1, max_px: int = 60) -> None:
+    """将图片 bytes 缩放后嵌入到指定单元格（保留向后兼容）。"""
+    png = _preprocess_image(img_bytes, max_px)
+    if png:
+        _embed_png(ws, png, row, col)
+
+
+def _preprocess_rows_images(
+    rows: list, n_img_cols: int, max_px: int = 60
+) -> dict[tuple[int, int], bytes]:
+    """并行预处理所有行的图片，返回 {(row_idx, col): png_bytes} 字典。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    tasks: list[tuple[int, int, bytes]] = []
+    for row_idx, row in enumerate(rows, 2):
+        for img_idx, img_bytes in enumerate(row.images[:n_img_cols]):
+            if img_bytes:
+                tasks.append((row_idx, img_idx + 1, img_bytes))
+
+    if not tasks:
+        return {}
+
+    with ThreadPoolExecutor(max_workers=min(8, len(tasks))) as pool:
+        processed = list(pool.map(lambda t: _preprocess_image(t[2], max_px), tasks))
+
+    return {
+        (ri, ci): png
+        for (ri, ci, _), png in zip(tasks, processed)
+        if png
+    }
 
 
 def _apply_header_style(ws, headers: list[str], n_img_cols: int = 1) -> None:
@@ -259,6 +297,11 @@ def _apply_keyword_mapping(attrs: dict, keyword_mapping: dict[str, list[str]]) -
     return result
 
 
+# ─────────────────────── LLM 映射缓存 ───────────────────────
+# key: job_id 字符串，value: keyword_mapping dict
+_keyword_mapping_cache: dict[str, dict[str, list[str]]] = {}
+
+
 # ─────────────────────── 主类 ───────────────────────
 
 class ExcelExporter:
@@ -393,7 +436,8 @@ class ExcelExporter:
                     unbound_image_rows=len(unbound_imgs))
         return rows
 
-    def build_full_excel(self, rows: list[ExportRow]) -> io.BytesIO:
+    @staticmethod
+    def build_full_excel_sync(rows: list[ExportRow]) -> io.BytesIO:
         """
         File 1: 商品图片1 | 商品图片2 | ... | 页码 | SKU ID | 固定属性列 | 动态属性列
         多图支持: 每张子图占一列，最大列数 = max(len(row.images))。
@@ -447,6 +491,9 @@ class ExcelExporter:
         )
         _apply_header_style(ws, headers, n_img_cols=n_img_cols)
 
+        # 并行预处理所有图片
+        preprocessed = _preprocess_rows_images(rows, n_img_cols)
+
         # 数据行
         for row_idx, row in enumerate(rows, 2):
             attrs = row.attributes
@@ -472,11 +519,12 @@ class ExcelExporter:
                     value=val,
                 ).alignment = Alignment(vertical="center", wrap_text=True)
 
-            # 嵌入图片（每张占一列）
+            # 嵌入已预处理图片（每张占一列）
             has_image = False
-            for img_idx, img_bytes in enumerate(row.images[:n_img_cols]):
-                if img_bytes:
-                    _embed_image(ws, img_bytes, row_idx, col=img_idx + 1, max_px=60)
+            for img_idx in range(min(len(row.images), n_img_cols)):
+                png = preprocessed.get((row_idx, img_idx + 1))
+                if png:
+                    _embed_png(ws, png, row_idx, img_idx + 1)
                     has_image = True
 
             ws.row_dimensions[row_idx].height = 60 if has_image else 15
@@ -486,31 +534,18 @@ class ExcelExporter:
         buf.seek(0)
         return buf
 
-    async def build_keywords_excel(
-        self,
+    def build_full_excel(self, rows: list[ExportRow]) -> io.BytesIO:
+        return self.build_full_excel_sync(rows)
+
+    @staticmethod
+    def build_keywords_excel_sync(
         rows: list[ExportRow],
-        llm_service=None,
+        keyword_mapping: dict | None,
     ) -> io.BytesIO:
-        """
-        关键词导出 Excel（平台导入格式）:
-          列: 商品图片 | 规格图片 | 商品名称/描述 | 售价 | 货号 | 商品ID | 标签 |
-              来源(仅自己可见) | 商品简称 | 商品规格 | 颜色 | 规格编码 | 批发价 |
-              打包价 | 代发价 | 拿货价(仅自己可见) | 活动类型 | 活动价 | 库存 |
-              重量(kg) | 备注(公开) | 自动下架时间
-          多图: 同一 SKU 的多张图片各展开为独立行，其余列数据重复。
-        """
+        """纯同步构建关键词 Excel，供线程池调用。keyword_mapping 已由外部预先获取。"""
         import openpyxl
         from openpyxl.styles import Alignment
 
-        # ── 决定映射策略 ──
-        keyword_mapping: dict[str, list[str]] | None = None
-        if llm_service is not None and rows:
-            keyword_mapping = await build_keyword_mapping_via_llm(rows, llm_service)
-            logger.info("keywords_excel_using_llm_mapping")
-        else:
-            logger.info("keywords_excel_using_fallback_mapping")
-
-        # 确定最多图片数（决定"商品图片"重复列数）
         n_img_cols = max((len(row.images) for row in rows), default=1)
         n_img_cols = max(n_img_cols, 1)
 
@@ -518,11 +553,9 @@ class ExcelExporter:
         ws = wb.active
         ws.title = "关键词导出"
 
-        # N 张图片 → N 个同名"商品图片"列 + 21 个关键词列
         headers = ["商品图片"] * n_img_cols + [kf[0] for kf in KEYWORD_FIELDS]
         _apply_header_style(ws, headers, n_img_cols=n_img_cols)
 
-        # 备用候选键（fallback）
         _FALLBACK_CANDIDATES: dict[str, list[str]] = {
             '售价':          ['unit_price', 'price', 'retail_price', '单价', '售价'],
             '商品规格':      ['size', 'spec', 'specification', '规格', '尺寸'],
@@ -536,15 +569,15 @@ class ExcelExporter:
             '自动下架时间':  ['auto_offline_time', '下架时间', 'offline_time'],
         }
 
+        # 并行预处理所有图片
+        preprocessed = _preprocess_rows_images(rows, n_img_cols)
+
         for row_idx, row in enumerate(rows, 2):
             attrs = row.attributes
-
-            # 商品名称/描述 = 品名 + 型号 + 变体规格（如"1人位"）+ 规格
-            # 品名（product_name）由大模型识别，始终纳入字段（如"高箱"、"大床"）
             model = _get_field_value(attrs, ['model_number', 'model', '型号'])
             pname = _get_field_value(attrs, ['product_name', '产品名称', '品名', 'name'])
             size  = _get_field_value(attrs, ['size', 'spec', 'specification', '规格', '尺寸'])
-            variant = row.variant_label  # e.g. "1人位", "2人位", "3人位"
+            variant = row.variant_label
             name_parts = []
             if pname and pname != model:
                 name_parts.append(pname)
@@ -554,7 +587,6 @@ class ExcelExporter:
             name_parts.append(size)
             product_name_val = " ".join(p for p in name_parts if p)
 
-            # 构建每个关键词列的值（固定顺序，对应 KEYWORD_FIELDS）
             kw_data: list[str] = []
             for col_name, _ in KEYWORD_FIELDS:
                 if col_name in _EMPTY_KW_COLS:
@@ -578,7 +610,6 @@ class ExcelExporter:
                     candidates = _FALLBACK_CANDIDATES.get(col_name, [])
                     kw_data.append(_get_field_value(attrs, candidates))
 
-            # 写关键词列（从第 n_img_cols+1 列开始）
             for col_offset, val in enumerate(kw_data):
                 ws.cell(
                     row=row_idx,
@@ -586,11 +617,11 @@ class ExcelExporter:
                     value=val,
                 ).alignment = Alignment(vertical="center", wrap_text=True)
 
-            # 嵌入图片（每张各占一列，列名均为"商品图片"）
             has_image = False
-            for img_idx, img_bytes in enumerate(row.images[:n_img_cols]):
-                if img_bytes:
-                    _embed_image(ws, img_bytes, row_idx, col=img_idx + 1, max_px=60)
+            for img_idx in range(min(len(row.images), n_img_cols)):
+                png = preprocessed.get((row_idx, img_idx + 1))
+                if png:
+                    _embed_png(ws, png, row_idx, img_idx + 1)
                     has_image = True
 
             ws.row_dimensions[row_idx].height = 60 if has_image else 15
@@ -599,3 +630,33 @@ class ExcelExporter:
         wb.save(buf)
         buf.seek(0)
         return buf
+
+    async def build_keywords_excel(
+        self,
+        rows: list[ExportRow],
+        llm_service=None,
+        cache_key: str | None = None,
+    ) -> io.BytesIO:
+        """关键词导出 Excel（平台导入格式）。LLM 映射支持 cache_key 缓存，构建在线程池执行。"""
+        import asyncio
+
+        keyword_mapping: dict[str, list[str]] | None = None
+        if llm_service is not None and rows:
+            if cache_key and cache_key in _keyword_mapping_cache:
+                keyword_mapping = _keyword_mapping_cache[cache_key]
+                logger.info("keywords_excel_using_cached_mapping", cache_key=cache_key)
+            else:
+                keyword_mapping = await build_keyword_mapping_via_llm(rows, llm_service)
+                if cache_key:
+                    _keyword_mapping_cache[cache_key] = keyword_mapping
+                logger.info("keywords_excel_using_llm_mapping")
+        else:
+            logger.info("keywords_excel_using_fallback_mapping")
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            self.build_keywords_excel_sync,
+            rows,
+            keyword_mapping,
+        )

@@ -149,16 +149,23 @@ export const jobsApi = {
       { bbox, ...options },
     ),
 
-  exportExcel: async (jobId: string, filename?: string) => {
-    const blob = await api.getBlob(`/jobs/${jobId}/export/excel`);
-    const url = URL.createObjectURL(blob);
+  startExportTask: async (jobId: string, includeRaw: boolean): Promise<string> => {
+    const res = await api.post<{ task_id: string }>(
+      `/jobs/${jobId}/export/excel/start${includeRaw ? "?include_raw=true" : ""}`
+    );
+    return res.task_id;
+  },
+
+  downloadExportTask: async (jobId: string, taskId: string, filename: string): Promise<void> => {
+    const blob = await api.getBlob(`/jobs/${jobId}/export/excel/${taskId}/download`);
+    const objectUrl = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url;
-    a.download = filename ?? `export_${jobId}.zip`;
+    a.href = objectUrl;
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    URL.revokeObjectURL(objectUrl);
   },
 
   dashboard: () => api.get<DashboardMetrics>("/dashboard/metrics"),

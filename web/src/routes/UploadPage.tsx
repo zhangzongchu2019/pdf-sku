@@ -15,9 +15,35 @@ export default function UploadPage() {
   const notify = useNotificationStore((s) => s.add);
   const [dragActive, setDragActive] = useState(false);
 
+  const handleUploadAndCreate = useCallback(async (uploadId: string) => {
+    try {
+      const fileId = await startUpload(uploadId);
+      const job = await createJob(fileId, merchantId, category || undefined);
+      notify({
+        type: "success",
+        message: job.is_duplicate
+          ? `该文件已存在，跳转到已有任务: ${job.job_id.slice(0, 8)}...`
+          : `Job 创建成功: ${job.job_id.slice(0, 8)}...`,
+      });
+      // 所有上传都完成后跳转：单文件跳详情，多文件跳列表
+      const stillActive = useUploadStore.getState().uploads.filter(
+        (u) => u.id !== uploadId && (u.status === "pending" || u.status === "uploading")
+      );
+      if (stillActive.length === 0) {
+        const allUploads = useUploadStore.getState().uploads;
+        navigate(allUploads.length === 1 ? `/jobs/${job.job_id}` : "/jobs");
+      }
+    } catch (e: any) {
+      notify({ type: "error", message: e.message });
+    }
+  }, [merchantId, category, startUpload, createJob, notify, navigate]);
+
   const handleFiles = useCallback((files: FileList | File[]) => {
-    const arr = Array.from(files);
-    for (const file of arr) {
+    if (!merchantId.trim()) {
+      notify({ type: "error", message: "请先输入商户 ID" });
+      return;
+    }
+    for (const file of Array.from(files)) {
       if (!file.name.toLowerCase().endsWith(".pdf")) {
         notify({ type: "error", message: `${file.name} 不是 PDF 文件` });
         continue;
@@ -26,36 +52,16 @@ export default function UploadPage() {
         notify({ type: "error", message: `${file.name} 超过 16GB 限制` });
         continue;
       }
-      addFile(file);
+      const uploadId = addFile(file);
+      handleUploadAndCreate(uploadId);
     }
-  }, [addFile, notify]);
+  }, [addFile, notify, merchantId, handleUploadAndCreate]);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     setDragActive(false);
     handleFiles(e.dataTransfer.files);
   }, [handleFiles]);
-
-  const handleUploadAndCreate = useCallback(async (uploadId: string) => {
-    if (!merchantId.trim()) {
-      notify({ type: "error", message: "请输入商户 ID" });
-      return;
-    }
-    try {
-      const fileId = await startUpload(uploadId);
-      const job = await createJob(fileId, merchantId, category || undefined);
-      notify({ type: "success", message: `Job 创建成功: ${job.job_id.slice(0, 8)}...` });
-      // 有其他待上传文件时留在当前页，否则跳转到 Job 详情
-      const pending = useUploadStore.getState().uploads.filter(
-        (u) => u.id !== uploadId && u.status === "pending"
-      );
-      if (pending.length === 0) {
-        navigate(`/jobs/${job.job_id}`);
-      }
-    } catch (e: any) {
-      notify({ type: "error", message: e.message });
-    }
-  }, [merchantId, category, startUpload, createJob, notify, navigate]);
 
   return (
     <div className="page upload-page">
@@ -105,13 +111,9 @@ export default function UploadPage() {
                      style={{ width: `${u.progress.percentage}%` }} />
               </div>
               <div className="upload-actions">
-                <span className="upload-status">{u.status === "uploading" ? `${u.progress.percentage}%` : u.status}</span>
-                {u.status === "pending" && (
-                  <button className="btn btn-primary btn-sm"
-                          onClick={() => handleUploadAndCreate(u.id)}>
-                    上传并创建
-                  </button>
-                )}
+                <span className="upload-status">
+                  {u.status === "uploading" ? `${u.progress.percentage}%` : u.status}
+                </span>
                 {u.status === "error" && <span className="error-text">{u.error}</span>}
                 <button className="btn btn-text btn-sm" onClick={() => removeUpload(u.id)}>✕</button>
               </div>

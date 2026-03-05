@@ -9,7 +9,10 @@ Gateway API 路由。对齐: OpenAPI V2.0 §/jobs + §/uploads + §/dashboard
 - Dashboard: GET /dashboard/metrics
 """
 from __future__ import annotations
+import asyncio
 import io
+import json
+import time
 import uuid
 import shutil
 from pathlib import Path
@@ -18,7 +21,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response, Path as PathParam
 from fastapi.responses import JSONResponse, FileResponse
-from sqlalchemy import select, func, desc, delete, update
+from sqlalchemy import select, func, desc, delete, update, or_, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
@@ -184,14 +187,34 @@ async def create_job(
 
     file_path = tus_store.get_file_path(upload_id)
     factory = get_job_factory()
-    job = await factory.create_job(
-        db=db, redis=redis,
-        upload_file_path=file_path,
-        filename=meta["filename"],
-        merchant_id=merchant_id,
-        category=category,
-        uploaded_by=f"{user.username} ({str(user.user_id)[:8]})",
-    )
+    from pdf_sku.common.exceptions import FileHashDuplicateError
+    try:
+        job = await factory.create_job(
+            db=db, redis=redis,
+            upload_file_path=file_path,
+            filename=meta["filename"],
+            merchant_id=merchant_id,
+            category=category,
+            uploaded_by=f"{user.username} ({str(user.user_id)[:8]})",
+            owner_id=user.user_id,
+        )
+    except FileHashDuplicateError as exc:
+        # 相同文件已存在：清理临时文件，返回已有 Job (200 而非 409)
+        try:
+            await tus_store.delete(upload_id)
+        except Exception:
+            pass
+        if exc.existing_job_id:
+            existing = await db.execute(
+                select(PDFJob).where(PDFJob.job_id == uuid.UUID(exc.existing_job_id))
+            )
+            existing_job = existing.scalar_one_or_none()
+            if existing_job:
+                body = _job_to_dict(existing_job, detail=True)
+                body["is_duplicate"] = True
+                return JSONResponse(status_code=200, content=body)
+        raise
+
     # 注意: job_factory.create_job 内部已 commit，此处无需再次 commit
 
     # 清理 TUS 元数据 (文件已移走)
@@ -212,6 +235,7 @@ async def create_job(
 @router.get("/jobs")
 async def list_jobs(
     db: DBSession,
+    user: AnyUser,
     status: str | None = Query(None),
     merchant_id: str | None = Query(None),
     page: int = Query(1, ge=1),
@@ -224,9 +248,22 @@ async def list_jobs(
     if status:
         query = query.where(PDFJob.user_status == status)
         count_query = count_query.where(PDFJob.user_status == status)
-    if merchant_id:
-        query = query.where(PDFJob.merchant_id == merchant_id)
-        count_query = count_query.where(PDFJob.merchant_id == merchant_id)
+
+    if user.role == "admin":
+        # Admin sees all; optionally filter by merchant_id param
+        if merchant_id:
+            query = query.where(PDFJob.merchant_id == merchant_id)
+            count_query = count_query.where(PDFJob.merchant_id == merchant_id)
+    else:
+        # Non-admin users only see their own jobs.
+        # New jobs use owner_id; old jobs (pre-isolation) fall back to uploaded_by match.
+        legacy_uploaded_by = f"{user.username} ({str(user.user_id)[:8]})"
+        ownership_filter = or_(
+            PDFJob.owner_id == user.user_id,
+            and_(PDFJob.owner_id.is_(None), PDFJob.uploaded_by == legacy_uploaded_by),
+        )
+        query = query.where(ownership_filter)
+        count_query = count_query.where(ownership_filter)
 
     total = (await db.execute(count_query)).scalar() or 0
     jobs = (await db.execute(
@@ -245,12 +282,19 @@ async def list_jobs(
 
 
 @router.get("/jobs/{job_id}")
-async def get_job(job_id: uuid.UUID, db: DBSession):
+async def get_job(job_id: uuid.UUID, db: DBSession, user: AnyUser):
     """获取 Job 详情。"""
     result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
     job = result.scalar_one_or_none()
     if not job:
         raise JobNotFoundError(f"Job {job_id} not found")
+    if user.role != "admin":
+        legacy_uploaded_by = f"{user.username} ({str(user.user_id)[:8]})"
+        owns = (job.owner_id == user.user_id) or (
+            job.owner_id is None and job.uploaded_by == legacy_uploaded_by
+        )
+        if not owns:
+            raise JobNotFoundError(f"Job {job_id} not found")
     return _job_to_dict(job, detail=True)
 
 
@@ -505,6 +549,34 @@ async def reprocess_single_page(
         "page_number": page_number,
         "status": result.status,
         "sku_count": len(result.skus),
+    }
+
+
+@router.post("/ops/jobs/{job_id}/force-finalize")
+async def force_finalize_job(job_id: uuid.UUID, db: DBSession, request: Request):
+    """
+    对已完成所有页面但 Job 状态卡在 PROCESSING 的任务进行强制终态计算。
+    不重新处理任何页面，仅根据当前页面状态更新 Job 状态。
+    """
+    result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise JobNotFoundError(f"Job {job_id} not found")
+
+    orchestrator = request.app.state.orchestrator
+    async with orchestrator._db_factory() as final_db:
+        fresh = (await final_db.execute(
+            select(PDFJob).where(PDFJob.job_id == job_id)
+        )).scalar_one()
+        await orchestrator._finalize_job(final_db, fresh)
+        await final_db.commit()
+        new_status = fresh.status
+        new_user_status = fresh.user_status
+
+    return {
+        "job_id": str(job_id),
+        "status": new_status,
+        "user_status": new_user_status,
     }
 
 
@@ -1232,37 +1304,170 @@ async def get_evaluation(job_id: uuid.UUID, db: DBSession):
     }
 
 
-# ───────────────────────── Excel 导出 ─────────────────────────
+# ───────────────────────── Excel 导出（任务式，支持进度） ─────────────────────────
+
+# 内存中的导出任务表: task_id -> task dict
+_export_tasks: dict[str, dict] = {}
+
+
+def _cleanup_export_tasks() -> None:
+    """清理超过 10 分钟的旧任务。"""
+    cutoff = time.monotonic() - 600
+    stale = [k for k, v in _export_tasks.items() if v.get("ts", 0) < cutoff]
+    for k in stale:
+        del _export_tasks[k]
+
+
+async def _run_export_task(
+    task_id: str,
+    job_id: uuid.UUID,
+    include_raw: bool,
+    session_factory,
+    llm_service,
+    job_data_dir: str,
+) -> None:
+    from pdf_sku.pipeline.exporter.excel_exporter import (
+        ExcelExporter,
+        build_keyword_mapping_via_llm,
+        _keyword_mapping_cache,
+    )
+    task = _export_tasks[task_id]
+
+    def upd(**kw):
+        task.update(kw)
+
+    try:
+        # ── 1. 加载数据 ──────────────────────────────────────────
+        upd(step="loading", progress=5, message="正在加载数据...")
+        exporter = ExcelExporter(job_data_dir)
+        async with session_factory() as db:
+            rows = await exporter.load_job_data(db, job_id)
+        upd(step="loading", progress=18, message=f"已加载 {len(rows)} 行数据")
+
+        # ── 2. LLM 语义映射 ──────────────────────────────────────
+        keyword_mapping = None
+        cache_key = str(job_id)
+        if rows and llm_service:
+            if cache_key in _keyword_mapping_cache:
+                keyword_mapping = _keyword_mapping_cache[cache_key]
+                upd(step="mapping", progress=55, message="使用已缓存的语义映射")
+            else:
+                upd(step="mapping", progress=20, message="正在进行语义映射（LLM）...")
+                keyword_mapping = await build_keyword_mapping_via_llm(rows, llm_service)
+                _keyword_mapping_cache[cache_key] = keyword_mapping
+                upd(step="mapping", progress=55, message="语义映射完成")
+
+        # ── 3. 生成 Excel ──────────────────────────────────────
+        upd(step="building", progress=60, message="正在生成 Excel 文件...")
+        loop = asyncio.get_event_loop()
+
+        if include_raw:
+            import zipfile
+            kw_fut = loop.run_in_executor(
+                None, ExcelExporter.build_keywords_excel_sync, rows, keyword_mapping
+            )
+            full_fut = loop.run_in_executor(
+                None, ExcelExporter.build_full_excel_sync, rows
+            )
+            kw_bytes, full_bytes = await asyncio.gather(kw_fut, full_fut)
+            upd(step="building", progress=90, message="正在打包 ZIP...")
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr(f"{job_id}_full.xlsx", full_bytes.getvalue())
+                zf.writestr(f"{job_id}_keywords.xlsx", kw_bytes.getvalue())
+            data = zip_buf.getvalue()
+            content_type = "application/zip"
+            filename = f"export_{job_id}.zip"
+        else:
+            kw_bytes = await loop.run_in_executor(
+                None, ExcelExporter.build_keywords_excel_sync, rows, keyword_mapping
+            )
+            data = kw_bytes.getvalue()
+            content_type = (
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            filename = f"export_{job_id}.xlsx"
+
+        upd(
+            step="done", progress=100, status="done",
+            message="导出完成！",
+            data=data, content_type=content_type, filename=filename,
+        )
+
+    except Exception as exc:
+        logger.error("export_task_failed", task_id=task_id, error=str(exc))
+        upd(step="error", progress=-1, status="error",
+            message=f"导出失败: {exc}", error=str(exc))
+
+
+@router.post(
+    "/jobs/{job_id}/export/excel/start",
+    summary="启动 Excel 导出任务，返回 task_id",
+)
+async def start_export_task(
+    job_id: uuid.UUID,
+    request: Request,
+    include_raw: bool = Query(False),
+):
+    _cleanup_export_tasks()
+    task_id = str(uuid.uuid4())
+    _export_tasks[task_id] = {
+        "status": "running", "step": "starting", "progress": 0,
+        "message": "准备中...", "data": None,
+        "content_type": None, "filename": None, "error": None,
+        "ts": time.monotonic(),
+    }
+    sf = request.app.state.session_factory
+    asyncio.create_task(
+        _run_export_task(task_id, job_id, include_raw, sf, get_llm_service(), settings.job_data_dir)
+    )
+    return {"task_id": task_id}
+
 
 @router.get(
-    "/jobs/{job_id}/export/excel",
-    summary="导出 Job SKU 识别结果为 Excel（ZIP 包）",
+    "/jobs/{job_id}/export/excel/{task_id}/events",
+    summary="SSE 进度流（无需鉴权，task_id 即凭证）",
+    response_class=EventSourceResponse,
+)
+async def export_task_events(task_id: str):
+    async def _gen():
+        while True:
+            task = _export_tasks.get(task_id)
+            if task is None:
+                yield {"data": json.dumps({"step": "error", "progress": -1, "message": "任务不存在或已过期"})}
+                return
+            payload = {
+                "step": task["step"],
+                "progress": task["progress"],
+                "message": task.get("message", ""),
+            }
+            if task.get("error"):
+                payload["error"] = task["error"]
+            yield {"data": json.dumps(payload)}
+            if task["status"] in ("done", "error"):
+                return
+            await asyncio.sleep(0.4)
+
+    return EventSourceResponse(_gen())
+
+
+@router.get(
+    "/jobs/{job_id}/export/excel/{task_id}/download",
+    summary="下载导出完成的 Excel 文件",
     response_class=Response,
 )
-async def export_job_excel(
-    job_id: uuid.UUID,
-    db: DBSession,
-):
-    """将指定 Job 的所有 SKU 及绑定图片导出为两个 Excel 文件（ZIP 打包返回）。"""
-    import zipfile
-    from pdf_sku.pipeline.exporter.excel_exporter import ExcelExporter
-
-    exporter = ExcelExporter(settings.job_data_dir)
-    rows = await exporter.load_job_data(db, job_id)
-
-    full_bytes = exporter.build_full_excel(rows)
-    kw_bytes = await exporter.build_keywords_excel(rows, llm_service=get_llm_service())
-
-    zip_buf = io.BytesIO()
-    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(f"{job_id}_full.xlsx", full_bytes.getvalue())
-        zf.writestr(f"{job_id}_keywords.xlsx", kw_bytes.getvalue())
-    zip_buf.seek(0)
-
+async def download_export_task(task_id: str):
+    task = _export_tasks.get(task_id)
+    if task is None:
+        from fastapi import HTTPException
+        raise HTTPException(404, "任务不存在或已过期")
+    if task["status"] != "done":
+        from fastapi import HTTPException
+        raise HTTPException(400, f"任务尚未完成（当前状态: {task['status']}）")
     return Response(
-        content=zip_buf.getvalue(),
-        media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="export_{job_id}.zip"'},
+        content=task["data"],
+        media_type=task["content_type"],
+        headers={"Content-Disposition": f'attachment; filename="{task["filename"]}"'},
     )
 
 
@@ -1286,25 +1491,38 @@ async def sse_stream(job_id: uuid.UUID, db: DBSession):
 # ───────────────────────── Dashboard ─────────────────────────
 
 @router.get("/dashboard/metrics")
-async def dashboard_metrics(db: DBSession):
+async def dashboard_metrics(db: DBSession, user: AnyUser):
     """仪表盘概览指标 (增强版)。"""
     from pdf_sku.gateway.dashboard import DashboardService
-    from datetime import timedelta
+
+    # 非 admin 用户只统计自己的数据
+    owner_id = None if user.role == "admin" else user.user_id
+    legacy_uploaded_by = (
+        None if user.role == "admin"
+        else f"{user.username} ({str(user.user_id)[:8]})"
+    )
 
     dashboard = DashboardService()
-    overview = await dashboard.get_overview(db)
+    overview = await dashboard.get_overview(db, owner_id=owner_id, legacy_uploaded_by=legacy_uploaded_by)
 
     # 补充今日统计
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    today_jobs = (await db.execute(
-        select(func.count()).where(PDFJob.created_at >= today_start)
-    )).scalar() or 0
+    today_jobs_q = select(func.count()).select_from(PDFJob).where(PDFJob.created_at >= today_start)
+    today_skus_q = select(func.count()).select_from(SKU).join(
+        PDFJob, SKU.job_id == PDFJob.job_id
+    ).where(SKU.created_at >= today_start)
+    if owner_id is not None:
+        ownership = or_(
+            PDFJob.owner_id == owner_id,
+            and_(PDFJob.owner_id.is_(None), PDFJob.uploaded_by == legacy_uploaded_by),
+        )
+        today_jobs_q = today_jobs_q.where(ownership)
+        today_skus_q = today_skus_q.where(ownership)
 
-    today_skus = (await db.execute(
-        select(func.count()).where(SKU.created_at >= today_start)
-    )).scalar() or 0
+    today_jobs = (await db.execute(today_jobs_q)).scalar() or 0
+    today_skus = (await db.execute(today_skus_q)).scalar() or 0
 
     return {
         "today_jobs": today_jobs,

@@ -645,6 +645,54 @@ async def lifespan(app: FastAPI):
                     await asyncio.sleep(60)
 
             bg_tasks.append(asyncio.create_task(orphan_loop()))
+
+            # 定时恢复: 每60秒扫描页面全部终态但 Job 仍卡在 PROCESSING 的任务并自动终态
+            async def _stuck_job_recovery_loop():
+                from sqlalchemy import select as _select
+                from pdf_sku.common.models import PDFJob as _PDFJob, Page as _Page
+                from pdf_sku.common.enums import PageStatus as _PageStatus
+
+                _terminal = {
+                    _PageStatus.AI_COMPLETED.value,
+                    _PageStatus.HUMAN_COMPLETED.value,
+                    _PageStatus.IMPORTED_CONFIRMED.value,
+                    _PageStatus.IMPORTED_ASSUMED.value,
+                    _PageStatus.BLANK.value,
+                    _PageStatus.AI_FAILED.value,
+                    _PageStatus.IMPORT_FAILED.value,
+                    _PageStatus.DEAD_LETTER.value,
+                    _PageStatus.SKIPPED.value,
+                }
+
+                while True:
+                    try:
+                        async with session_factory() as rdb:
+                            jobs = (await rdb.execute(
+                                _select(_PDFJob).where(
+                                    _PDFJob.status.in_(["PROCESSING", "PARTIAL_FAILED"])
+                                )
+                            )).scalars().all()
+
+                            for stuck_job in jobs:
+                                pages = (await rdb.execute(
+                                    _select(_Page.status).where(_Page.job_id == stuck_job.job_id)
+                                )).scalars().all()
+                                if pages and all(s in _terminal for s in pages):
+                                    log.info("recovering_stuck_job", job_id=str(stuck_job.job_id))
+                                    async with session_factory() as fin_db:
+                                        fresh = (await fin_db.execute(
+                                            _select(_PDFJob).where(_PDFJob.job_id == stuck_job.job_id)
+                                        )).scalar_one()
+                                        await orchestrator._finalize_job(fin_db, fresh)
+                                        await fin_db.commit()
+                                    log.info("stuck_job_recovered",
+                                             job_id=str(stuck_job.job_id),
+                                             new_status=fresh.status)
+                    except Exception as _e:
+                        log.warning("stuck_job_recovery_failed", error=str(_e))
+                    await asyncio.sleep(60)
+
+            bg_tasks.append(asyncio.create_task(_stuck_job_recovery_loop()))
             await scheduled_runner.start()
             log.info("background_tasks_started", count=len(bg_tasks))
 
