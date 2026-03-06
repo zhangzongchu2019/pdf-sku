@@ -1162,6 +1162,14 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
         for i in range(n):
             clusters[find(i)].append(i)
 
+        # 超大聚类 (> MAX_COMPOSITE_TILES 个碎片) 说明是密集产品网格
+        # (如椅子页面每格各一张图), 不应合并成一张大图——保留各自作为独立商品图
+        MAX_COMPOSITE_TILES = 10
+
+        # 瓦片页单张图片判定为商品图的最小短边 (150 DPI 像素)。
+        # 比普通页门槛 (200px) 低，因为密集网格页每个商品格本身就小。
+        TILE_PAGE_MIN_SHORT = 80
+
         dpi_scale = 150 / 72.0
         merged: list[ImageInfo] = []
         composite_idx = 0
@@ -1175,15 +1183,26 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                     _single_short = int(min(_dw, _dh))
                 else:
                     _single_short = img.short_edge or 0
-                if _single_short >= 200:
-                    # 大尺寸独立图片: 不是碎片，保留为商品图
+                if _single_short >= TILE_PAGE_MIN_SHORT:
+                    # 瓦片页上足够大的独立图片 = 商品图，保留
                     img.is_fragmented = False
                     img.search_eligible = True
                 else:
-                    # 小碎片: 标记为碎片，不参与绑定
+                    # 极小碎片 (图标/水印): 标记为碎片，不参与绑定
                     img.is_fragmented = True
                     img.search_eligible = False
                 merged.append(img)
+                continue
+
+            if len(members) > MAX_COMPOSITE_TILES:
+                # 超大聚类: 密集产品网格，每张图是独立的商品图，直接保留
+                for m in members:
+                    img = images[m]
+                    img.is_fragmented = False
+                    img.search_eligible = True
+                    merged.append(img)
+                logger.info("tile_cluster_too_large_kept_individual",
+                            page_no=page_no, members=len(members))
                 continue
 
             # 合并: 计算外接矩形
@@ -1202,7 +1221,7 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                 width=int(dw),
                 height=int(dh),
                 short_edge=short,
-                search_eligible=short >= 200,
+                search_eligible=short >= TILE_PAGE_MIN_SHORT,
                 is_tile_composite=True,
                 role="unknown",
             )

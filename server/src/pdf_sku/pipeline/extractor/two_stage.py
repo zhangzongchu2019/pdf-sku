@@ -14,38 +14,46 @@ import structlog
 logger = structlog.get_logger()
 _parser = ResponseParser()
 
-DENSE_ANNOTATED_PROMPT = """This cropped catalog image shows {n} product cells labeled CELL-1 to CELL-{n} from left to right (red numbered boxes).
+DENSE_ANNOTATED_PROMPT = """This cropped catalog image shows {n} product cells labeled CELL-1 to CELL-{n} with red numbered boxes.
 
-Read the product label text beneath each red-boxed image. Each label shows:
-  product type : model_number
-  seat-count (人位) : size_in_mm   (or just "规格 : size")
+Read the label text for each cell EXACTLY as it appears in the image.
+
+CRITICAL — text faithfulness rules:
+- Copy ALL text verbatim from the image. Do NOT translate, paraphrase, or simplify.
+- Preserve Chinese characters exactly: "餐桌（table）" stays "餐桌（table）", NOT "table".
+- Preserve parenthetical content: "B24#硬" stays "B24#硬", "Y11*（圆9分角）" stays as-is.
+- model_number: copy exactly including #, *, （）, 硬, and any suffixes shown.
+- The label format varies — it may be ONLY a model number (e.g. "241#"), or include product type, size, price.
+  Extract whatever fields are actually visible; leave other fields as "".
 
 Return EXACTLY {n} entries in order (CELL-1 first, CELL-{n} last). Do NOT skip any cell.
 
 Respond ONLY with a JSON array:
 [
-  {{"cell": 1, "product_name": "沙发", "model_number": "LF302#", "size": "1110*860*900mm", "variant_label": "单人位"}},
-  {{"cell": 2, "product_name": "沙发", "model_number": "LF302#", "size": "1760*860*900mm", "variant_label": "双人位"}},
+  {{"cell": 1, "product_name": "餐椅", "model_number": "241#", "size": "", "variant_label": ""}},
+  {{"cell": 2, "product_name": "沙发", "model_number": "LF302#", "size": "1110*860*900mm", "variant_label": "单人位"}},
   ...
 ]
 
 Rules:
 - Return EXACTLY {n} objects, ordered cell 1 … {n}
-- variant_label: seat-count string if visible (单人位/双人位/三人位/四人位), else ""
-- ONE entry per cell even if label shows multiple sizes — use the size shown for that specific cell
-- If text is unclear, still return an entry; use whatever you can read or infer from the product image"""
+- variant_label: seat-count string if visible (单人位/双人位/三人位/四人位/单椅/etc.), else ""
+- If a cell label is partly unclear, still return an entry with whatever text you can read"""
 
 SINGLE_CELL_PROMPT = """This cropped catalog image shows a single product cell.
 Read the product label text visible (typically below or beside the product image).
-The label usually shows: product type, model number, variant (人位/seat count), size.
+
+CRITICAL — text faithfulness rules:
+- Copy ALL text verbatim from the image. Do NOT translate, paraphrase, or simplify.
+- Preserve Chinese characters exactly: "餐桌（table）" stays "餐桌（table）", NOT "table".
+- model_number: keep exactly as shown including #, *, suffixes like 硬, parentheticals like （圆9分角）.
 
 Return ONLY a single JSON object:
-{{"product_name": "沙发", "model_number": "LF302#", "size": "1110*860*900mm", "variant_label": "单人位"}}
+{{"product_name": "餐椅", "model_number": "241#", "size": "", "variant_label": ""}}
 
 Rules:
-- variant_label: seat-count string if visible (单人位/双人位/三人位/四人位), else ""
-- model_number: keep exactly as shown (e.g. "LF302#", "LF303#")
-- If text is unclear, return your best guess — do NOT return null or an empty object"""
+- variant_label: seat-count if visible (单人位/双人位/三人位/四人位), else ""
+- If text is unclear, return your best reading — do NOT return null or an empty object"""
 
 BOUNDARY_PROMPT_TEMPLATE = """Identify ALL product boundaries in this PDF catalog page image.
 The image dimensions are {img_w} x {img_h} pixels.
@@ -60,6 +68,12 @@ Respond with ONLY a JSON array:
 
 ATTR_PROMPT = """Extract products and their SKU variants for each boundary region.
 Each boundary may contain one or more products. Each product may have multiple SKU variants.
+
+CRITICAL — text faithfulness rules:
+- Copy ALL text verbatim from the image/OCR. Do NOT translate, paraphrase, or simplify.
+- Preserve Chinese characters exactly: "餐桌（table）" stays "餐桌（table）", NOT "table".
+- Preserve parenthetical content and suffixes exactly as written.
+- product_name and model_number must match what is visible in the PDF — no translation, no summarization.
 
 CRITICAL rule — how to count products:
 - If raw OCR text is available (not "(none)"), count every distinct "型号：" / "型号:" entry.
@@ -98,12 +112,12 @@ Respond with ONLY a JSON array:
   "boundary_id": 1,
   "products": [
     {{
-      "product_name": "858B# Sofa",
-      "model_number": "858B",
-      "common_attrs": {{"material": "imported oak", "color": "chestnut/grey"}},
+      "product_name": "858B#布艺沙发",
+      "model_number": "858B#",
+      "common_attrs": {{"material": "进口橡木", "color": "栗色/灰色"}},
       "skus": [
-        {{"variant_label": "single seat", "size": "850*900*950mm"}},
-        {{"variant_label": "double seat", "size": "1400*900*950mm"}}
+        {{"variant_label": "单人位", "size": "850*900*950mm"}},
+        {{"variant_label": "双人位", "size": "1400*900*950mm"}}
       ]
     }}
   ]
@@ -141,17 +155,27 @@ class TwoStageExtractor:
         if not self._llm:
             return self._rule_boundaries(text_blocks, text_roles, images=images)
 
-        # 密集图片目录页: 大量瓦片合成图（>=20）→ 跳过 LLM 边界识别，直接用图片 bbox 作边界
-        # 注意: 只计算 is_tile_composite=True 的合成图，不含瓦片页上恢复的大尺寸独立图片
-        # （独立图片用于绑定，但不触发密集页路径，以免干扰 LLM 边界识别）
+        # 密集图片目录页: 大量可交付图片（>=20）→ 跳过 LLM 边界识别，直接用图片 bbox 作边界
+        # 两种情形:
+        # 1. 大量瓦片合成图 (is_tile_composite=True): 旧代码路径
+        # 2. 大量小尺寸独立产品图 (short_edge < 300): 如椅子密集网格页，每格一张独立图
+        #    在这种情形下 LLM boundary detection 会返回粗粒度边界（<20），触发 ATTR_PROMPT
+        #    而非 dense_by_rows，导致绑定错位。直接用图片 bbox 作锚点更准确。
         eligible_imgs = [img for img in (images or []) if getattr(img, "search_eligible", False)]
         tile_composite_imgs = [img for img in eligible_imgs if getattr(img, "is_tile_composite", False)]
-        if len(tile_composite_imgs) >= 20:
+        small_individual_imgs = [
+            img for img in eligible_imgs
+            if not getattr(img, "is_tile_composite", False)
+            and (img.short_edge or 0) < 300
+        ]
+        is_dense_imageset = len(tile_composite_imgs) >= 20 or len(small_individual_imgs) >= 20
+        if is_dense_imageset:
             logger.info("dense_imageset_boundary_skip_llm",
                         tile_composite_count=len(tile_composite_imgs),
+                        small_individual_count=len(small_individual_imgs),
                         eligible_count=len(eligible_imgs),
                         text_block_count=len(text_blocks),
-                        reason="tile composites >= 20, using image bboxes as boundaries directly")
+                        reason="dense imageset >= 20, using image bboxes as boundaries directly")
             return self._rule_boundaries(text_blocks, text_roles, images=images)
 
         # 获取截图实际尺寸
