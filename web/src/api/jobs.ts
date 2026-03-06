@@ -137,6 +137,11 @@ export const jobsApi = {
       `/jobs/${jobId}/pages/${pageNo}/ocr-region`, { bbox }
     ),
 
+  skuFromRegion: (jobId: string, pageNo: number, bbox: number[]) =>
+    api.post<{ sku_id: string; page_number: number; attributes: Record<string, string>; source_text: string; validity: string }>(
+      `/jobs/${jobId}/pages/${pageNo}/sku-from-region`, { bbox }
+    ),
+
   /** 从页面截图裁剪商品子图 (添加新图片 或 调整已有图片) */
   cropImage: (
     jobId: string,

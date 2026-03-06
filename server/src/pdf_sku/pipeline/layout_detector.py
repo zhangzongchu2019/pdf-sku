@@ -177,6 +177,13 @@ def split_composite_image(
         return images
 
     big_img = eligible[0]
+
+    # 只对瓦片拼合图（_merge_tile_fragments 创建）运行 YOLO。
+    # 扫描版全页图或单品展示图不应拆分：YOLO 只能检测到产品图片区域，
+    # 无法覆盖旁边的文字标签，拆分后会导致绑定错位并引入多余 SKU。
+    if not getattr(big_img, "is_tile_composite", False):
+        return images
+
     bx0, by0, bx1, by1 = big_img.bbox
     img_area = abs(bx1 - bx0) * abs(by1 - by0)
     page_area = page_width * page_height

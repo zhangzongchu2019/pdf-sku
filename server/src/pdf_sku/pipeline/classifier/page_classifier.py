@@ -57,8 +57,10 @@ class PageClassifier:
 
     def _rule_classify(self, features: FeatureVector, raw_text: str) -> ClassifyResult | None:
         """基于特征的规则分类。"""
-        # A: 表格主导 (优先于空白页检测，有表格就不算空白)
-        if features.table_count > 0 and features.table_area_ratio > 0.3:
+        # A: 结构化表格页 — 须有实际文字内容，避免把全页布局容器（无文字）误判为表格页
+        if (features.table_count > 0
+                and features.table_area_ratio > 0.3
+                and features.text_block_count > 0):
             return ClassifyResult(page_type="A", layout_type="table", confidence=0.88)
 
         # D: 空白页（无文字、无图片、无表格）

@@ -237,11 +237,13 @@ class PageProcessor:
                 skus = self._validator.deduplicate_skus(skus)
 
             # ── retry: validity 全灭 或 SKU 数远少于图片数 ──
+            # 包含 extraction_method=None（所有 LLM 调用均失败）的情况：
+            # 并发处理时 API 限流可能导致全部失败，重试时往往可以成功
             eligible_count = sum(1 for img in raw.images if img.search_eligible)
             should_retry = (
                 page_type not in ("D", "A")
                 and (
-                    (not skus and extraction_method is not None)
+                    (not skus and eligible_count >= 1)
                     or (0 < len(skus) < eligible_count * 0.7
                         and eligible_count >= 1)
                 )
@@ -426,9 +428,13 @@ class PageProcessor:
             try:
                 # 获取截图实际像素尺寸，传给 VLM 做坐标归一化
                 _img_size = self._two_stage._get_image_size(screenshot) if screenshot else (0, 0)
+                _page_size = (
+                    raw.metadata.page_width or 0.0,
+                    raw.metadata.page_height or 0.0,
+                )
                 boundaries = await self._two_stage.identify_boundaries(
                     raw.text_blocks, None, screenshot, image_size=_img_size,
-                    images=raw.images)
+                    images=raw.images, page_size=_page_size)
                 if boundaries:
                     skus = await self._two_stage.extract_batch(
                         boundaries, raw, screenshot=screenshot)
@@ -1156,6 +1162,7 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
         for i in range(n):
             clusters[find(i)].append(i)
 
+        dpi_scale = 150 / 72.0
         merged: list[ImageInfo] = []
         composite_idx = 0
         for members in clusters.values():
@@ -1184,7 +1191,6 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
             y0 = min(images[m].bbox[1] for m in members)
             x1 = max(images[m].bbox[2] for m in members)
             y1 = max(images[m].bbox[3] for m in members)
-            dpi_scale = 150 / 72.0
             dw = (x1 - x0) * dpi_scale
             dh = (y1 - y0) * dpi_scale
             short = int(min(dw, dh))

@@ -383,8 +383,10 @@ function PageVerifyPanel({
   const [hoveredSkuId, setHoveredSkuId] = useState<string | null>(null);
   const [naturalSize, setNaturalSize] = useState<[number, number] | null>(null);
   const [cropMode, setCropMode] = useState(false);
+  const [skuExtractMode, setSkuExtractMode] = useState(false);
   const [drawing, setDrawing] = useState<{ sx: number; sy: number; ex: number; ey: number } | null>(null);
   const [cropping, setCropping] = useState(false);
+  const [skuExtracting, setSkuExtracting] = useState(false);
   const screenshotImgRef = useRef<HTMLImageElement>(null);
 
   let hoveredBboxes: number[][] = [];
@@ -439,6 +441,27 @@ function PageVerifyPanel({
     finally { setCropping(false); }
   };
 
+  const handleSkuExtractMouseUp = async (e: React.MouseEvent) => {
+    if (!drawing) return;
+    e.stopPropagation();
+    const img = screenshotImgRef.current;
+    if (!img) { setDrawing(null); return; }
+    const rect = img.getBoundingClientRect();
+    const x1 = Math.round(Math.min(drawing.sx, drawing.ex) * img.naturalWidth / rect.width);
+    const y1 = Math.round(Math.min(drawing.sy, drawing.ey) * img.naturalHeight / rect.height);
+    const x2 = Math.round(Math.max(drawing.sx, drawing.ex) * img.naturalWidth / rect.width);
+    const y2 = Math.round(Math.max(drawing.sy, drawing.ey) * img.naturalHeight / rect.height);
+    setDrawing(null);
+    if (x2 - x1 < 20 || y2 - y1 < 20) return;
+    setSkuExtracting(true);
+    try {
+      await jobsApi.skuFromRegion(jobId, page.page_number, [x1, y1, x2, y2]);
+      await onUpdated();
+      setSkuExtractMode(false);
+    } catch (err) { console.error("框选识别SKU失败:", err); alert("识别失败，请重试"); }
+    finally { setSkuExtracting(false); }
+  };
+
   const handleDeleteImage = async (imageId: string) => {
     try { await jobsApi.deleteImage(jobId, page.page_number, imageId); await onUpdated(); }
     catch (err) { console.error("删除图片失败:", err); }
@@ -463,7 +486,7 @@ function PageVerifyPanel({
         </span>
         <div style={{ flex: 1 }} />
         <button
-          onClick={() => { setCropMode(!cropMode); setDrawing(null); }}
+          onClick={() => { setCropMode(!cropMode); setSkuExtractMode(false); setDrawing(null); }}
           style={{
             padding: "3px 10px", fontSize: 11, cursor: "pointer",
             backgroundColor: cropMode ? "#22D3EE22" : "transparent",
@@ -472,6 +495,17 @@ function PageVerifyPanel({
           }}
         >
           {cropping ? "裁剪中..." : cropMode ? "取消框选" : "✏ 框选子图"}
+        </button>
+        <button
+          onClick={() => { setSkuExtractMode(!skuExtractMode); setCropMode(false); setDrawing(null); }}
+          style={{
+            padding: "3px 10px", fontSize: 11, cursor: "pointer",
+            backgroundColor: skuExtractMode ? "#A78BFA22" : "transparent",
+            border: `1px solid ${skuExtractMode ? "#A78BFA44" : "#2D3548"}`,
+            borderRadius: 3, color: skuExtractMode ? "#A78BFA" : "#94A3B8",
+          }}
+        >
+          {skuExtracting ? "识别中..." : skuExtractMode ? "取消识别" : "🔍 框选识别SKU"}
         </button>
         <button
           onClick={(e) => { e.stopPropagation(); prevPage && onNavigate(prevPage.page_number); }}
@@ -500,11 +534,11 @@ function PageVerifyPanel({
       <div style={{ display: "flex" }}>
         <div style={{ width: 380, flexShrink: 0, padding: 16, borderRight: "1px solid #1E293B" }}>
           <div
-            style={{ position: "relative", cursor: cropMode ? "crosshair" : "default", userSelect: "none" }}
-            onMouseDown={cropMode ? handleCropMouseDown : undefined}
-            onMouseMove={cropMode ? handleCropMouseMove : undefined}
-            onMouseUp={cropMode ? handleCropMouseUp : undefined}
-            onMouseLeave={cropMode ? () => setDrawing(null) : undefined}
+            style={{ position: "relative", cursor: (cropMode || skuExtractMode) ? "crosshair" : "default", userSelect: "none" }}
+            onMouseDown={(cropMode || skuExtractMode) ? handleCropMouseDown : undefined}
+            onMouseMove={(cropMode || skuExtractMode) ? handleCropMouseMove : undefined}
+            onMouseUp={cropMode ? handleCropMouseUp : skuExtractMode ? handleSkuExtractMouseUp : undefined}
+            onMouseLeave={(cropMode || skuExtractMode) ? () => setDrawing(null) : undefined}
           >
             <img
               ref={screenshotImgRef}
@@ -526,14 +560,15 @@ function PageVerifyPanel({
                 pointerEvents: "none", boxShadow: "0 0 0 2px #22D3EE33",
               }} />
             ))}
-            {cropMode && drawing && (
+            {(cropMode || skuExtractMode) && drawing && (
               <div style={{
                 position: "absolute",
                 left: Math.min(drawing.sx, drawing.ex),
                 top: Math.min(drawing.sy, drawing.ey),
                 width: Math.abs(drawing.ex - drawing.sx),
                 height: Math.abs(drawing.ey - drawing.sy),
-                border: "2px dashed #22D3EE", backgroundColor: "#22D3EE18",
+                border: `2px dashed ${skuExtractMode ? "#A78BFA" : "#22D3EE"}`,
+                backgroundColor: skuExtractMode ? "#A78BFA18" : "#22D3EE18",
                 borderRadius: 2, pointerEvents: "none",
               }} />
             )}

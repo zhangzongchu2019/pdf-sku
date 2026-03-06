@@ -1587,76 +1587,19 @@ async def ocr_region(
             "message": "LLM service is not initialized",
         })
 
-    # Get page screenshot PNG bytes
+    # Load screenshot and crop region
     job_dir = Path(settings.job_data_dir) / str(job_id)
-    cache_path = job_dir / "screenshots" / f"page-{page_number}.png"
-    png_bytes: bytes | None = None
-
-    if cache_path.exists():
-        png_bytes = cache_path.read_bytes()
-    else:
-        source_pdf = job_dir / "source.pdf"
-        if not source_pdf.exists():
-            return JSONResponse(status_code=404, content={
-                "error_code": "SOURCE_PDF_MISSING",
-                "message": f"Source PDF not found for job {job_id}",
-            })
-        try:
-            import fitz
-            doc = fitz.open(source_pdf)
-            try:
-                if page_number < 1 or page_number > doc.page_count:
-                    return JSONResponse(status_code=404, content={
-                        "error_code": "PAGE_OUT_OF_RANGE",
-                        "message": f"Page {page_number} is out of range",
-                    })
-                zoom = 150 / 72
-                pix = doc[page_number - 1].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-                png_bytes = pix.tobytes("png")
-            finally:
-                doc.close()
-        except Exception as e:
-            logger.exception("ocr_screenshot_failed", error=str(e))
-            return JSONResponse(status_code=500, content={
-                "error_code": "RENDER_FAILED",
-                "message": "Failed to render page for OCR",
-            })
-
-    # Crop bbox region using Pillow
-    try:
-        from PIL import Image as PILImage
-        import io
-
-        full_img = PILImage.open(io.BytesIO(png_bytes))
-        x1, y1, x2, y2 = [int(v) for v in bbox]
-        # Clamp to image bounds
-        x1 = max(0, min(x1, full_img.width))
-        y1 = max(0, min(y1, full_img.height))
-        x2 = max(0, min(x2, full_img.width))
-        y2 = max(0, min(y2, full_img.height))
-        cropped = full_img.crop((x1, y1, x2, y2))
-
-        # Resize if too large — LLM APIs have image size limits
-        MAX_LONG_EDGE = 2048
-        w, h = cropped.size
-        if max(w, h) > MAX_LONG_EDGE:
-            ratio = MAX_LONG_EDGE / max(w, h)
-            cropped = cropped.resize(
-                (int(w * ratio), int(h * ratio)),
-                PILImage.LANCZOS,
-            )
-            logger.info("ocr_crop_resized",
-                        original=f"{w}x{h}",
-                        resized=f"{cropped.size[0]}x{cropped.size[1]}")
-
-        buf = io.BytesIO()
-        cropped.save(buf, format="PNG")
-        crop_bytes = buf.getvalue()
-    except Exception as e:
-        logger.exception("ocr_crop_failed", error=str(e))
-        return JSONResponse(status_code=500, content={
+    png_bytes = await _load_page_screenshot(job_dir, page_number)
+    if not png_bytes:
+        return JSONResponse(status_code=404, content={
+            "error_code": "SCREENSHOT_NOT_FOUND",
+            "message": f"Page {page_number} screenshot not found",
+        })
+    crop_bytes = await _crop_region(png_bytes, bbox)
+    if not crop_bytes:
+        return JSONResponse(status_code=400, content={
             "error_code": "CROP_FAILED",
-            "message": "Failed to crop image region",
+            "message": "Bbox too small or invalid",
         })
 
     # Call LLM for OCR
@@ -1691,6 +1634,154 @@ async def ocr_region(
             "error_code": "OCR_FAILED",
             "message": f"OCR extraction failed: {str(e)}",
         })
+
+
+# ───────────────────────── SKU from Region (框选识别 SKU) ─────────────────────────
+
+_SKU_FROM_REGION_PROMPT = """你是一个家具商品信息提取专家。
+这是一张家具产品目录页的局部截图（用户框选的区域）。
+请提取图中所有能识别到的商品信息，返回 JSON 对象（字段名用英文，值用原始语言）。
+
+常见字段示例：
+- model_number: 货号/型号，如 "204#"、"WS X-683"
+- product_name: 品名，如 "大床"、"沙发"
+- size: 尺寸规格，如 "1800x2000mm"
+- unit_price: 售价/单价
+- color: 颜色
+- material: 材质
+- weight: 重量
+- source_text: 图片中所有可见文字的完整转录
+
+只包含图中能清晰辨识的字段，未识别的字段用 null。
+严格返回 JSON，不要额外解释。"""
+
+
+async def _load_page_screenshot(job_dir: Path, page_number: int) -> bytes | None:
+    """加载页面截图 PNG bytes，不存在则尝试渲染。"""
+    cache_path = job_dir / "screenshots" / f"page-{page_number}.png"
+    if cache_path.exists():
+        return cache_path.read_bytes()
+    source_pdf = job_dir / "source.pdf"
+    if not source_pdf.exists():
+        return None
+    try:
+        import fitz
+        doc = fitz.open(source_pdf)
+        try:
+            if page_number < 1 or page_number > doc.page_count:
+                return None
+            zoom = 150 / 72
+            pix = doc[page_number - 1].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+            return pix.tobytes("png")
+        finally:
+            doc.close()
+    except Exception:
+        return None
+
+
+async def _crop_region(png_bytes: bytes, bbox: list) -> bytes | None:
+    """裁剪并缩放图片区域，返回 PNG bytes。"""
+    try:
+        from PIL import Image as PILImage
+        full_img = PILImage.open(io.BytesIO(png_bytes))
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        x1 = max(0, min(x1, full_img.width))
+        y1 = max(0, min(y1, full_img.height))
+        x2 = max(0, min(x2, full_img.width))
+        y2 = max(0, min(y2, full_img.height))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        cropped = full_img.crop((x1, y1, x2, y2))
+        MAX_LONG_EDGE = 2048
+        w, h = cropped.size
+        if max(w, h) > MAX_LONG_EDGE:
+            ratio = MAX_LONG_EDGE / max(w, h)
+            cropped = cropped.resize((int(w * ratio), int(h * ratio)), PILImage.LANCZOS)
+        buf = io.BytesIO()
+        cropped.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+@router.post("/jobs/{job_id}/pages/{page_number}/sku-from-region")
+async def sku_from_region(
+    request: Request,
+    job_id: uuid.UUID,
+    db: DBSession,
+    page_number: int = PathParam(..., ge=1),
+):
+    """从页面截图上框选区域，用 LLM 识别 SKU 属性后直接创建 SKU 记录。
+
+    Body: { "bbox": [x1, y1, x2, y2] }  — 截图像素坐标
+    """
+    import json as json_mod
+
+    body = await request.json()
+    bbox = body.get("bbox")
+    if not bbox or len(bbox) != 4:
+        return JSONResponse(status_code=400, content={"error_code": "INVALID_BBOX", "message": "bbox must be [x1,y1,x2,y2]"})
+
+    llm_service = get_llm_service()
+    if llm_service is None:
+        return JSONResponse(status_code=503, content={"error_code": "LLM_NOT_AVAILABLE", "message": "LLM service not initialized"})
+
+    job_result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
+    if not job_result.scalar_one_or_none():
+        raise JobNotFoundError(f"Job {job_id} not found")
+
+    # 加载截图
+    job_dir = Path(settings.job_data_dir) / str(job_id)
+    png_bytes = await _load_page_screenshot(job_dir, page_number)
+    if not png_bytes:
+        return JSONResponse(status_code=404, content={"error_code": "SCREENSHOT_NOT_FOUND", "message": "Page screenshot not found"})
+
+    # 裁剪区域
+    crop_bytes = await _crop_region(png_bytes, bbox)
+    if not crop_bytes:
+        return JSONResponse(status_code=400, content={"error_code": "CROP_FAILED", "message": "Bbox too small or invalid"})
+
+    # LLM 识别
+    try:
+        resp = await llm_service.call_llm(
+            operation="sku_from_region",
+            prompt=_SKU_FROM_REGION_PROMPT,
+            images=[crop_bytes],
+        )
+        raw = resp.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        parsed = json_mod.loads(raw.strip())
+    except Exception as e:
+        logger.exception("sku_from_region_llm_failed", error=str(e))
+        return JSONResponse(status_code=500, content={"error_code": "LLM_FAILED", "message": f"LLM extraction failed: {e}"})
+
+    source_text = parsed.pop("source_text", "") or ""
+    attributes = {k: str(v) for k, v in parsed.items() if v is not None}
+
+    # 创建 SKU 记录
+    from nanoid import generate as nanoid
+    sku_id = f"p{page_number}_manual_{nanoid(size=6)}"
+    db.add(SKU(
+        sku_id=sku_id, job_id=job_id, page_number=page_number,
+        validity="valid", attributes=attributes,
+        attribute_source="HUMAN_CREATED", status="EXTRACTED",
+        source_bbox=bbox,
+    ))
+    db.add(Annotation(
+        job_id=job_id, page_number=page_number, annotator="",
+        type="SKU_CREATED_FROM_REGION",
+        payload={"sku_id": sku_id, "bbox": bbox, "source_text": source_text},
+    ))
+    await db.commit()
+    logger.info("sku_from_region_created", job_id=str(job_id), sku_id=sku_id, page=page_number, attrs=len(attributes))
+    return {
+        "sku_id": sku_id, "page_number": page_number,
+        "attributes": attributes, "source_text": source_text,
+        "validity": "valid", "attribute_source": "HUMAN_CREATED", "status": "EXTRACTED",
+    }
 
 
 # ───────────────────────── Crop Image (人工添加/调整子图) ─────────────────────────

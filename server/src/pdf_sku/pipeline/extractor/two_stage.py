@@ -135,6 +135,7 @@ class TwoStageExtractor:
         profile: dict | None = None,
         image_size: tuple[int, int] | None = None,
         images: list | None = None,
+        page_size: tuple[float, float] | None = None,
     ) -> list[SKUBoundary]:
         """阶段1: SKU 边界识别。"""
         if not self._llm:
@@ -158,6 +159,12 @@ class TwoStageExtractor:
         if (not img_w or not img_h) and screenshot:
             img_w, img_h = self._get_image_size(screenshot)
 
+        # 计算像素→PDF点坐标的转换系数（用于将 LLM 返回的像素坐标转回 PDF 点坐标）
+        # Phase 8 会统一将 source_bbox 从 PDF 点缩放到截图像素，所以这里必须保持 PDF 点空间
+        page_w, page_h = page_size or (0.0, 0.0)
+        px_to_pt_x = page_w / img_w if (img_w and page_w) else None
+        px_to_pt_y = page_h / img_h if (img_h and page_h) else None
+
         try:
             prompt = BOUNDARY_PROMPT_TEMPLATE.format(
                 img_w=img_w or "unknown",
@@ -174,17 +181,28 @@ class TwoStageExtractor:
                 for item in parsed.data:
                     bbox = item.get("bbox", [0, 0, 0, 0])
                     if len(bbox) == 4:
-                        bbox = self._normalize_bbox(
-                            bbox, img_w, img_h)
+                        bbox = self._normalize_bbox(bbox, img_w, img_h)
                     boundaries.append(SKUBoundary(
                         boundary_id=item.get("boundary_id", len(boundaries) + 1),
                         bbox=tuple(bbox) if len(bbox) == 4 else (0, 0, 0, 0),
                         text_content=item.get("text_content", ""),
                         confidence=float(item.get("confidence", 0.5)),
                     ))
+                # NMS 和全页 boundary 惩罚在像素坐标下执行
                 boundaries = self._nms_boundaries(boundaries)
                 boundaries = self._penalize_fullpage_boundaries(
                     boundaries, img_w, img_h)
+                # LLM 返回像素坐标，转回 PDF 点坐标（与 _rule_boundaries 一致），
+                # 避免 Phase 8 的统一缩放（PDF pts → 截图像素）导致坐标翻倍
+                if px_to_pt_x and px_to_pt_y:
+                    for b in boundaries:
+                        if b.bbox and b.bbox != (0, 0, 0, 0):
+                            b.bbox = (
+                                b.bbox[0] * px_to_pt_x,
+                                b.bbox[1] * px_to_pt_y,
+                                b.bbox[2] * px_to_pt_x,
+                                b.bbox[3] * px_to_pt_y,
+                            )
                 return boundaries
         except Exception as e:
             logger.warning("boundary_identify_failed", error=str(e))
