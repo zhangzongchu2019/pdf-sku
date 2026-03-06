@@ -95,14 +95,20 @@ def _get_field_value(attrs: dict, candidates: list[str]) -> str:
     return ""
 
 
-def _preprocess_image(img_bytes: bytes, max_px: int = 60) -> bytes | None:
+IMG_MAX_PX = 400          # 导出图片最大边长（像素）
+IMG_COL_WIDTH = 57        # 图片列宽（Excel 字符单位，约 400px）
+IMG_ROW_HEIGHT = 300      # 图片行高（Excel point 单位，约 400px）
+
+
+def _preprocess_image(img_bytes: bytes, max_px: int = IMG_MAX_PX) -> bytes | None:
     """PIL 缩放图片为 PNG bytes，线程安全，可并行执行。"""
     if not img_bytes:
         return None
     try:
         from PIL import Image as PILImage
         pil = PILImage.open(io.BytesIO(img_bytes))
-        pil.thumbnail((max_px, max_px))
+        if pil.width > max_px or pil.height > max_px:
+            pil.thumbnail((max_px, max_px), PILImage.LANCZOS)
         buf = io.BytesIO()
         pil.save(buf, format="PNG")
         return buf.getvalue()
@@ -123,7 +129,7 @@ def _embed_png(ws, png_bytes: bytes, row: int, col: int) -> None:
         logger.warning("excel_embed_image_failed", row=row, col=col, error=str(e))
 
 
-def _embed_image(ws, img_bytes: bytes, row: int, col: int = 1, max_px: int = 60) -> None:
+def _embed_image(ws, img_bytes: bytes, row: int, col: int = 1, max_px: int = IMG_MAX_PX) -> None:
     """将图片 bytes 缩放后嵌入到指定单元格（保留向后兼容）。"""
     png = _preprocess_image(img_bytes, max_px)
     if png:
@@ -131,7 +137,7 @@ def _embed_image(ws, img_bytes: bytes, row: int, col: int = 1, max_px: int = 60)
 
 
 def _preprocess_rows_images(
-    rows: list, n_img_cols: int, max_px: int = 60
+    rows: list, n_img_cols: int, max_px: int = IMG_MAX_PX
 ) -> dict[tuple[int, int], bytes]:
     """并行预处理所有行的图片，返回 {(row_idx, col): png_bytes} 字典。"""
     from concurrent.futures import ThreadPoolExecutor
@@ -169,11 +175,11 @@ def _apply_header_style(ws, headers: list[str], n_img_cols: int = 1) -> None:
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    # 图片列宽 14，其余列宽 20
+    # 图片列宽 IMG_COL_WIDTH，其余列宽 20
     for col_idx in range(1, len(headers) + 1):
         col_letter = get_column_letter(col_idx)
         if col_idx <= n_img_cols:
-            ws.column_dimensions[col_letter].width = 14
+            ws.column_dimensions[col_letter].width = IMG_COL_WIDTH
         else:
             ws.column_dimensions[col_letter].width = 20
 
@@ -310,9 +316,13 @@ class ExcelExporter:
 
     async def load_job_data(self, db: AsyncSession, job_id: UUID) -> list[ExportRow]:
         """
-        查询 SKU + 绑定图片（每 SKU 可多图），构建导出行列表。
-        对于没有 SKU 绑定的商品子图（search_eligible=True），
-        额外追加图片专属行（sku_id="" / attributes={}），确保图片不漏出。
+        查询 SKU + 绑定图片，构建导出行列表。
+
+        合并规则：
+        - 相同 product_id 的 SKU → 合并为一行（同一商品的不同规格）
+        - 无 product_id 但绑定相同首图的 SKU → 合并为一行
+        - 仅输出完整商品子图（is_fragmented=False, search_eligible=True）
+        - 不输出未绑定 SKU 的游离图片行
         """
         from pdf_sku.common.models import SKU, SKUImageBinding, Image, PDFJob
         from collections import defaultdict
@@ -326,7 +336,7 @@ class ExcelExporter:
 
         sku_ids = [s.sku_id for s in skus]
 
-        # 2. 每个 SKU 的所有有效图片绑定（不限 rank），按置信度降序
+        # 2. 每个 SKU 的有效图片绑定，按置信度降序
         sku_image_ids: dict[str, list[str]] = defaultdict(list)
         if sku_ids:
             bindings = (await db.execute(
@@ -348,19 +358,26 @@ class ExcelExporter:
                 if b.image_id and b.image_id not in sku_image_ids[b.sku_id]:
                     sku_image_ids[b.sku_id].append(b.image_id)
 
-        # 3. 批量查询已绑定图片的元数据
+        # 3. 批量查询图片元数据
+        # all_images: 用于分组判断（所有绑定的图片，不过滤）
+        # display_images: 用于实际展示（仅完整商品子图，过滤瓦片碎片）
         all_bound_image_ids = list({iid for ids in sku_image_ids.values() for iid in ids})
-        images: dict[str, object] = {}
+        all_images: dict[str, object] = {}
+        display_images: set[str] = set()
         if all_bound_image_ids:
             img_rows = (await db.execute(
                 select(Image)
                 .where(Image.job_id == job_id, Image.image_id.in_(all_bound_image_ids))
             )).scalars().all()
-            images = {img.image_id: img for img in img_rows}
+            for img in img_rows:
+                all_images[img.image_id] = img
+                # 仅完整商品子图参与展示（排除瓦片碎片）
+                if not img.is_fragmented and img.search_eligible:
+                    display_images.add(img.image_id)
 
         job_dir = self._job_data_dir / str(job_id)
 
-        # 4. 查询 PDF 原始文件名（用于"来源"列）
+        # 4. 查询 PDF 原始文件名
         source_filename = ""
         try:
             pdf_job = (await db.execute(
@@ -371,69 +388,127 @@ class ExcelExporter:
         except Exception as e:
             logger.warning("excel_source_filename_failed", error=str(e))
 
-        rows: list[ExportRow] = []
-
-        # 5. 构建 SKU 行（含各自的绑定图片）
-        for sku in skus:
-            image_ids = sku_image_ids.get(sku.sku_id, [])
-            image_bytes_list: list[bytes] = []
-            for image_id in image_ids:
-                img = images.get(image_id)
-                if img:
-                    img_path = job_dir / img.extracted_path
-                    try:
-                        image_bytes_list.append(img_path.read_bytes())
-                    except Exception as e:
-                        logger.warning(
-                            "excel_export_image_read_failed",
-                            image_id=image_id, path=str(img_path), error=str(e),
-                        )
-
-            rows.append(ExportRow(
-                page_number=sku.page_number,
-                sku_id=sku.sku_id,
-                attributes=dict(sku.attributes or {}),
-                images=image_bytes_list,
-                image_ids=image_ids,
-                source_text=source_filename,
-                variant_label=sku.variant_label or "",
-            ))
-
-        # 6. 查询未绑定的商品子图（search_eligible=True），为每张追加独立图片行
-        unbound_q = (
-            select(Image)
-            .where(Image.job_id == job_id, Image.search_eligible == True)
-            .order_by(Image.page_number, Image.image_id)
-        )
-        if all_bound_image_ids:
-            unbound_q = unbound_q.where(Image.image_id.notin_(all_bound_image_ids))
-        unbound_imgs = (await db.execute(unbound_q)).scalars().all()
-
-        for img in unbound_imgs:
-            img_path = job_dir / img.extracted_path
-            img_bytes = b""
+        def _load_image(image_id: str) -> bytes | None:
+            img = all_images.get(image_id)
+            if not img:
+                return None
             try:
-                img_bytes = img_path.read_bytes()
+                return (job_dir / img.extracted_path).read_bytes()
             except Exception as e:
-                logger.warning(
-                    "excel_export_unbound_image_read_failed",
-                    image_id=img.image_id, path=str(img_path), error=str(e),
-                )
-            rows.append(ExportRow(
-                page_number=img.page_number,
-                sku_id="",
-                attributes={},
-                images=[img_bytes] if img_bytes else [],
-                image_ids=[img.image_id],
-                source_text=source_filename,
-            ))
+                logger.warning("excel_export_image_read_failed",
+                               image_id=image_id, error=str(e))
+                return None
 
-        # 按页码排序（SKU 行在前，图片专属行在后）
-        rows.sort(key=lambda r: (r.page_number, 0 if r.sku_id else 1))
+        def _build_row(sku_group: list, group_id: str) -> ExportRow:
+            """将一组 SKU 合并为一个 ExportRow。展示图仅含完整子图。"""
+            # 按 SKU 顺序收集去重后的图片，仅展示完整子图（非碎片）
+            ordered_ids: list[str] = []
+            seen: set[str] = set()
+            for sku in sku_group:
+                for iid in sku_image_ids.get(sku.sku_id, []):
+                    if iid not in seen and iid in display_images:
+                        seen.add(iid)
+                        ordered_ids.append(iid)
+
+            image_bytes_list: list[bytes] = []
+            for iid in ordered_ids:
+                data = _load_image(iid)
+                if data:
+                    image_bytes_list.append(data)
+
+            # 代表 SKU（第一个）的属性作为基准
+            rep = sku_group[0]
+            attrs = dict(rep.attributes or {})
+
+            # 规格拼接：variant_label + size
+            variant_parts: list[str] = []
+            for sku in sku_group:
+                vl = sku.variant_label or ""
+                a = sku.attributes or {}
+                size = str(
+                    a.get("size") or a.get("规格") or
+                    a.get("spec") or a.get("specification") or ""
+                ).strip()
+                if vl and size:
+                    variant_parts.append(f"{vl}: {size}")
+                elif vl:
+                    variant_parts.append(vl)
+                elif size:
+                    variant_parts.append(size)
+
+            variant_label = (
+                " / ".join(variant_parts)
+                if len(sku_group) > 1 and variant_parts
+                else (rep.variant_label or "")
+            )
+
+            return ExportRow(
+                page_number=rep.page_number,
+                sku_id=group_id,
+                attributes=attrs,
+                images=image_bytes_list,
+                image_ids=ordered_ids,
+                source_text=source_filename,
+                variant_label=variant_label,
+            )
+
+        # 5. 对所有 SKU 统一用 Union-Find 分组
+        #    规则1: 共享任意同一张图片的 SKU → 合并（相同商品子图 → 同一行）
+        #    规则2: 同一 product_id 的 SKU → 强制合并（同商品不同规格 → 同一行）
+        parent: dict[str, str] = {sku.sku_id: sku.sku_id for sku in skus}
+
+        def _find(x: str) -> str:
+            root = x
+            while parent.get(root, root) != root:
+                root = parent[root]
+            # 路径压缩
+            while parent.get(x, x) != root:
+                parent[x], x = root, parent[x]
+            return root
+
+        def _union(x: str, y: str) -> None:
+            px, py = _find(x), _find(y)
+            if px != py:
+                parent[px] = py
+
+        # 规则1: 共享图片合并（用 all_images 确保所有绑定图都参与）
+        img_to_sku_ids: dict[str, list[str]] = defaultdict(list)
+        for sku in skus:
+            for iid in sku_image_ids.get(sku.sku_id, []):
+                if iid in all_images:
+                    img_to_sku_ids[iid].append(sku.sku_id)
+
+        for sid_list in img_to_sku_ids.values():
+            for i in range(1, len(sid_list)):
+                _union(sid_list[0], sid_list[i])
+
+        # 规则2: 同 product_id 强制合并
+        pid_first: dict[str, str] = {}
+        for sku in skus:
+            if sku.product_id:
+                if sku.product_id in pid_first:
+                    _union(pid_first[sku.product_id], sku.sku_id)
+                else:
+                    pid_first[sku.product_id] = sku.sku_id
+
+        # 按 root 聚合（保持原始 SKU 顺序）
+        union_groups: dict[str, list] = defaultdict(list)
+        for sku in skus:
+            union_groups[_find(sku.sku_id)].append(sku)
+
+        rows: list[ExportRow] = []
+        for grp in union_groups.values():
+            # group_id: 优先用组内第一个 product_id，否则用第一个 sku_id
+            group_id = next((s.product_id for s in grp if s.product_id), grp[0].sku_id)
+            rows.append(_build_row(grp, group_id))
+
+        rows.sort(key=lambda r: r.page_number)
 
         logger.info("excel_export_rows_loaded",
-                    job_id=str(job_id), sku_rows=len(skus),
-                    unbound_image_rows=len(unbound_imgs))
+                    job_id=str(job_id),
+                    total_rows=len(rows),
+                    total_skus=len(skus),
+                    union_groups=len(union_groups))
         return rows
 
     @staticmethod
@@ -527,7 +602,7 @@ class ExcelExporter:
                     _embed_png(ws, png, row_idx, img_idx + 1)
                     has_image = True
 
-            ws.row_dimensions[row_idx].height = 60 if has_image else 15
+            ws.row_dimensions[row_idx].height = IMG_ROW_HEIGHT if has_image else 15
 
         buf = io.BytesIO()
         wb.save(buf)
@@ -624,7 +699,7 @@ class ExcelExporter:
                     _embed_png(ws, png, row_idx, img_idx + 1)
                     has_image = True
 
-            ws.row_dimensions[row_idx].height = 60 if has_image else 15
+            ws.row_dimensions[row_idx].height = IMG_ROW_HEIGHT if has_image else 15
 
         buf = io.BytesIO()
         wb.save(buf)
