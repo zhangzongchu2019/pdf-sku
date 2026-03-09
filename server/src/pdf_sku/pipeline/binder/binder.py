@@ -188,6 +188,57 @@ class SKUImageBinder:
         self._unify_product_bindings(skus, results)
         # 去重修正: SKU 数 == 图片数时强制 1:1 唯一分配
         results = self._resolve_duplicate_bindings(results, skus, deliverable)
+        # 次级绑定: 将 role="product_detail" 的场景图分配给距离最近的 SKU（作为附图 rank≥2）
+        results = self._bind_secondary_detail_images(results, skus, deliverable, threshold)
+        return results
+
+    def _bind_secondary_detail_images(
+        self,
+        results: list[BindingResult],
+        skus: list[SKUResult],
+        deliverable: list[ImageInfo],
+        threshold: float,
+    ) -> list[BindingResult]:
+        """为 role='product_detail' 的场景图找最近 SKU，追加为次级绑定（rank≥2）。
+
+        仅处理 Phase 6.5 明确标记为 product_detail 的场景照，不影响其他页面。
+        """
+        detail_images = [img for img in deliverable if img.role == "product_detail"]
+        if not detail_images or not skus:
+            return results
+
+        bound_image_ids = {r.image_id for r in results if r.image_id}
+        unbound_details = [img for img in detail_images if img.image_id not in bound_image_ids]
+        if not unbound_details:
+            return results
+
+        # 计算每个 SKU 已有的绑定数，用于确定新绑定的 rank
+        rank_counter: dict[str, int] = {}
+        for r in results:
+            if r.image_id:
+                rank_counter[r.sku_id] = rank_counter.get(r.sku_id, 0) + 1
+
+        for img in unbound_details:
+            nearest_sku = min(
+                skus,
+                key=lambda s: self._bbox_distance(s.source_bbox, img.bbox),
+            )
+            rank = rank_counter.get(nearest_sku.sku_id, 0) + 1
+            results.append(BindingResult(
+                sku_id=nearest_sku.sku_id,
+                image_id=img.image_id,
+                confidence=0.6,
+                method="lifestyle_secondary",
+                is_ambiguous=False,
+                rank=rank,
+            ))
+            rank_counter[nearest_sku.sku_id] = rank
+            logger.info(
+                "lifestyle_secondary_bound",
+                sku_id=nearest_sku.sku_id,
+                image_id=img.image_id,
+                rank=rank,
+            )
         return results
 
     def _resolve_duplicate_bindings(

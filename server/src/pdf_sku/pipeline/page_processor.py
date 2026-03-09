@@ -59,6 +59,36 @@ def _render_page_sync(file_path: str, page_no: int, dpi: int = 150) -> bytes:
         doc.close()
 
 
+_PRODUCT_REGION_PROMPT = """\
+This is a furniture product catalog page image.
+
+The following {n} products have been identified on this page:
+{product_list}
+
+For each product, identify ALL its individual photo panels separately:
+- "product_photo": the product shown alone on a clean/white background
+- "lifestyle_photo": the product shown in a room or scene setting (if visible)
+
+Return a JSON array with one entry per individual photo panel found:
+[
+  {{"product_index": 0, "photo_type": "product_photo", "bbox": [x0, y0, x1, y1]}},
+  {{"product_index": 0, "photo_type": "lifestyle_photo", "bbox": [x0, y0, x1, y1]}},
+  {{"product_index": 1, "photo_type": "product_photo", "bbox": [x0, y0, x1, y1]}},
+  {{"product_index": 1, "photo_type": "lifestyle_photo", "bbox": [x0, y0, x1, y1]}},
+  ...
+]
+
+RULES:
+1. product_index is 0-indexed, matching the product list above
+2. Each bbox should cover the ENTIRE photo panel region — include all product views, angles, and close-ups shown together in that panel area. Be generous: extend to the natural boundary of the photo zone (edge of the image or the dividing line between panels). Do NOT crop into the product.
+3. Only include photo panels clearly visible on this page
+4. If a product has no lifestyle photo on this page, omit it — do not fabricate one
+5. Every product must have at least one "product_photo" entry
+
+Image size: {img_w} × {img_h} pixels. Use integer pixel coordinates.
+Respond ONLY with the JSON array, no other text."""
+
+
 class PageProcessor:
     """单页 9 阶段处理管线。"""
 
@@ -266,6 +296,12 @@ class PageProcessor:
                             after_retry=len(retry_skus),
                             adopted=len(retry_skus) > len(skus),
                             eligible_images=eligible_count)
+
+            # ═══ Phase 6.5: 单大图多商品子图拆分 ═══
+            # 当页面只有 1 张全页大图且 SKU boundary bbox 各不相同时，
+            # 为每个产品区域创建独立 ImageInfo（_region_），
+            # _crop_composites 在 Phase 8 后从截图裁剪实际图片数据。
+            await self._maybe_create_product_regions(raw, skus, page_no, screenshot)
 
             # ═══ Phase 7: ID 分配 ═══
             hash_prefix = (file_hash or "unknown")[:8]
@@ -1252,6 +1288,563 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                      composites=composite_idx,
                      remaining=len([m for m in merged if not m.is_fragmented]))
         return merged
+
+    async def _maybe_create_product_regions(
+        self,
+        raw: ParsedPageIR,
+        skus: list[SKUResult],
+        page_no: int,
+        screenshot: bytes = b"",
+    ) -> None:
+        """Phase 6.5: 单大图多商品页 → 用 LLM 检测商品子图区域。
+
+        触发条件:
+        - 仅 1 张 search_eligible 图片且覆盖 >= 70% 页面面积
+        - 提取到 >= 2 个 SKU
+        - 至少 2 个 SKU 有不同的有效 source_bbox
+
+        策略: 调用 Vision LLM，直接询问页面上 n 个商品各自的完整区域坐标，
+        返回 PDF pts 坐标系的 bbox 列表。若 LLM 不可用或返回异常结果，
+        降级为等比网格（page_w/n_cols × page_h/n_rows 均等切分）。
+        """
+        eligible = [img for img in raw.images if img.search_eligible]
+        if len(eligible) != 1:
+            return
+
+        full_img = eligible[0]
+        if len(full_img.bbox) < 4:
+            return
+
+        page_w = raw.metadata.page_width or 1.0
+        page_h = raw.metadata.page_height or 1.0
+        img_area = abs(full_img.bbox[2] - full_img.bbox[0]) * abs(full_img.bbox[3] - full_img.bbox[1])
+        if img_area / (page_w * page_h) < 0.70:
+            return
+
+        if len(skus) < 2:
+            return
+
+        # ── 1. 收集唯一 source_bbox（IoU 去重）──
+        def _iou(a: tuple, b: tuple) -> float:
+            x0, y0 = max(a[0], b[0]), max(a[1], b[1])
+            x1, y1 = min(a[2], b[2]), min(a[3], b[3])
+            inter = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+            area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+            area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+            union = area_a + area_b - inter
+            return inter / union if union > 0 else 0.0
+
+        # ── 1a. 构建有 model_number 的唯一产品列表（去重），排除 ghost SKU ──
+        # Phase 6 可能把生活场景图识别为产品（无 model_number），这里只取真实产品。
+        # 按 source_bbox 左上角坐标排序，尽量保持阅读顺序（上→下、左→右）。
+        seen_models: set[str] = set()
+        unique_products: list[tuple[str, str, "SKUResult"]] = []  # (model, name, sku)
+        for sku in sorted(skus, key=lambda s: (
+            round((s.source_bbox[1] if s.source_bbox else 0) / 50) * 50,
+            s.source_bbox[0] if s.source_bbox else 0,
+        )):
+            model = sku.attributes.get("model_number", "")
+            if not model:
+                continue
+            if model in seen_models:
+                continue
+            seen_models.add(model)
+            unique_products.append((model, sku.attributes.get("product_name", ""), sku))
+
+        # 如果有 model_number 的产品不足 2 个，退而用所有有位置的 SKU
+        if len(unique_products) < 2:
+            seen_bboxes: list[tuple] = []
+            unique_products = []
+            for sku in sorted(skus, key=lambda s: (
+                round((s.source_bbox[1] if s.source_bbox else 0) / 50) * 50,
+                s.source_bbox[0] if s.source_bbox else 0,
+            )):
+                sb = sku.source_bbox
+                if not sb or sb == (0, 0, 0, 0):
+                    continue
+                if any(_iou(sb, e) > 0.80 for e in seen_bboxes):
+                    continue
+                seen_bboxes.append(sb)
+                unique_products.append(("", sku.attributes.get("product_name", ""), sku))
+
+        n = len(unique_products)
+        if n < 2:
+            return
+
+        # ── 2. 检测产品子图区域：优先 YOLO（像素级精确），降级 LLM，再降级等比网格 ──
+        product_descs = [(model, name) for model, name, _ in unique_products]
+
+        # 主路：YOLO 图形检测（同步，快速，无 API 成本）
+        llm_photos = self._detect_product_regions_yolo(
+            screenshot, unique_products, page_w, page_h, page_no)
+        _detection_method = "yolo" if llm_photos is not None else "llm"
+
+        # 次路：LLM 降级
+        if llm_photos is None:
+            llm_photos = await self._detect_product_regions_with_llm(
+                screenshot, product_descs, page_w, page_h, page_no)
+
+        dpi_scale = 150 / 72.0
+        img_idx = 0
+
+        def _min_dist_to_bbox(cx: float, cy: float, bbox: tuple) -> float:
+            bx = max(bbox[0], min(cx, bbox[2]))
+            by = max(bbox[1], min(cy, bbox[3]))
+            return ((cx - bx) ** 2 + (cy - by) ** 2) ** 0.5
+
+        if llm_photos is not None:
+            # ── LLM 成功：为每张子图创建独立 ImageInfo ──
+            # LLM 返回 list[dict]，每项含 product_index / photo_type / bbox
+            # product_photo → role="product_main"（白底产品图，用于搜索）
+            # lifestyle_photo → role="product_detail"（生活场景图，作为附图）
+            from collections import defaultdict as _defaultdict
+            by_product: dict[int, list[dict]] = _defaultdict(list)
+            for photo in llm_photos:
+                by_product[photo["product_index"]].append(photo)
+
+            new_region_images: list[ImageInfo] = []
+            model_to_main_bbox: dict[str, tuple] = {}   # model → product_photo bbox
+            for prod_idx, (model, _name, _rep_sku) in enumerate(unique_products):
+                for photo in by_product.get(prod_idx, []):
+                    bbox = photo["bbox"]
+                    dw = abs(bbox[2] - bbox[0]) * dpi_scale
+                    dh = abs(bbox[3] - bbox[1]) * dpi_scale
+                    short = int(min(dw, dh))
+                    role = "product_main" if photo["photo_type"] == "product_photo" else "product_detail"
+                    new_region_images.append(ImageInfo(
+                        image_id=f"p{page_no}_region_{img_idx}",
+                        bbox=bbox,
+                        width=int(dw), height=int(dh), short_edge=short,
+                        search_eligible=short >= 150,
+                        role=role,
+                        data=b"",
+                    ))
+                    if role == "product_main" and model:
+                        model_to_main_bbox[model] = bbox
+                    img_idx += 1
+
+            # 安全检查: 若 LLM 坐标异常导致产品图片不足（如归一化坐标、bbox太小），
+            # 则放弃 LLM 结果，降级为等比网格。
+            # 要求每个产品至少有 1 张可搜索的 product_main 图片；
+            # 若有产品的主图不可搜索，说明坐标质量不可靠，整体降级。
+            eligible_main_count = sum(
+                1 for img in new_region_images
+                if img.search_eligible and img.role == "product_main"
+            )
+            has_eligible_llm = eligible_main_count >= n
+            if not has_eligible_llm:
+                logger.warning(
+                    "product_regions_llm_no_eligible",
+                    page=page_no,
+                    n_created=len(new_region_images),
+                    reason="all short_edge < 150, likely bad LLM coords",
+                )
+                llm_photos = None
+                img_idx = 0
+            else:
+                # ── 3. 标记原大图为不可搜索（仅在成功创建有效区域时）──
+                full_img.search_eligible = False
+                raw.images.extend(new_region_images)
+
+                # 将每个 SKU 的 source_bbox 指向对应产品的 product_main 照片
+                for sku in skus:
+                    model = sku.attributes.get("model_number", "")
+                    sb = sku.source_bbox
+                    if model and model in model_to_main_bbox:
+                        sku.source_bbox = model_to_main_bbox[model]
+                    elif not model and sb and sb != (0, 0, 0, 0):
+                        # fallback：找最近的 product_main 图片
+                        main_bboxes = [b for b in model_to_main_bbox.values()]
+                        if main_bboxes:
+                            cx, cy = (sb[0] + sb[2]) / 2, (sb[1] + sb[3]) / 2
+                            sku.source_bbox = min(main_bboxes, key=lambda b: _min_dist_to_bbox(cx, cy, b))
+
+                n_images = img_idx
+                used_method = f"{_detection_method}_individual"
+
+        if llm_photos is None:
+            # ── 降级：等比网格，每产品一个区域（旧行为）──
+            # ── 3. 标记原大图为不可搜索 ──
+            full_img.search_eligible = False
+            grid_cells = self._make_equal_product_grid(n, page_w, page_h)
+            for cell_bbox in grid_cells:
+                x0, y0, x1, y1 = cell_bbox
+                dw = abs(x1 - x0) * dpi_scale
+                dh = abs(y1 - y0) * dpi_scale
+                short = int(min(dw, dh))
+                raw.images.append(ImageInfo(
+                    image_id=f"p{page_no}_region_{img_idx}",
+                    bbox=cell_bbox,
+                    width=int(dw), height=int(dh), short_edge=short,
+                    search_eligible=short >= 150,
+                    role="unknown",
+                    data=b"",
+                ))
+                img_idx += 1
+
+            model_to_region: dict[str, tuple] = {
+                model: grid_cells[i] for i, (model, _, _) in enumerate(unique_products)
+                if model and i < len(grid_cells)
+            }
+            for sku in skus:
+                model = sku.attributes.get("model_number", "")
+                sb = sku.source_bbox
+                if model and model in model_to_region:
+                    sku.source_bbox = model_to_region[model]
+                elif not model and sb and sb != (0, 0, 0, 0) and grid_cells:
+                    cx, cy = (sb[0] + sb[2]) / 2, (sb[1] + sb[3]) / 2
+                    sku.source_bbox = min(grid_cells, key=lambda c: _min_dist_to_bbox(cx, cy, c))
+
+            n_images = img_idx
+            used_method = "equal_grid"
+
+        logger.info(
+            "product_regions_created",
+            page=page_no,
+            original_image=full_img.image_id,
+            n_products=n,
+            n_images=n_images,
+            method=used_method,
+        )
+
+    def _detect_product_regions_yolo(
+        self,
+        screenshot: bytes,
+        unique_products: list,  # [(model, name, rep_sku), ...]
+        page_w: float,
+        page_h: float,
+        page_no: int,
+    ) -> list[dict] | None:
+        """使用 DocLayout-YOLO 精确检测产品子图区域（像素级精度）。
+
+        返回与 _detect_product_regions_with_llm 相同格式的 list[dict]，
+        每项含 product_index / photo_type / bbox (PDF pts)；
+        失败时返回 None（调用方降级为 LLM 或等比网格）。
+
+        流程：
+        1. YOLO 检测页面截图中的 Figure 区域（像素坐标）
+        2. 白底像素比例区分 product_photo（白底）/ lifestyle_photo（场景）
+        3. source_bbox 近邻匹配将每个 figure 分配给对应产品
+        """
+        try:
+            from pdf_sku.pipeline.layout_detector import detect_figures_on_image
+            import io as _io
+            from PIL import Image as _PILImage
+
+            if not screenshot:
+                return None
+
+            pil_img = _PILImage.open(_io.BytesIO(screenshot))
+            img_w, img_h = pil_img.size
+
+            # 使用较高置信度以减少噪点检测（0.40 > default 0.25）
+            figures_px = detect_figures_on_image(screenshot, conf_override=0.40)
+            if not figures_px:
+                return None
+
+            n = len(unique_products)
+
+            # 最小面积过滤：figure 需 >= 页面面积 / (n * 6)，排除微小噪点
+            min_area_px = (img_w * img_h) / max(n * 6, 1)
+            figures_px = [
+                f for f in figures_px
+                if (f[2] - f[0]) * (f[3] - f[1]) >= min_area_px
+            ]
+
+            if len(figures_px) < n:
+                logger.info(
+                    "product_regions_yolo_insufficient",
+                    page=page_no, n_products=n, n_figures=len(figures_px),
+                )
+                return None
+
+            # 像素坐标 → PDF 点坐标
+            def _px_to_pt(fx0: float, fy0: float, fx1: float, fy1: float) -> tuple:
+                return (
+                    fx0 * page_w / img_w,
+                    fy0 * page_h / img_h,
+                    fx1 * page_w / img_w,
+                    fy1 * page_h / img_h,
+                )
+
+            figures_pt = [_px_to_pt(*f) for f in figures_px]
+
+            # 白底检测：R/G/B 均 > 220 的像素占比 > 45% 认为是白底产品图
+            def _is_white_bg(fx0: float, fy0: float, fx1: float, fy1: float) -> bool:
+                x0 = max(0, int(fx0))
+                y0 = max(0, int(fy0))
+                x1 = min(img_w, int(fx1))
+                y1 = min(img_h, int(fy1))
+                if x1 <= x0 or y1 <= y0:
+                    return False
+                region = pil_img.crop((x0, y0, x1, y1)).convert("RGB")
+                pixels = list(region.getdata())
+                total = len(pixels)
+                if total == 0:
+                    return False
+                white = sum(1 for r, g, b in pixels if r > 220 and g > 220 and b > 220)
+                ratio = white / total
+                logger.debug(
+                    "product_regions_yolo_white_check",
+                    page=page_no, bbox=[x0, y0, x1, y1], white_ratio=round(ratio, 3),
+                )
+                return ratio > 0.45
+
+            fig_is_white = [_is_white_bg(*f) for f in figures_px]
+            fig_photo_type = [
+                "product_photo" if w else "lifestyle_photo" for w in fig_is_white
+            ]
+
+            # ── 产品 → figure 匹配 ──
+            # source_bbox 此时为 PDF pts（Phase 8 尚未执行缩放）
+            def _min_dist_to_box(cx: float, cy: float, bbox: tuple) -> float:
+                bx = max(bbox[0], min(cx, bbox[2]))
+                by = max(bbox[1], min(cy, bbox[3]))
+                return ((cx - bx) ** 2 + (cy - by) ** 2) ** 0.5
+
+            # 第一轮：为每个产品找最近的 product_photo figure（若有）
+            unassigned_product = list(range(len(figures_pt)))  # 所有 figure 编号
+            prod_to_figs: dict[int, list[int]] = {i: [] for i in range(n)}
+
+            # 按白底/非白底分组
+            white_figs = [i for i, w in enumerate(fig_is_white) if w]
+            scene_figs = [i for i, w in enumerate(fig_is_white) if not w]
+
+            used_white: set[int] = set()
+            used_scene: set[int] = set()
+
+            for prod_idx, (_, _, rep_sku) in enumerate(unique_products):
+                sb = rep_sku.source_bbox
+                if sb and sb != (0, 0, 0, 0):
+                    cx = (sb[0] + sb[2]) / 2
+                    cy = (sb[1] + sb[3]) / 2
+                else:
+                    # 无 source_bbox：按产品序号估算页面位置
+                    cx = page_w * ((prod_idx % max(n // 2, 1)) + 0.5) / max(n // 2, 1)
+                    cy = page_h * ((prod_idx // max(n // 2, 1)) + 0.5) / max((n + 1) // 2, 1)
+
+                # 找最近的白底 figure 作为 product_photo
+                avail_white = [i for i in white_figs if i not in used_white]
+                if avail_white:
+                    best_w = min(avail_white,
+                                 key=lambda i: _min_dist_to_box(cx, cy, figures_pt[i]))
+                    prod_to_figs[prod_idx].append(best_w)
+                    used_white.add(best_w)
+                else:
+                    # 无白底 figure：用任意最近 figure 作为 product_photo
+                    avail_any = [i for i in range(len(figures_pt))
+                                 if i not in used_white and i not in used_scene]
+                    if not avail_any:
+                        avail_any = [i for i in range(len(figures_pt))
+                                     if not prod_to_figs.get(prod_idx)]
+                    if avail_any:
+                        best_any = min(avail_any,
+                                       key=lambda i: _min_dist_to_box(cx, cy, figures_pt[i]))
+                        prod_to_figs[prod_idx].append(best_any)
+                        fig_photo_type[best_any] = "product_photo"  # 强制标记
+                        used_white.add(best_any)
+
+            # 第二轮：将剩余的场景图分配给最近产品（lifestyle_photo）
+            remaining_scene = [i for i in scene_figs if i not in used_white and i not in used_scene]
+            for fig_i in remaining_scene:
+                fp = figures_pt[fig_i]
+                fcx = (fp[0] + fp[2]) / 2
+                fcy = (fp[1] + fp[3]) / 2
+                # 找 product_photo 中心最近的产品
+                best_prod = min(
+                    range(n),
+                    key=lambda pi: _min_dist_to_box(
+                        fcx, fcy,
+                        figures_pt[prod_to_figs[pi][0]] if prod_to_figs[pi] else (0, 0, 0, 0),
+                    ),
+                )
+                prod_to_figs[best_prod].append(fig_i)
+                used_scene.add(fig_i)
+
+            # 验证：每个产品必须有至少 1 个 figure
+            if any(not figs for figs in prod_to_figs.values()):
+                logger.warning(
+                    "product_regions_yolo_unmatched",
+                    page=page_no,
+                    unmatched=[i for i, figs in prod_to_figs.items() if not figs],
+                )
+                return None
+
+            # 构建结果列表（与 LLM 方法格式相同）
+            photos: list[dict] = []
+            for prod_idx in range(n):
+                for fig_i in prod_to_figs[prod_idx]:
+                    photos.append({
+                        "product_index": prod_idx,
+                        "photo_type": fig_photo_type[fig_i],
+                        "bbox": figures_pt[fig_i],
+                    })
+
+            # 最终保障：每个产品至少一个 product_photo
+            covered = {p["product_index"] for p in photos if p["photo_type"] == "product_photo"}
+            if not all(i in covered for i in range(n)):
+                # 将该产品第一个 figure 强制改为 product_photo
+                for prod_idx in range(n):
+                    if prod_idx not in covered:
+                        for photo in photos:
+                            if photo["product_index"] == prod_idx:
+                                photo["photo_type"] = "product_photo"
+                                covered.add(prod_idx)
+                                break
+
+            logger.info(
+                "product_regions_yolo_ok",
+                page=page_no,
+                n_products=n,
+                n_figures=len(figures_px),
+                n_photos=len(photos),
+                white_figures=len(white_figs),
+                scene_figures=len(scene_figs),
+            )
+            return photos
+
+        except Exception as e:
+            logger.warning("product_regions_yolo_failed", page=page_no, error=str(e))
+            return None
+
+    async def _detect_product_regions_with_llm(
+        self,
+        screenshot: bytes,
+        product_descs: list[tuple[str, str]],  # [(model_number, product_name), ...]
+        page_w: float,
+        page_h: float,
+        page_no: int,
+    ) -> list[dict] | None:
+        """用 Vision LLM 检测每个产品的独立子图（产品照 + 场景照）。
+
+        返回 list[dict]，每项：{"product_index": int, "photo_type": str, "bbox": tuple(PDF pts)}
+        product_index 对应 product_descs 的下标；失败返回 None（调用方降级为等比网格）。
+        """
+        if not screenshot or not self._llm:
+            return None
+        n = len(product_descs)
+        try:
+            import io
+            from PIL import Image as PILImage
+            pil = PILImage.open(io.BytesIO(screenshot))
+            img_w, img_h = pil.size
+
+            product_list_lines = []
+            for idx, (model, name) in enumerate(product_descs):
+                if model and name:
+                    product_list_lines.append(f"{idx}. {model} - {name}")
+                elif model:
+                    product_list_lines.append(f"{idx}. {model}")
+                else:
+                    product_list_lines.append(f"{idx}. {name or f'Product {idx}'}")
+            product_list = "\n".join(product_list_lines)
+
+            prompt = _PRODUCT_REGION_PROMPT.format(
+                n=n, product_list=product_list, img_w=img_w, img_h=img_h)
+            resp = await self._llm.call_llm(
+                operation="detect_product_regions",
+                prompt=prompt,
+                images=[screenshot],
+            )
+
+            from pdf_sku.llm_adapter.parser.response_parser import ResponseParser
+            parsed = ResponseParser().parse(resp.text, expected_type="array")
+            if not parsed.success or not isinstance(parsed.data, list):
+                logger.warning("product_regions_llm_parse_failed",
+                               page=page_no, text=resp.text[:200])
+                return None
+
+            photos: list[dict] = []
+            for item in parsed.data:
+                prod_idx = item.get("product_index")
+                photo_type = item.get("photo_type", "")
+                bbox = item.get("bbox") or []
+                if prod_idx is None or len(bbox) != 4:
+                    continue
+                prod_idx = int(prod_idx)
+                if not (0 <= prod_idx < n):
+                    continue
+
+                # 坐标规范化: 确保 x0<x1, y0<y1（防止 LLM 返回坐标顺序颠倒）
+                x0, y0, x1, y1 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+                if x0 > x1:
+                    x0, x1 = x1, x0
+                if y0 > y1:
+                    y0, y1 = y1, y0
+
+                # bbox 合理性检查: 最大值 < 5 说明是归一化坐标（0-1范围），跳过
+                # 在像素坐标系下, 有效产品图的最小维度应 >= 5px
+                if x1 - x0 < 5 or y1 - y0 < 5:
+                    logger.warning(
+                        "product_regions_llm_bbox_too_small",
+                        page=page_no,
+                        prod_idx=prod_idx,
+                        bbox=[x0, y0, x1, y1],
+                    )
+                    continue
+
+                # bbox 扩展: 按图片尺寸的 3% 向外扩展，补偿 LLM 框选偏紧的问题
+                # clamp 到图片边界，防止越界
+                pad_x = (x1 - x0) * 0.03
+                pad_y = (y1 - y0) * 0.03
+                x0 = max(0.0, x0 - pad_x)
+                y0 = max(0.0, y0 - pad_y)
+                x1 = min(float(img_w), x1 + pad_x)
+                y1 = min(float(img_h), y1 + pad_y)
+
+                pt_bbox = (
+                    x0 * page_w / img_w,
+                    y0 * page_h / img_h,
+                    x1 * page_w / img_w,
+                    y1 * page_h / img_h,
+                )
+                photos.append({
+                    "product_index": prod_idx,
+                    "photo_type": photo_type,
+                    "bbox": pt_bbox,
+                })
+
+            # 验证：每个产品至少有一张 product_photo
+            covered = {p["product_index"] for p in photos if p["photo_type"] == "product_photo"}
+            if not all(i in covered for i in range(n)):
+                missing = [i for i in range(n) if i not in covered]
+                logger.warning("product_regions_llm_missing_product_photos",
+                               page=page_no, missing=missing)
+                return None
+
+            logger.info("product_regions_llm_ok", page=page_no, n=n, photos=len(photos))
+            return photos
+
+        except Exception as e:
+            logger.warning("product_regions_llm_failed", page=page_no, error=str(e))
+            return None
+
+    @staticmethod
+    def _make_equal_product_grid(n: int, page_w: float, page_h: float) -> list[tuple]:
+        """生成 n 格等比网格（PDF pts），作为 LLM 检测失败时的降级方案。"""
+        # 找最接近正方形的因子对
+        best_rows, best_cols = n, 1
+        best_ratio_diff = float("inf")
+        for nr in range(1, n + 1):
+            if n % nr == 0:
+                nc = n // nr
+                # 期望网格格子接近正方形
+                cell_w = page_w / nc
+                cell_h = page_h / nr
+                ratio_diff = abs(cell_w / cell_h - 1.0)
+                if ratio_diff < best_ratio_diff:
+                    best_ratio_diff = ratio_diff
+                    best_rows, best_cols = nr, nc
+
+        cells: list[tuple] = []
+        for row in range(best_rows):
+            y0 = row * page_h / best_rows
+            y1 = (row + 1) * page_h / best_rows
+            for col in range(best_cols):
+                x0 = col * page_w / best_cols
+                x1 = (col + 1) * page_w / best_cols
+                cells.append((x0, y0, x1, y1))
+        return cells
 
     @staticmethod
     def _split_fullpage_composites(

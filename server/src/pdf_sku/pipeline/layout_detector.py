@@ -120,8 +120,14 @@ def _remove_containing_boxes(
     return keep
 
 
-def detect_figures_on_image(image_data: bytes) -> list[tuple[float, float, float, float]]:
-    """在图片上跑 YOLO 检测，返回 Figure 类 bbox 列表 (像素坐标 x0,y0,x1,y1)。"""
+def detect_figures_on_image(
+    image_data: bytes,
+    conf_override: float | None = None,
+) -> list[tuple[float, float, float, float]]:
+    """在图片上跑 YOLO 检测，返回 Figure 类 bbox 列表 (像素坐标 x0,y0,x1,y1)。
+
+    conf_override: 覆盖 settings.layout_detect_confidence，用于需要更高置信度的场景。
+    """
     holder = _ModelHolder.get()
     holder.load()
     if not holder.available:
@@ -130,7 +136,7 @@ def detect_figures_on_image(image_data: bytes) -> list[tuple[float, float, float
     from PIL import Image as PILImage
 
     pil_img = PILImage.open(io.BytesIO(image_data))
-    conf_threshold = settings.layout_detect_confidence
+    conf_threshold = conf_override if conf_override is not None else settings.layout_detect_confidence
     results = holder.model.predict(pil_img, conf=conf_threshold, verbose=False)
     if not results:
         return []
