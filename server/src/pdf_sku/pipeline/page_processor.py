@@ -89,6 +89,32 @@ Image size: {img_w} × {img_h} pixels. Use integer pixel coordinates.
 Respond ONLY with the JSON array, no other text."""
 
 
+_CV_SELECT_PROMPT = """\
+This furniture catalog page has {n_cand} candidate regions marked with colored numbered boxes (0 to {n_cand_minus1}).
+
+The following {n} products have been identified on this page:
+{product_list}
+
+For each product, identify which numbered region(s) contain its photo panels.
+Return a JSON array:
+[
+  {{"product_index": 0, "region_index": 2, "photo_type": "product_photo"}},
+  {{"product_index": 0, "region_index": 5, "photo_type": "lifestyle_photo"}},
+  {{"product_index": 1, "region_index": 3, "photo_type": "product_photo"}},
+  ...
+]
+
+RULES:
+1. product_index: 0-based index from the product list above
+2. region_index: the number shown in the colored box on the image
+3. photo_type: "product_photo" (clean/white background) or "lifestyle_photo" (room scene)
+4. Every product must have exactly one "product_photo" entry
+5. "lifestyle_photo" entries are optional — only include if clearly visible
+6. If a region contains multiple products or is irrelevant (text, header, etc.), skip it
+
+Respond ONLY with the JSON array, no other text."""
+
+
 class PageProcessor:
     """单页 9 阶段处理管线。"""
 
@@ -1371,18 +1397,30 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
         if n < 2:
             return
 
-        # ── 2. 检测产品子图区域：优先 YOLO（像素级精确），降级 LLM，再降级等比网格 ──
+        # ── 2. 检测产品子图区域：LLM 优先（语义识别），CV 辅助（边界精修）──
         product_descs = [(model, name) for model, name, _ in unique_products]
 
-        # 主路：YOLO 图形检测（同步，快速，无 API 成本）
-        llm_photos = self._detect_product_regions_yolo(
-            screenshot, unique_products, page_w, page_h, page_no)
-        _detection_method = "yolo" if llm_photos is not None else "llm"
+        # 主路：LLM 语义识别（识别哪里是商品图、哪里是场景图）+ CV 精修边界
+        llm_photos = await self._detect_product_regions_with_llm(
+            screenshot, product_descs, page_w, page_h, page_no)
+        _detection_method = "llm"
 
-        # 次路：LLM 降级
+        # 次路：YOLO 图形检测（当 LLM 无法给出坐标时）
         if llm_photos is None:
-            llm_photos = await self._detect_product_regions_with_llm(
-                screenshot, product_descs, page_w, page_h, page_no)
+            llm_photos = self._detect_product_regions_yolo(
+                screenshot, unique_products, page_w, page_h, page_no)
+            if llm_photos is not None:
+                _detection_method = "yolo"
+
+        # 三路：CV 网格 + LLM 语义选择
+        if llm_photos is None:
+            cv_candidates = self._detect_product_regions_cv(
+                screenshot, n, page_w, page_h, page_no)
+            if cv_candidates is not None:
+                llm_photos = await self._select_product_regions_with_llm(
+                    screenshot, cv_candidates, product_descs, page_w, page_h, page_no)
+                if llm_photos is not None:
+                    _detection_method = "cv_llm"
 
         dpi_scale = 150 / 72.0
         img_idx = 0
@@ -1407,10 +1445,19 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
             for prod_idx, (model, _name, _rep_sku) in enumerate(unique_products):
                 for photo in by_product.get(prod_idx, []):
                     bbox = photo["bbox"]
+                    role = "product_main" if photo["photo_type"] == "product_photo" else "product_detail"
+                    # CV 精修边界：
+                    # product_main → 紧密裁剪到商品主体（排除文字/多余背景）
+                    # product_detail → 扩展/对齐到完整场景面板
+                    if role == "product_main":
+                        bbox = self._tighten_product_bbox(
+                            screenshot, bbox, page_w, page_h)
+                    else:
+                        bbox = self._snap_scene_bbox(
+                            screenshot, bbox, page_w, page_h)
                     dw = abs(bbox[2] - bbox[0]) * dpi_scale
                     dh = abs(bbox[3] - bbox[1]) * dpi_scale
                     short = int(min(dw, dh))
-                    role = "product_main" if photo["photo_type"] == "product_photo" else "product_detail"
                     new_region_images.append(ImageInfo(
                         image_id=f"p{page_no}_region_{img_idx}",
                         bbox=bbox,
@@ -1630,19 +1677,6 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                                  key=lambda i: _min_dist_to_box(cx, cy, figures_pt[i]))
                     prod_to_figs[prod_idx].append(best_w)
                     used_white.add(best_w)
-                else:
-                    # 无白底 figure：用任意最近 figure 作为 product_photo
-                    avail_any = [i for i in range(len(figures_pt))
-                                 if i not in used_white and i not in used_scene]
-                    if not avail_any:
-                        avail_any = [i for i in range(len(figures_pt))
-                                     if not prod_to_figs.get(prod_idx)]
-                    if avail_any:
-                        best_any = min(avail_any,
-                                       key=lambda i: _min_dist_to_box(cx, cy, figures_pt[i]))
-                        prod_to_figs[prod_idx].append(best_any)
-                        fig_photo_type[best_any] = "product_photo"  # 强制标记
-                        used_white.add(best_any)
 
             # 第二轮：将剩余的场景图分配给最近产品（lifestyle_photo）
             remaining_scene = [i for i in scene_figs if i not in used_white and i not in used_scene]
@@ -1660,6 +1694,15 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                 )
                 prod_to_figs[best_prod].append(fig_i)
                 used_scene.add(fig_i)
+
+            # 若完全找不到白底商品图，说明 YOLO 只检测到了场景图
+            # 不强制把场景图当产品图，而是降级到 CV+LLM
+            if not white_figs:
+                logger.info(
+                    "product_regions_yolo_no_white_bg",
+                    page=page_no, n_figures=len(figures_px),
+                )
+                return None
 
             # 验证：每个产品必须有至少 1 个 figure
             if any(not figs for figs in prod_to_figs.values()):
@@ -1817,6 +1860,451 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
 
         except Exception as e:
             logger.warning("product_regions_llm_failed", page=page_no, error=str(e))
+            return None
+
+    @staticmethod
+    def _detect_product_regions_cv(
+        screenshot: bytes,
+        n_products: int,
+        page_w: float,
+        page_h: float,
+        page_no: int,
+    ) -> list[tuple] | None:
+        """使用传统 CV 方法检测候选产品图区域（像素坐标）。
+
+        适合扫描版 PDF：产品区域间有明显白色/浅色分隔，CV 边界比 YOLO/LLM 更精确。
+        返回 [(x0, y0, x1, y1), ...] 像素坐标，候选数 >= n_products；
+        候选不足或异常时返回 None，由调用方降级。
+
+        算法优先级（并行运行，合并结果）：
+        1. 亮度投影网格分割（适合规则网格排列的产品）
+        2. 形态学轮廓检测（适合不规则排列或有边框的产品）
+        3. 白底商品图连通域检测（直接定位白底商品主体，弥补策略1/2漏检）
+        """
+        try:
+            import numpy as np
+            import cv2
+            from PIL import Image as PILImage
+            import io as _io
+            from scipy.ndimage import uniform_filter1d
+
+            pil = PILImage.open(_io.BytesIO(screenshot))
+            img_w, img_h = pil.size
+            img_np = np.array(pil.convert("RGB"))
+            gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+            page_area = img_w * img_h
+            min_area = page_area / (n_products * 8)
+
+            # ── 策略 1: 自适应亮度投影网格分割 ──
+            # 扫描版 PDF 背景非纯白，用自适应阈值找分隔带
+            row_avg = gray.mean(axis=1).astype(float)
+            col_avg = gray.mean(axis=0).astype(float)
+
+            def _find_band_boundaries(avg: "np.ndarray", dim: int) -> list[int]:
+                smooth = uniform_filter1d(avg, size=max(dim // 50, 5))
+                mu, sigma = smooth.mean(), smooth.std()
+                thresh = mu + 0.4 * sigma
+                # 分隔带宽度必须在合理范围内：过宽说明是内容区（白底商品图/亮色场景）
+                MIN_SEP = max(dim // (n_products * 10), 3)
+                MAX_SEP = dim // (n_products * 2)  # 超过此宽度视为内容区，不作分隔
+                bounds = [0]
+                in_bright = False
+                band_start = 0
+                for i, v in enumerate(smooth):
+                    if v >= thresh and not in_bright:
+                        in_bright = True
+                        band_start = i
+                    elif v < thresh and in_bright:
+                        in_bright = False
+                        band_w = i - band_start
+                        if MIN_SEP <= band_w <= MAX_SEP:
+                            bounds.append((band_start + i) // 2)
+                bounds.append(dim)
+                return sorted(set(bounds))
+
+            row_cuts = _find_band_boundaries(row_avg, img_h)
+            col_cuts = _find_band_boundaries(col_avg, img_w)
+
+            grid_candidates: list[tuple] = []
+            for ri in range(len(row_cuts) - 1):
+                for ci in range(len(col_cuts) - 1):
+                    y0, y1 = row_cuts[ri], row_cuts[ri + 1]
+                    x0, x1 = col_cuts[ci], col_cuts[ci + 1]
+                    if (x1 - x0) * (y1 - y0) >= min_area:
+                        grid_candidates.append((x0, y0, x1, y1))
+
+            # ── 策略 2: 形态学轮廓检测 ──
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            edges = cv2.Canny(blurred, 30, 100)
+            kernel_size = max(20, img_w // 40)
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_RECT, (kernel_size, kernel_size))
+            closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=3)
+            contours, _ = cv2.findContours(
+                closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            contour_candidates: list[tuple] = []
+            for cnt in contours:
+                x, y, w, h = cv2.boundingRect(cnt)
+                if w * h >= min_area:
+                    contour_candidates.append((x, y, x + w, y + h))
+
+            # ── 策略 3: 白底商品图连通域检测 ──
+            # 扫描版商品图：单一商品主体在纯白背景上，直接检测非白色连通域
+            # 即使策略1/2找到了候选，也运行此策略补充漏检的白底商品图
+            wb_candidates: list[tuple] = []
+            try:
+                non_white = (gray < 235).astype(np.uint8)
+                # 闭运算：连接商品内部小空隙（如白色桌面），但不合并距离较远的内容
+                k_wb = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+                filled_wb = cv2.morphologyEx(non_white, cv2.MORPH_CLOSE, k_wb, iterations=2)
+                n_wb, _, stats_wb, _ = cv2.connectedComponentsWithStats(
+                    filled_wb, connectivity=8)
+                for lbl in range(1, n_wb):
+                    blob_area = stats_wb[lbl, cv2.CC_STAT_AREA]
+                    # 过滤：太小（噪点/文字）或太大（整幅场景图）
+                    if blob_area < min_area // 4 or blob_area > page_area // n_products:
+                        continue
+                    bx = stats_wb[lbl, cv2.CC_STAT_LEFT]
+                    by = stats_wb[lbl, cv2.CC_STAT_TOP]
+                    bw = stats_wb[lbl, cv2.CC_STAT_WIDTH]
+                    bh = stats_wb[lbl, cv2.CC_STAT_HEIGHT]
+                    # bbox 内白色像素比例 > 50%：说明商品被白色背景包围（白底商品图）
+                    region_wb = gray[by:by + bh, bx:bx + bw]
+                    white_ratio = (region_wb > 235).sum() / region_wb.size
+                    if white_ratio < 0.50:
+                        continue  # 背景不够白，是场景图
+                    pad_wb = min(20, min(bx, by, img_w - bx - bw, img_h - by - bh))
+                    wb_candidates.append((
+                        max(bx - pad_wb, 0), max(by - pad_wb, 0),
+                        min(bx + bw + pad_wb, img_w), min(by + bh + pad_wb, img_h),
+                    ))
+            except Exception:
+                pass  # 策略3失败不影响整体
+
+            # ── 合并所有候选，去重后返回 ──
+            # 优先使用白底检测结果 + 结构分割结果，让 LLM 从全集中做语义选择
+            best_structural = (
+                grid_candidates if len(grid_candidates) >= len(contour_candidates)
+                else contour_candidates
+            )
+            all_cands = wb_candidates + best_structural
+
+            # 简单去重：移除与已有候选 IoU > 0.7 的重复框
+            def _iou_1d(a0, a1, b0, b1):
+                inter = max(0, min(a1, b1) - max(a0, b0))
+                union = max(a1, b0) - min(a0, b1) + inter
+                return inter / union if union > 0 else 0.0
+
+            def _iou_2d(r1, r2):
+                ix = _iou_1d(r1[0], r1[2], r2[0], r2[2])
+                iy = _iou_1d(r1[1], r1[3], r2[1], r2[3])
+                return ix * iy  # 近似 IoU（实际是 intersection ratio）
+
+            deduped: list[tuple] = []
+            for cand in all_cands:
+                if not any(_iou_2d(cand, kept) > 0.5 for kept in deduped):
+                    deduped.append(cand)
+
+            if len(deduped) >= n_products:
+                logger.info("product_regions_cv_ok",
+                            page=page_no, candidates=len(deduped),
+                            wb=len(wb_candidates), grid=len(grid_candidates),
+                            contour=len(contour_candidates))
+                return deduped
+
+            # 候选不足时，取最大集合返回（给 LLM 更多选择）
+            if deduped:
+                logger.info("product_regions_cv_partial",
+                            page=page_no, candidates=len(deduped), n_products=n_products)
+                return deduped
+
+            return None
+
+        except Exception as e:
+            logger.warning("product_regions_cv_failed", page=page_no, error=str(e))
+            return None
+
+    @staticmethod
+    def _tighten_product_bbox(
+        screenshot: bytes,
+        pdf_bbox: tuple,
+        page_w: float,
+        page_h: float,
+        padding: int = 20,
+    ) -> tuple:
+        """紧密裁剪商品区域到商品主体，排除角落文字和多余背景。
+
+        用角点采样估算背景色（不假设白底），找最大连通的前景域即商品主体。
+        若无法收紧则返回原始 bbox。
+        """
+        try:
+            import numpy as np
+            import cv2
+            from PIL import Image as PILImage
+            import io as _io
+
+            pil = PILImage.open(_io.BytesIO(screenshot))
+            img_w, img_h = pil.size
+            gray = cv2.cvtColor(np.array(pil.convert("RGB")), cv2.COLOR_RGB2GRAY)
+
+            # PDF pts → 像素坐标
+            px0 = int(pdf_bbox[0] * img_w / page_w)
+            py0 = int(pdf_bbox[1] * img_h / page_h)
+            px1 = int(pdf_bbox[2] * img_w / page_w)
+            py1 = int(pdf_bbox[3] * img_h / page_h)
+            px0, px1 = max(0, px0), min(img_w, px1)
+            py0, py1 = max(0, py0), min(img_h, py1)
+
+            # LLM 坐标可能不够精确 → 将搜索区域扩展到包含 bbox 中心的整个页面半区象限
+            # 这样即使 LLM bbox 偏小，商品主体也一定在搜索范围内
+            cx_px = (px0 + px1) // 2
+            cy_px = (py0 + py1) // 2
+            # 按 bbox 中心确定页面象限（上/下 × 左/右）
+            qx0 = (img_w // 2) if cx_px > img_w // 2 else 0
+            qy0 = (img_h // 2) if cy_px > img_h // 2 else 0
+            qx1 = img_w if cx_px > img_w // 2 else (img_w // 2)
+            qy1 = img_h if cy_px > img_h // 2 else (img_h // 2)
+
+            region = gray[qy0:qy1, qx0:qx1]
+            rh, rw = region.shape
+            if rh < 20 or rw < 20:
+                return pdf_bbox
+
+            # 用四角像素估算背景亮度（商品通常居中，角落是背景）
+            bsize = max(min(20, rh // 5, rw // 5), 3)
+            corners = np.concatenate([
+                region[:bsize, :bsize].ravel(),
+                region[:bsize, -bsize:].ravel(),
+                region[-bsize:, :bsize].ravel(),
+                region[-bsize:, -bsize:].ravel(),
+            ])
+            bg_brightness = float(corners.mean())
+
+            # 前景掩码：与背景亮度差异 > 20 的像素
+            content_mask = (np.abs(region.astype(float) - bg_brightness) > 20).astype(np.uint8)
+            if not content_mask.any():
+                return pdf_bbox
+
+            # 形态学闭运算：连接商品内部小空隙（如白色桌面、大理石纹理）
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+            content_mask = cv2.morphologyEx(content_mask, cv2.MORPH_CLOSE, k, iterations=1)
+
+            # 找最大连通域（商品主体，通常远大于文字标注等噪点）
+            n_labels, _, stats, _ = cv2.connectedComponentsWithStats(
+                content_mask, connectivity=8)
+            if n_labels < 2:
+                return pdf_bbox
+
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            largest = int(np.argmax(areas))
+            lx = stats[largest + 1, cv2.CC_STAT_LEFT]
+            ly = stats[largest + 1, cv2.CC_STAT_TOP]
+            lw = stats[largest + 1, cv2.CC_STAT_WIDTH]
+            lh = stats[largest + 1, cv2.CC_STAT_HEIGHT]
+
+            # 最大域需合理（至少占象限面积的 5%），否则不收紧
+            if lw * lh < rh * rw * 0.05:
+                return pdf_bbox
+
+            tx0 = max(lx - padding, 0)
+            ty0 = max(ly - padding, 0)
+            tx1 = min(lx + lw + padding, rw)
+            ty1 = min(ly + lh + padding, rh)
+
+            scale_x = page_w / img_w
+            scale_y = page_h / img_h
+            return (
+                (qx0 + tx0) * scale_x,
+                (qy0 + ty0) * scale_y,
+                (qx0 + tx1) * scale_x,
+                (qy0 + ty1) * scale_y,
+            )
+        except Exception:
+            return pdf_bbox
+
+    @staticmethod
+    def _snap_scene_bbox(
+        screenshot: bytes,
+        pdf_bbox: tuple,
+        page_w: float,
+        page_h: float,
+    ) -> tuple:
+        """将场景图的 bbox 精修到实际图像面板边界（排除页面留白）。
+
+        在 LLM 给出的近似范围内向外扩展，找到场景图面板的真实边界。
+        若无法精修则返回原始 bbox。
+        """
+        try:
+            import numpy as np
+            import cv2
+            from PIL import Image as PILImage
+            import io as _io
+
+            pil = PILImage.open(_io.BytesIO(screenshot))
+            img_w, img_h = pil.size
+            gray = cv2.cvtColor(np.array(pil.convert("RGB")), cv2.COLOR_RGB2GRAY)
+
+            # 扩展到包含 bbox 中心的整个页面象限，确保完整场景不被裁切
+            cx_sc = int((pdf_bbox[0] + pdf_bbox[2]) / 2 * img_w / page_w)
+            cy_sc = int((pdf_bbox[1] + pdf_bbox[3]) / 2 * img_h / page_h)
+            px0 = (img_w // 2) if cx_sc > img_w // 2 else 0
+            py0 = (img_h // 2) if cy_sc > img_h // 2 else 0
+            px1 = img_w if cx_sc > img_w // 2 else (img_w // 2)
+            py1 = img_h if cy_sc > img_h // 2 else (img_h // 2)
+
+            region = gray[py0:py1, px0:px1]
+            if region.size == 0:
+                return pdf_bbox
+
+            # 估算页面背景亮度（整页图像四角）
+            bsize = max(int(img_w * 0.02), 5)
+            page_corners = np.concatenate([
+                gray[:bsize, :bsize].ravel(),
+                gray[:bsize, -bsize:].ravel(),
+                gray[-bsize:, :bsize].ravel(),
+                gray[-bsize:, -bsize:].ravel(),
+            ])
+            page_bg = float(page_corners.mean())
+
+            # 场景面板内容：与页面背景差异明显的像素
+            content_mask = (np.abs(region.astype(float) - page_bg) > 20).astype(np.uint8)
+            if not content_mask.any():
+                return pdf_bbox
+
+            # 形态学闭运算：填补场景内的小间隙（如灯光反射等）
+            k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+            closed = cv2.morphologyEx(content_mask, cv2.MORPH_CLOSE, k, iterations=2)
+
+            # 找最大连通域（整个场景面板）
+            n_labels, _, stats, _ = cv2.connectedComponentsWithStats(
+                closed, connectivity=8)
+            if n_labels < 2:
+                return pdf_bbox
+
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            largest = int(np.argmax(areas))
+            lx = stats[largest + 1, cv2.CC_STAT_LEFT]
+            ly = stats[largest + 1, cv2.CC_STAT_TOP]
+            lw = stats[largest + 1, cv2.CC_STAT_WIDTH]
+            lh = stats[largest + 1, cv2.CC_STAT_HEIGHT]
+
+            scale_x = page_w / img_w
+            scale_y = page_h / img_h
+            return (
+                (px0 + lx) * scale_x,
+                (py0 + ly) * scale_y,
+                (px0 + lx + lw) * scale_x,
+                (py0 + ly + lh) * scale_y,
+            )
+        except Exception:
+            return pdf_bbox
+
+    async def _select_product_regions_with_llm(
+        self,
+        screenshot: bytes,
+        cv_candidates_px: list[tuple],  # [(x0, y0, x1, y1), ...] 像素坐标
+        product_descs: list[tuple[str, str]],  # [(model_number, product_name), ...]
+        page_w: float,
+        page_h: float,
+        page_no: int,
+    ) -> list[dict] | None:
+        """将 CV 候选区域编号叠加到截图，让 LLM 做语义选择/纠错。
+
+        LLM 只需回答「哪个编号对应哪个产品」，坐标精度由 CV 保证。
+        返回与 _detect_product_regions_with_llm 相同格式：
+          list[{"product_index": int, "photo_type": str, "bbox": tuple(PDF pts)}]
+        """
+        if not screenshot or not self._llm:
+            return None
+        try:
+            import io as _io
+            from PIL import Image as PILImage, ImageDraw
+
+            pil = PILImage.open(_io.BytesIO(screenshot))
+            img_w, img_h = pil.size
+            draw = ImageDraw.Draw(pil)
+
+            # 绘制候选框（循环颜色）+ 左上角编号标签
+            BOX_COLORS = ["red", "blue", "green", "orange", "purple", "cyan",
+                          "magenta", "yellow"]
+            for i, (x0, y0, x1, y1) in enumerate(cv_candidates_px):
+                color = BOX_COLORS[i % len(BOX_COLORS)]
+                draw.rectangle([x0, y0, x1, y1], outline=color, width=4)
+                lx = min(int(x0) + 4, img_w - 28)
+                ly = max(int(y0) + 4, 0)
+                # 带背景的数字标签，便于 LLM 识别
+                draw.rectangle([lx - 2, ly - 2, lx + 24, ly + 24], fill=color)
+                draw.text((lx, ly), str(i), fill="white")
+
+            buf = _io.BytesIO()
+            pil.save(buf, format="JPEG", quality=85)
+            annotated_bytes = buf.getvalue()
+
+            n = len(product_descs)
+            n_cand = len(cv_candidates_px)
+            product_list = "\n".join(
+                f"{i}. {model} - {name}" if (model and name) else
+                f"{i}. {model or name or f'Product {i}'}"
+                for i, (model, name) in enumerate(product_descs)
+            )
+            prompt = _CV_SELECT_PROMPT.format(
+                n=n, n_cand=n_cand, n_cand_minus1=n_cand - 1,
+                product_list=product_list,
+            )
+            resp = await self._llm.call_llm(
+                operation="select_product_regions",
+                prompt=prompt,
+                images=[annotated_bytes],
+            )
+
+            from pdf_sku.llm_adapter.parser.response_parser import ResponseParser
+            parsed = ResponseParser().parse(resp.text, expected_type="array")
+            if not parsed.success or not isinstance(parsed.data, list):
+                logger.warning("select_product_regions_llm_parse_failed",
+                               page=page_no, text=resp.text[:200])
+                return None
+
+            photos: list[dict] = []
+            for item in parsed.data:
+                prod_idx = item.get("product_index")
+                cand_idx = item.get("region_index")
+                photo_type = item.get("photo_type", "product_photo")
+                if prod_idx is None or cand_idx is None:
+                    continue
+                prod_idx = int(prod_idx)
+                cand_idx = int(cand_idx)
+                if not (0 <= prod_idx < n) or not (0 <= cand_idx < n_cand):
+                    continue
+                if photo_type not in ("product_photo", "lifestyle_photo"):
+                    photo_type = "product_photo"
+                x0, y0, x1, y1 = cv_candidates_px[cand_idx]
+                # CV 像素坐标 → PDF points（Phase 8 会再 scale 回像素）
+                pt_bbox = (
+                    x0 * page_w / img_w,
+                    y0 * page_h / img_h,
+                    x1 * page_w / img_w,
+                    y1 * page_h / img_h,
+                )
+                photos.append({
+                    "product_index": prod_idx,
+                    "photo_type": photo_type,
+                    "bbox": pt_bbox,
+                })
+
+            covered = {p["product_index"] for p in photos if p["photo_type"] == "product_photo"}
+            if not all(i in covered for i in range(n)):
+                missing = [i for i in range(n) if i not in covered]
+                logger.warning("select_product_regions_llm_missing",
+                               page=page_no, missing=missing)
+                return None
+
+            logger.info("select_product_regions_llm_ok",
+                        page=page_no, n_products=n, n_photos=len(photos))
+            return photos
+
+        except Exception as e:
+            logger.warning("select_product_regions_llm_failed", page=page_no, error=str(e))
             return None
 
     @staticmethod
