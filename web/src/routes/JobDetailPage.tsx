@@ -4,6 +4,8 @@ import { useJobStore } from "../stores/jobStore";
 import { useSSEStore } from "../stores/sseStore";
 import { jobsApi } from "../api/jobs";
 import type { PageDetail } from "../api/jobs";
+import { opsApi } from "../api/ops";
+import type { AbExperimentResult, AbVariant } from "../api/ops";
 import StatusBadge from "../components/common/StatusBadge";
 import Loading from "../components/common/Loading";
 import { PageHeatmap } from "../components/dashboard/PageHeatmap";
@@ -650,6 +652,259 @@ function PageVerifyPanel({
   );
 }
 
+// ── OCR A/B 实验 结果弹窗 ──────────────────────────────────────────────────
+
+const VARIANT_COLORS = ["#22D3EE", "#A78BFA", "#34D399"];
+
+function AbExperimentModal({
+  pageNumber,
+  result,
+  onClose,
+}: {
+  pageNumber: number;
+  result: AbExperimentResult;
+  onClose: () => void;
+}) {
+  const [activeVariant, setActiveVariant] = useState(0);
+  const [showPrompt, setShowPrompt] = useState(false);
+  const variant: AbVariant | undefined = result.variants[activeVariant];
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed", inset: 0, zIndex: 9998,
+        backgroundColor: "rgba(0,0,0,0.75)",
+        display: "flex", alignItems: "flex-start", justifyContent: "center",
+        paddingTop: 40, overflowY: "auto",
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: "min(1100px, 96vw)", backgroundColor: "#131C2E",
+          border: "1px solid #2D3548", borderRadius: 10, padding: 24,
+          marginBottom: 40,
+        }}
+      >
+        {/* 标题栏 */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <div>
+            <span style={{ fontSize: 15, fontWeight: 700, color: "#E2E8F0" }}>
+              OCR A/B 实验 — 第 {pageNumber} 页
+            </span>
+            <span style={{ marginLeft: 12, fontSize: 12, color: "#64748B" }}>
+              图片 {result.image_size.width}×{result.image_size.height}px ·
+              OCR检测到 {result.ocr.img_boxes.length} 个图片块 / {result.ocr.text_boxes.length} 个文字块
+            </span>
+          </div>
+          <button
+            onClick={onClose}
+            style={{ background: "none", border: "none", color: "#94A3B8", fontSize: 20, cursor: "pointer" }}
+          >✕</button>
+        </div>
+
+        {/* 上方：标注图 + OCR 数据 */}
+        <div style={{ display: "flex", gap: 16, marginBottom: 20 }}>
+          {/* 标注图 */}
+          <div style={{ flex: "0 0 auto", maxWidth: 480 }}>
+            <div style={{ fontSize: 11, color: "#64748B", marginBottom: 4 }}>
+              标注图（<span style={{ color: "#22D3EE" }}>彩色实线框</span> = 图片块候选区域，编号=region_index ·{" "}
+              <span style={{ color: "#FBBF24" }}>黄色虚线框</span> = OCR文字块位置）
+            </div>
+            <img
+              src={`data:image/jpeg;base64,${result.annotated_image_b64}`}
+              style={{ width: "100%", maxWidth: 480, borderRadius: 6, border: "1px solid #2D3548", cursor: "zoom-in" }}
+              onClick={() => window.open(`data:image/jpeg;base64,${result.annotated_image_b64}`, "_blank")}
+              title="点击在新标签页中查看大图"
+            />
+          </div>
+          {/* OCR 数据面板 */}
+          <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 10 }}>
+            {/* img_boxes */}
+            <div>
+              <div style={{ fontSize: 11, color: "#64748B", marginBottom: 4 }}>
+                OCR 图片块（{result.ocr.img_boxes.length} 个，作为候选区域，彩色实线框）
+              </div>
+              <div style={{
+                maxHeight: 130, overflowY: "auto", fontSize: 11,
+                backgroundColor: "#0F172A", borderRadius: 6, border: "1px solid #2D3548", padding: 8,
+              }}>
+                {result.ocr.img_boxes.map((ib, i) => (
+                  <div key={i} style={{ marginBottom: 3, fontFamily: "monospace" }}>
+                    <span style={{
+                      display: "inline-block", padding: "0 5px",
+                      backgroundColor: `${VARIANT_COLORS[i % VARIANT_COLORS.length]}22`,
+                      border: `1px solid ${VARIANT_COLORS[i % VARIANT_COLORS.length]}55`,
+                      borderRadius: 3, color: VARIANT_COLORS[i % VARIANT_COLORS.length],
+                      fontWeight: 600, marginRight: 6,
+                    }}>{i}</span>
+                    <span style={{ color: "#64748B" }}>[{ib.bbox.map(Math.round).join(",")}]</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            {/* text_boxes */}
+            <div>
+              <div style={{ fontSize: 11, color: "#64748B", marginBottom: 4 }}>
+                OCR 文字块（{result.ocr.text_boxes.length} 个，黄色虚线框）
+              </div>
+            <div style={{
+              flex: 1, maxHeight: 160, overflowY: "auto", fontSize: 11,
+              backgroundColor: "#0F172A", borderRadius: 6, border: "1px solid #2D3548", padding: 8,
+            }}>
+              {result.ocr.text_boxes.length === 0 && (
+                <div style={{ color: "#475569" }}>未检测到文字</div>
+              )}
+              {result.ocr.text_boxes.map((tb, i) => (
+                <div key={i} style={{ marginBottom: 4, lineHeight: 1.4 }}>
+                  <span style={{ color: "#FBBF2499", fontFamily: "monospace" }}>
+                    [{tb.bbox.map(Math.round).join(",")}]
+                  </span>{" "}
+                  <span style={{ color: "#CBD5E1" }}>{tb.text}</span>
+                </div>
+              ))}
+            </div>
+            </div>{/* end text_boxes wrapper */}
+
+            {/* 商品列表 */}
+            <div>
+              <div style={{ fontSize: 11, color: "#64748B", marginBottom: 4 }}>
+                商品列表（共 {result.products.length} 个）
+              </div>
+              <div style={{ fontSize: 12, backgroundColor: "#0F172A", borderRadius: 6, border: "1px solid #2D3548", padding: 8 }}>
+                {result.products.map((p, i) => (
+                  <div key={i} style={{ color: "#CBD5E1", marginBottom: 2 }}>
+                    <span style={{ color: "#64748B" }}>{i}.</span>{" "}
+                    {p.model && <span style={{ color: "#22D3EE" }}>{p.model}</span>}
+                    {p.name && <span style={{ color: "#94A3B8" }}> {p.name}</span>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>{/* end OCR 数据面板 */}
+        </div>
+
+        {/* 变体切换标签 */}
+        <div style={{ display: "flex", gap: 8, marginBottom: 12, borderBottom: "1px solid #2D3548", paddingBottom: 8 }}>
+          {result.variants.map((v, i) => (
+            <button
+              key={i}
+              onClick={() => { setActiveVariant(i); setShowPrompt(false); }}
+              style={{
+                padding: "4px 14px", fontSize: 12, cursor: "pointer", borderRadius: 4,
+                border: `1px solid ${activeVariant === i ? VARIANT_COLORS[i] : "#2D3548"}`,
+                backgroundColor: activeVariant === i ? `${VARIANT_COLORS[i]}18` : "transparent",
+                color: activeVariant === i ? VARIANT_COLORS[i] : "#64748B",
+                fontWeight: activeVariant === i ? 600 : 400,
+              }}
+            >
+              {v.name}
+              {v.error && <span style={{ color: "#EF4444", marginLeft: 4 }}>⚠</span>}
+            </button>
+          ))}
+        </div>
+
+        {/* 当前变体详情 */}
+        {variant && (
+          <div>
+            {/* 元信息行 */}
+            <div style={{ display: "flex", gap: 16, fontSize: 11, color: "#64748B", marginBottom: 12 }}>
+              <span>耗时 <b style={{ color: "#94A3B8" }}>{variant.latency_ms.toFixed(0)}ms</b></span>
+              <span>输入 <b style={{ color: "#94A3B8" }}>{variant.input_tokens}</b> tokens</span>
+              <span>输出 <b style={{ color: "#94A3B8" }}>{variant.output_tokens}</b> tokens</span>
+              <span>发图 <b style={{ color: variant.used_image ? "#22C55E" : "#EF4444" }}>{variant.used_image ? "是" : "否"}</b></span>
+              <span>OCR结构化数据 <b style={{ color: variant.used_structured_data ? "#22C55E" : "#EF4444" }}>{variant.used_structured_data ? "是" : "否"}</b></span>
+            </div>
+
+            {variant.error && (
+              <div style={{ padding: "6px 10px", backgroundColor: "#EF444418", border: "1px solid #EF444433", borderRadius: 4, fontSize: 12, color: "#EF4444", marginBottom: 10 }}>
+                错误：{variant.error}
+              </div>
+            )}
+
+            {/* 匹配结果表格 */}
+            <div style={{ fontSize: 11, color: "#64748B", marginBottom: 6 }}>
+              匹配结果（商品 → 图片区域）
+            </div>
+            {variant.matches.length === 0 ? (
+              <div style={{ fontSize: 12, color: "#475569", padding: "8px 0" }}>未解析到有效匹配</div>
+            ) : (
+              <table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse", marginBottom: 12 }}>
+                <thead>
+                  <tr style={{ color: "#64748B", borderBottom: "1px solid #2D3548" }}>
+                    <th style={{ textAlign: "left", padding: "4px 8px", fontWeight: 500 }}>product_index</th>
+                    <th style={{ textAlign: "left", padding: "4px 8px", fontWeight: 500 }}>商品</th>
+                    <th style={{ textAlign: "left", padding: "4px 8px", fontWeight: 500 }}>region_index</th>
+                    <th style={{ textAlign: "left", padding: "4px 8px", fontWeight: 500 }}>photo_type</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {variant.matches.map((m, i) => {
+                    const prod = result.products[m.product_index];
+                    return (
+                      <tr key={i} style={{ borderBottom: "1px solid #1E293B" }}>
+                        <td style={{ padding: "4px 8px", color: "#94A3B8" }}>{m.product_index}</td>
+                        <td style={{ padding: "4px 8px", color: "#CBD5E1" }}>
+                          {prod ? `${prod.model || ""} ${prod.name || ""}`.trim() : "-"}
+                        </td>
+                        <td style={{ padding: "4px 8px" }}>
+                          <span style={{
+                            display: "inline-block", padding: "1px 8px",
+                            backgroundColor: `${VARIANT_COLORS[m.region_index % VARIANT_COLORS.length]}22`,
+                            border: `1px solid ${VARIANT_COLORS[m.region_index % VARIANT_COLORS.length]}44`,
+                            borderRadius: 3, color: VARIANT_COLORS[m.region_index % VARIANT_COLORS.length],
+                            fontWeight: 600,
+                          }}>
+                            {m.region_index}
+                          </span>
+                        </td>
+                        <td style={{ padding: "4px 8px", color: m.photo_type === "product_photo" ? "#22C55E" : "#A78BFA" }}>
+                          {m.photo_type}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+
+            {/* Prompt 折叠展示 */}
+            <button
+              onClick={() => setShowPrompt((v) => !v)}
+              style={{ fontSize: 11, color: "#64748B", background: "none", border: "none", cursor: "pointer", padding: 0, marginBottom: 6 }}
+            >
+              {showPrompt ? "▲ 隐藏 Prompt" : "▼ 查看 Prompt"}
+            </button>
+            {showPrompt && variant.prompt && (
+              <pre style={{
+                fontSize: 11, backgroundColor: "#0F172A", border: "1px solid #2D3548",
+                borderRadius: 4, padding: 10, overflowX: "auto", whiteSpace: "pre-wrap",
+                color: "#94A3B8", maxHeight: 200, overflowY: "auto",
+              }}>
+                {variant.prompt}
+              </pre>
+            )}
+            {showPrompt && variant.response_text && (
+              <>
+                <div style={{ fontSize: 11, color: "#64748B", marginTop: 6, marginBottom: 4 }}>LLM 原始响应：</div>
+                <pre style={{
+                  fontSize: 11, backgroundColor: "#0F172A", border: "1px solid #2D3548",
+                  borderRadius: 4, padding: 10, overflowX: "auto", whiteSpace: "pre-wrap",
+                  color: "#A78BFA", maxHeight: 150, overflowY: "auto",
+                }}>
+                  {variant.response_text}
+                </pre>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
 export default function JobDetailPage() {
   const { jobId } = useParams<{ jobId: string }>();
   const { currentJob, pages, skus, fetchJob, fetchPages, fetchSkus, loading } = useJobStore();
@@ -665,6 +920,9 @@ export default function JobDetailPage() {
   const [activities, setActivities] = useState<ActivityEntry[]>([]);
   const [exporting, setExporting] = useState(false);
   const [includeRaw, setIncludeRaw] = useState(false);
+  const [abExperimentPage, setAbExperimentPage] = useState<number | null>(null);
+  const [abExperimentLoading, setAbExperimentLoading] = useState(false);
+  const [abExperimentResult, setAbExperimentResult] = useState<AbExperimentResult | null>(null);
   const [exportProgress, setExportProgress] = useState<{
     progress: number;
     message: string;
@@ -758,6 +1016,22 @@ export default function JobDetailPage() {
       alert("重新分析失败，请稍后重试");
     } finally {
       setReprocessingPage(null);
+    }
+  };
+
+  const handleRunAbExperiment = async (pageNo: number) => {
+    if (!jobId || abExperimentLoading) return;
+    setAbExperimentLoading(true);
+    setAbExperimentPage(pageNo);
+    setAbExperimentResult(null);
+    try {
+      const result = await opsApi.runAbExperiment(jobId, pageNo);
+      setAbExperimentResult(result);
+    } catch (e: any) {
+      alert(`AB 实验失败：${e.message || String(e)}`);
+      setAbExperimentPage(null);
+    } finally {
+      setAbExperimentLoading(false);
     }
   };
 
@@ -988,7 +1262,7 @@ export default function JobDetailPage() {
               <th style={{ width: 70 }}>缩略图</th>
               <th>页码</th><th>状态</th><th>类型</th><th>SKU数</th>
               <th>置信度</th><th style={{ width: 70 }}>需介入</th><th>提取方式</th><th>LLM模型</th>
-              <th style={{ width: 90 }}>操作</th>
+              <th style={{ width: 110 }}>操作</th>
             </tr>
           </thead>
           <tbody>
@@ -1021,7 +1295,7 @@ export default function JobDetailPage() {
                   </td>
                   <td>{p.extraction_method || "-"}</td>
                   <td>{p.llm_model_used || "-"}</td>
-                  <td onClick={(e) => e.stopPropagation()}>
+                  <td onClick={(e) => e.stopPropagation()} style={{ whiteSpace: "nowrap" }}>
                     <button
                       onClick={() => handleReprocessPage(p.page_number)}
                       disabled={reprocessingPage !== null}
@@ -1030,9 +1304,25 @@ export default function JobDetailPage() {
                         padding: "2px 8px", fontSize: 11, cursor: reprocessingPage !== null ? "not-allowed" : "pointer",
                         backgroundColor: "transparent", border: "1px solid #2D3548", borderRadius: 3,
                         color: reprocessingPage === p.page_number ? "#F59E0B" : "#94A3B8",
+                        marginRight: 4,
                       }}
                     >
                       {reprocessingPage === p.page_number ? "⏳" : "🔄"}
+                    </button>
+                    <button
+                      onClick={() => handleRunAbExperiment(p.page_number)}
+                      disabled={abExperimentLoading}
+                      title="OCR A/B 实验：对比三种检测变体"
+                      style={{
+                        padding: "2px 8px", fontSize: 11,
+                        cursor: abExperimentLoading ? "not-allowed" : "pointer",
+                        backgroundColor: abExperimentPage === p.page_number && abExperimentLoading ? "#22D3EE18" : "transparent",
+                        border: `1px solid ${abExperimentPage === p.page_number ? "#22D3EE44" : "#2D3548"}`,
+                        borderRadius: 3,
+                        color: abExperimentPage === p.page_number && abExperimentLoading ? "#22D3EE" : "#64748B",
+                      }}
+                    >
+                      {abExperimentPage === p.page_number && abExperimentLoading ? "⏳" : "🔬"}
                     </button>
                   </td>
                 </tr>
@@ -1118,6 +1408,15 @@ export default function JobDetailPage() {
         >
           <img src={lightboxImg} style={{ maxWidth: "90vw", maxHeight: "90vh", borderRadius: 6 }} />
         </div>
+      )}
+
+      {/* AB 实验结果弹窗 */}
+      {abExperimentResult && abExperimentPage !== null && (
+        <AbExperimentModal
+          pageNumber={abExperimentPage}
+          result={abExperimentResult}
+          onClose={() => { setAbExperimentResult(null); setAbExperimentPage(null); }}
+        />
       )}
     </div>
   );

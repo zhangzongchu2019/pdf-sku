@@ -580,6 +580,104 @@ async def force_finalize_job(job_id: uuid.UUID, db: DBSession, request: Request)
     }
 
 
+# ───────────────────────── AB 实验：OCR vs 现有方案 ─────────────────────────
+
+@router.post("/ops/jobs/{job_id}/pages/{page_number}/ab-experiment")
+async def run_page_ab_experiment(
+    job_id: uuid.UUID,
+    db: DBSession,
+    request: Request,
+    page_number: int = PathParam(..., ge=1),
+):
+    """运行 OCR A/B 实验：对比 OCR 增强（标注图+文字/纯数据）与现有 LLM 基线的产品区域检测效果。
+
+    请求体（可选）:
+      {
+        "products": [{"model": "A001", "name": "沙发"}],  // 不传则从 DB 自动读取
+        "vlm_provider": "gemini"
+      }
+
+    返回:
+      {
+        "image_size": {...},
+        "products": [...],
+        "ocr": {"text_boxes": [...], "img_boxes": [...], "page_size": {...}},
+        "annotated_image_b64": "...",   // JPEG base64，可直接在浏览器展示
+        "variants": [
+          {"name": "A: 标注图+OCR文字", "matches": [...], "latency_ms": ..., ...},
+          {"name": "B: 纯结构化数据",   "matches": [...], ...},
+          {"name": "C: 仅标注图(基线)", "matches": [...], ...},
+        ]
+      }
+    """
+    # 验证 Job 存在
+    job_result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
+    job = job_result.scalar_one_or_none()
+    if not job:
+        raise JobNotFoundError(f"Job {job_id} not found")
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+
+    vlm_provider = body.get("vlm_provider", "gemini")
+
+    # 获取 products 列表（优先用请求体传入，否则从 DB 读取）
+    products: list[dict] = body.get("products", [])
+    if not products:
+        skus_result = await db.execute(
+            select(SKU).where(SKU.job_id == job_id, SKU.page_number == page_number)
+        )
+        skus = skus_result.scalars().all()
+        seen_models: set[str] = set()
+        for sku in skus:
+            attrs = sku.attributes or {}
+            model = attrs.get("model_number", "")
+            name = attrs.get("product_name", "")
+            if model and model not in seen_models:
+                seen_models.add(model)
+                products.append({"model": model, "name": name})
+            elif not model and name:
+                products.append({"model": "", "name": name})
+
+    if not products:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "当前页面无 SKU 数据，请先运行 AI 分析或手动传入 products 参数"},
+        )
+
+    # 加载页面截图
+    job_dir = Path(settings.job_data_dir) / str(job_id)
+    png_bytes = await _load_page_screenshot(job_dir, page_number)
+    if not png_bytes:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"页面 {page_number} 截图不存在"},
+        )
+
+    # 运行 AB 实验（耗时操作）
+    try:
+        from pdf_sku.pipeline.ab_experiment_runner import run_ab_experiment
+        result = await run_ab_experiment(
+            screenshot_bytes=png_bytes,
+            products=products,
+            vlm_provider=vlm_provider,
+        )
+    except Exception as e:
+        logger.exception("ab_experiment_failed", job_id=str(job_id), page=page_number, error=str(e))
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"实验运行失败: {str(e)}"},
+        )
+
+    if "error" in result:
+        return JSONResponse(status_code=422, content=result)
+
+    return result
+
+
 # ───────────────────────── Pages / SKUs / Evaluation ─────────────────────────
 
 @router.get("/jobs/{job_id}/pages")

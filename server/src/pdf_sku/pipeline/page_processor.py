@@ -115,6 +115,41 @@ RULES:
 Respond ONLY with the JSON array, no other text."""
 
 
+_OCR_LLM_PROMPT = """\
+This furniture catalog page has {n_regions} image regions detected by OCR, marked with colored numbered boxes (0 to {n_regions_minus1}).
+Yellow dashed boxes show OCR-detected text areas.
+
+Image region bboxes (pixel coordinates, index: [x0,y0,x1,y1]):
+{region_bboxes}
+
+OCR text blocks detected on the page (format: [x0,y0,x1,y1] "text"):
+{ocr_text}
+
+The following {n} products have been identified on this page:
+{product_list}
+
+Use the image region bboxes AND the OCR text positions to match each product to its photo region.
+Key spatial rule: the text block describing a product (model number, dimensions, etc.) is typically located BELOW or BESIDE its image region.
+
+Return a JSON array:
+[
+  {{"product_index": 0, "region_index": 2, "photo_type": "product_photo"}},
+  {{"product_index": 0, "region_index": 5, "photo_type": "lifestyle_photo"}},
+  {{"product_index": 1, "region_index": 3, "photo_type": "product_photo"}},
+  ...
+]
+
+RULES:
+1. product_index: 0-based index from the product list above
+2. region_index: 0-based index matching the numbered colored box on the image
+3. photo_type: "product_photo" (clean/white background) or "lifestyle_photo" (room/scene setting)
+4. Every product must have exactly one "product_photo" entry
+5. "lifestyle_photo" entries are optional — only include if clearly visible
+6. Skip regions that are irrelevant (pure text blocks, headers, footers)
+
+Respond ONLY with the JSON array, no other text."""
+
+
 class PageProcessor:
     """单页 9 阶段处理管线。"""
 
@@ -1397,22 +1432,29 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
         if n < 2:
             return
 
-        # ── 2. 检测产品子图区域：LLM 优先（语义识别），CV 辅助（边界精修）──
+        # ── 2. 检测产品子图区域：OCR+LLM 主路，降级链兜底 ──
         product_descs = [(model, name) for model, name, _ in unique_products]
 
-        # 主路：LLM 语义识别（识别哪里是商品图、哪里是场景图）+ CV 精修边界
-        llm_photos = await self._detect_product_regions_with_llm(
+        # 主路：OCR 精确定位图框 + LLM 语义匹配（不再让 LLM 猜坐标）
+        llm_photos = await self._detect_product_regions_with_ocr_llm(
             screenshot, product_descs, page_w, page_h, page_no)
-        _detection_method = "llm"
+        _detection_method = "ocr_llm"
 
-        # 次路：YOLO 图形检测（当 LLM 无法给出坐标时）
+        # 次路：纯 LLM（OCR API 不可用/超时时的 fallback）
+        if llm_photos is None:
+            llm_photos = await self._detect_product_regions_with_llm(
+                screenshot, product_descs, page_w, page_h, page_no)
+            if llm_photos is not None:
+                _detection_method = "llm"
+
+        # 三路：YOLO 图形检测
         if llm_photos is None:
             llm_photos = self._detect_product_regions_yolo(
                 screenshot, unique_products, page_w, page_h, page_no)
             if llm_photos is not None:
                 _detection_method = "yolo"
 
-        # 三路：CV 网格 + LLM 语义选择
+        # 四路：CV 网格 + LLM 语义选择
         if llm_photos is None:
             cv_candidates = self._detect_product_regions_cv(
                 screenshot, n, page_w, page_h, page_no)
@@ -1447,22 +1489,26 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                     bbox = photo["bbox"]
                     role = "product_main" if photo["photo_type"] == "product_photo" else "product_detail"
                     # CV 精修边界：
-                    # product_main → 紧密裁剪到商品主体（排除文字/多余背景）
-                    # product_detail → 扩展/对齐到完整场景面板
-                    if role == "product_main":
-                        bbox = self._tighten_product_bbox(
-                            screenshot, bbox, page_w, page_h)
-                    else:
-                        bbox = self._snap_scene_bbox(
-                            screenshot, bbox, page_w, page_h)
+                    # OCR+LLM 路径已提供像素级精确 bbox，跳过 CV 精修（避免跨区域融合导致重复）
+                    # 其余路径：product_main → 紧密裁剪，product_detail → 扩展到完整场景面板
+                    if _detection_method != "ocr_llm":
+                        if role == "product_main":
+                            bbox = self._tighten_product_bbox(
+                                screenshot, bbox, page_w, page_h)
+                        else:
+                            bbox = self._snap_scene_bbox(
+                                screenshot, bbox, page_w, page_h)
                     dw = abs(bbox[2] - bbox[0]) * dpi_scale
                     dh = abs(bbox[3] - bbox[1]) * dpi_scale
                     short = int(min(dw, dh))
+                    # OCR+LLM bbox 已精确，放宽 search_eligible 阈值到 10px（仅过滤退化图框）；
+                    # 其余路径保留 150px（LLM 猜坐标时误差较大，过小说明坐标可靠性低）
+                    _se_thresh = 10 if _detection_method == "ocr_llm" else 150
                     new_region_images.append(ImageInfo(
                         image_id=f"p{page_no}_region_{img_idx}",
                         bbox=bbox,
                         width=int(dw), height=int(dh), short_edge=short,
-                        search_eligible=short >= 150,
+                        search_eligible=short >= _se_thresh,
                         role=role,
                         data=b"",
                     ))
@@ -1474,9 +1520,12 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
             # 则放弃 LLM 结果，降级为等比网格。
             # 要求每个产品至少有 1 张可搜索的 product_main 图片；
             # 若有产品的主图不可搜索，说明坐标质量不可靠，整体降级。
+            # OCR+LLM 路径：bbox 来自 OCR 精确检测，阈值放宽到 10px（仅过滤退化图框）；
+            # 纯 LLM 路径：保持 150px（防止 LLM 猜错坐标时降级）
+            _eligible_threshold = 10 if _detection_method == "ocr_llm" else 150
             eligible_main_count = sum(
                 1 for img in new_region_images
-                if img.search_eligible and img.role == "product_main"
+                if img.short_edge >= _eligible_threshold and img.role == "product_main"
             )
             has_eligible_llm = eligible_main_count >= n
             if not has_eligible_llm:
@@ -1484,30 +1533,44 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                     "product_regions_llm_no_eligible",
                     page=page_no,
                     n_created=len(new_region_images),
-                    reason="all short_edge < 150, likely bad LLM coords",
+                    reason=f"short_edge < {_eligible_threshold}, likely bad LLM coords",
                 )
                 llm_photos = None
                 img_idx = 0
             else:
-                # ── 3. 标记原大图为不可搜索（仅在成功创建有效区域时）──
-                full_img.search_eligible = False
-                raw.images.extend(new_region_images)
+                # 紧缩后重复 bbox 检查：若多张 product_main 的 bbox 相同
+                # （_tighten_product_bbox 将不同区域映射到同一连通体），降级到下一路
+                # OCR+LLM 路径跳过此检查：无 tighten，重复 bbox 属于合法的"变体共用主图"场景
+                main_bboxes = [img.bbox for img in new_region_images if img.role == "product_main"]
+                if _detection_method != "ocr_llm" and len(set(main_bboxes)) < len(main_bboxes):
+                    logger.warning(
+                        "product_regions_post_tighten_duplicate_bboxes",
+                        page=page_no,
+                        n_products=n,
+                        main_bboxes=main_bboxes,
+                    )
+                    llm_photos = None
+                    img_idx = 0
+                else:
+                    # ── 3. 标记原大图为不可搜索（仅在成功创建有效区域时）──
+                    full_img.search_eligible = False
+                    raw.images.extend(new_region_images)
 
-                # 将每个 SKU 的 source_bbox 指向对应产品的 product_main 照片
-                for sku in skus:
-                    model = sku.attributes.get("model_number", "")
-                    sb = sku.source_bbox
-                    if model and model in model_to_main_bbox:
-                        sku.source_bbox = model_to_main_bbox[model]
-                    elif not model and sb and sb != (0, 0, 0, 0):
-                        # fallback：找最近的 product_main 图片
-                        main_bboxes = [b for b in model_to_main_bbox.values()]
-                        if main_bboxes:
-                            cx, cy = (sb[0] + sb[2]) / 2, (sb[1] + sb[3]) / 2
-                            sku.source_bbox = min(main_bboxes, key=lambda b: _min_dist_to_bbox(cx, cy, b))
+                    # 将每个 SKU 的 source_bbox 指向对应产品的 product_main 照片
+                    for sku in skus:
+                        model = sku.attributes.get("model_number", "")
+                        sb = sku.source_bbox
+                        if model and model in model_to_main_bbox:
+                            sku.source_bbox = model_to_main_bbox[model]
+                        elif not model and sb and sb != (0, 0, 0, 0):
+                            # fallback：找最近的 product_main 图片
+                            near_bboxes = [b for b in model_to_main_bbox.values()]
+                            if near_bboxes:
+                                cx, cy = (sb[0] + sb[2]) / 2, (sb[1] + sb[3]) / 2
+                                sku.source_bbox = min(near_bboxes, key=lambda b: _min_dist_to_bbox(cx, cy, b))
 
-                n_images = img_idx
-                used_method = f"{_detection_method}_individual"
+                    n_images = img_idx
+                    used_method = f"{_detection_method}_individual"
 
         if llm_photos is None:
             # ── 降级：等比网格，每产品一个区域（旧行为）──
@@ -1748,6 +1811,186 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
 
         except Exception as e:
             logger.warning("product_regions_yolo_failed", page=page_no, error=str(e))
+            return None
+
+    async def _detect_product_regions_with_ocr_llm(
+        self,
+        screenshot: bytes,
+        product_descs: list[tuple[str, str]],  # [(model_number, product_name), ...]
+        page_w: float,
+        page_h: float,
+        page_no: int,
+    ) -> list[dict] | None:
+        """OCR + LLM 两步法检测产品子图区域（主路）。
+
+        步骤：
+        1. 调用 PaddleOCR-VL API，精确定位页面上的图片块（img_boxes）和文字块（text_boxes）
+        2. 在截图上画带编号的彩色框（img_boxes）和黄色虚线框（text_boxes），生成标注图
+        3. 把标注图 + img_box 坐标 + OCR 文字内容发给 LLM
+        4. LLM 返回 {product_index, region_index, photo_type}，region_index 对应 img_box 序号
+        5. 用 img_box 的实际像素 bbox 转换为 PDF 点坐标，作为最终结果
+
+        优势：LLM 只需做"文字→图框匹配"（简单推理），不再猜测像素坐标（困难任务）；
+        图框位置由 OCR 精确提供，识别精度大幅提升。
+
+        失败（OCR 超时/无图块/LLM 解析失败）返回 None，由调用方降级到 YOLO/CV。
+        """
+        if not screenshot or not self._llm:
+            return None
+
+        n = len(product_descs)
+
+        try:
+            from pdf_sku.pipeline.ocr_client import call_ocr_on_image
+            from pdf_sku.pipeline.ab_experiment_runner import annotate_img_boxes, ImgBox, TextBox
+            import re as _re
+
+            # ── 1. 调用 OCR，获取 parsing_res_list ──
+            parsing_res = await call_ocr_on_image(screenshot, timeout=120)
+            if not parsing_res:
+                logger.info("product_regions_ocr_llm_no_result", page=page_no)
+                return None
+
+            # ── 2. 解析 img_boxes / text_boxes ──
+            img_boxes: list[ImgBox] = []
+            text_boxes: list[TextBox] = []
+            ocr_img_w = ocr_img_h = 0
+
+            for blk in parsing_res:
+                label = blk.get("block_label", "")
+                bbox = blk.get("block_bbox", [])
+                if not bbox or len(bbox) != 4:
+                    continue
+                # 从第一个块推断 OCR 使用的图片尺寸（用 block_bbox 上界估计）
+                ocr_img_w = max(ocr_img_w, int(bbox[2]))
+                ocr_img_h = max(ocr_img_h, int(bbox[3]))
+
+                if label == "image":
+                    img_boxes.append(ImgBox(bbox=list(bbox)))
+                else:
+                    raw = blk.get("block_content", "")
+                    clean = _re.sub(r"<[^>]+>", "", raw).strip()
+                    if clean:
+                        text_boxes.append(TextBox(bbox=list(bbox), text=clean, label=label))
+
+            if not img_boxes:
+                logger.info("product_regions_ocr_llm_no_img_boxes",
+                            page=page_no, text_blocks=len(text_boxes))
+                return None
+
+            # ── 3. 生成标注图 ──
+            annotated = annotate_img_boxes(screenshot, img_boxes, text_boxes)
+
+            # ── 4. 获取实际图片尺寸（用于坐标换算）──
+            import io as _io
+            from PIL import Image as _PIL
+            pil = _PIL.open(_io.BytesIO(screenshot))
+            px_w, px_h = pil.size
+            # OCR bbox 坐标基于原始提交图片（即 screenshot），与 px_w/px_h 对齐
+            # 若 OCR 返回的坐标范围比截图小（极少情况），用截图尺寸兜底
+            ref_w = max(ocr_img_w, px_w) or px_w
+            ref_h = max(ocr_img_h, px_h) or px_h
+
+            # ── 5. 构建 prompt ──
+            region_lines = []
+            for i, box in enumerate(img_boxes):
+                x0, y0, x1, y1 = [int(v) for v in box.bbox]
+                region_lines.append(f"  {i}: [{x0},{y0},{x1},{y1}]")
+
+            ocr_lines = []
+            for tb in text_boxes:
+                bstr = "[{},{},{},{}]".format(*[int(v) for v in tb.bbox])
+                ocr_lines.append(f"  {bstr} \"{tb.text}\"")
+
+            product_list_lines = []
+            for idx, (model, name) in enumerate(product_descs):
+                if model and name:
+                    product_list_lines.append(f"  {idx}. {model} - {name}")
+                elif model:
+                    product_list_lines.append(f"  {idx}. {model}")
+                else:
+                    product_list_lines.append(f"  {idx}. {name or f'Product {idx}'}")
+
+            prompt = _OCR_LLM_PROMPT.format(
+                n_regions=len(img_boxes),
+                n_regions_minus1=len(img_boxes) - 1,
+                region_bboxes="\n".join(region_lines),
+                ocr_text="\n".join(ocr_lines) if ocr_lines else "  (no text detected)",
+                n=n,
+                product_list="\n".join(product_list_lines),
+            )
+
+            # ── 6. 调用 LLM（发标注图 + prompt）──
+            resp = await self._llm.call_llm(
+                operation="detect_product_regions_ocr_llm",
+                prompt=prompt,
+                images=[annotated],
+            )
+
+            from pdf_sku.llm_adapter.parser.response_parser import ResponseParser
+            parsed = ResponseParser().parse(resp.text, expected_type="array")
+            if not parsed.success or not isinstance(parsed.data, list):
+                logger.warning("product_regions_ocr_llm_parse_failed",
+                               page=page_no, text=resp.text[:200])
+                return None
+
+            # ── 7. 转换 region_index → PDF pts bbox ──
+            photos: list[dict] = []
+            n_regions = len(img_boxes)
+            for item in parsed.data:
+                prod_idx = item.get("product_index")
+                region_idx = item.get("region_index")
+                photo_type = item.get("photo_type", "product_photo")
+                if prod_idx is None or region_idx is None:
+                    continue
+                prod_idx = int(prod_idx)
+                region_idx = int(region_idx)
+                if not (0 <= prod_idx < n) or not (0 <= region_idx < n_regions):
+                    continue
+                px_bbox = img_boxes[region_idx].bbox  # [x0, y0, x1, y1] 像素坐标
+                pt_bbox = (
+                    px_bbox[0] * page_w / ref_w,
+                    px_bbox[1] * page_h / ref_h,
+                    px_bbox[2] * page_w / ref_w,
+                    px_bbox[3] * page_h / ref_h,
+                )
+                photos.append({
+                    "product_index": prod_idx,
+                    "photo_type": photo_type,
+                    "bbox": pt_bbox,
+                })
+
+            # ── 8. 验证 ──
+            # 8a. 每个产品必须有一张 product_photo
+            covered = {p["product_index"] for p in photos if p["photo_type"] == "product_photo"}
+            if not all(i in covered for i in range(n)):
+                missing = [i for i in range(n) if i not in covered]
+                logger.warning("product_regions_ocr_llm_missing_product_photos",
+                               page=page_no, missing=missing)
+                return None
+
+            # 8b. 唯一性检查（仅当图框数 >= SKU数时生效）
+            # - 图框数 >= SKU数：每个产品独占一个图框，若有重复说明 LLM 匹配有误 → 降级
+            # - 图框数 < SKU数：图框不够，允许多个 SKU 共享同一图框（变体款式共用主图）→ 不降级
+            main_regions = [p["region_index"] for p in parsed.data
+                            if p.get("photo_type") == "product_photo"
+                            and isinstance(p.get("region_index"), int)]
+            if n_regions >= n and len(set(main_regions)) < n:
+                logger.warning(
+                    "product_regions_ocr_llm_duplicate_regions",
+                    page=page_no, n_products=n,
+                    n_img_boxes=n_regions,
+                    main_regions=main_regions,
+                )
+                return None
+
+            logger.info("product_regions_ocr_llm_ok",
+                        page=page_no, n_products=n,
+                        n_img_boxes=n_regions, n_photos=len(photos))
+            return photos
+
+        except Exception as e:
+            logger.warning("product_regions_ocr_llm_failed", page=page_no, error=str(e))
             return None
 
     async def _detect_product_regions_with_llm(

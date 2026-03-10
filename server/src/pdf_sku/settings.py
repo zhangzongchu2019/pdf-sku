@@ -68,6 +68,11 @@ class Settings(BaseSettings):
     langfuse_secret_key: str = ""
     langfuse_host: str = ""
 
+    # === PaddleOCR-VL ===
+    ocr_token: str = ""  # Bearer token，对应 .env OCR_TOKEN
+    ocr_model: str = "PaddleOCR-VL-1.5"
+    ocr_job_url: str = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
+
     # === Layout Detection ===
     doclayout_model_path: str = ""  # 留空用默认 server/models/doclayout_yolo.pt
     layout_detect_enabled: bool = True

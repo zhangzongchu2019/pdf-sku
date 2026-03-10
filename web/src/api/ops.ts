@@ -66,4 +66,43 @@ export const opsApi = {
 
   rollbackConfig: (profileId: string) =>
     api.post(`/ops/config/rollback/${profileId}`),
+
+  /** OCR A/B 实验：对比三种变体的产品区域检测结果 */
+  runAbExperiment: (
+    jobId: string,
+    pageNumber: number,
+    body?: { products?: { model: string; name: string }[]; vlm_provider?: string },
+  ) =>
+    api.post<AbExperimentResult>(
+      `/ops/jobs/${jobId}/pages/${pageNumber}/ab-experiment`,
+      body ?? {},
+    ),
 };
+
+// ── AB 实验结果类型 ──────────────────────────────────────────────────────────
+
+export interface AbVariant {
+  name: string;
+  matches: { product_index: number; region_index: number; photo_type: string }[];
+  latency_ms: number;
+  input_tokens: number;
+  output_tokens: number;
+  used_image: boolean;
+  used_structured_data: boolean;
+  error: string;
+  prompt?: string;
+  response_text?: string;
+}
+
+export interface AbExperimentResult {
+  image_size: { width: number; height: number };
+  products: { model: string; name: string }[];
+  ocr: {
+    text_boxes: { bbox: number[]; text: string; label: string }[];
+    img_boxes: { bbox: number[] }[];
+    page_size: { width: number; height: number };
+  };
+  annotated_image_b64: string;
+  variants: AbVariant[];
+  error?: string;
+}
