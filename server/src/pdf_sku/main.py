@@ -19,6 +19,76 @@ from pdf_sku.settings import settings
 logger = structlog.get_logger()
 
 
+def create_llm_service(redis=None):
+    """创建 LLMService 实例 (可脱离 FastAPI 使用)。
+
+    Args:
+        redis: 可选 Redis 连接。无 Redis 时跳过 BudgetGuard/RateLimiter。
+    """
+    from pdf_sku.llm_adapter.client.registry import register as register_client
+    from pdf_sku.llm_adapter.service import LLMService
+    from pdf_sku.llm_adapter.prompt.engine import PromptEngine
+    from pdf_sku.llm_adapter.parser.response_parser import ResponseParser
+    from pdf_sku.llm_adapter.resilience.circuit_breaker import CircuitBreaker
+    from pdf_sku.llm_adapter.resilience.budget_guard import BudgetGuard
+    from pdf_sku.llm_adapter.resilience.rate_limiter import RateLimiter
+
+    if settings.gemini_api_key:
+        from pdf_sku.llm_adapter.client.gemini import GeminiClient
+        register_client("gemini", GeminiClient(
+            api_key=settings.gemini_api_key,
+            model=settings.gemini_model,
+            timeout=settings.llm_timeout_seconds,
+            api_base=settings.gemini_api_base,
+        ))
+    if settings.qwen_api_key:
+        from pdf_sku.llm_adapter.client.qwen import QwenClient
+        register_client("qwen", QwenClient(
+            api_key=settings.qwen_api_key,
+            model=settings.qwen_model,
+            timeout=settings.llm_timeout_seconds,
+        ))
+    if settings.openrouter_api_key:
+        from pdf_sku.llm_adapter.client.openrouter import OpenRouterClient
+        register_client("openrouter", OpenRouterClient(
+            api_key=settings.openrouter_api_key,
+            model=settings.openrouter_model,
+            timeout=settings.llm_timeout_seconds,
+            api_base=settings.openrouter_api_base,
+        ))
+
+    # 选择默认客户端: 优先用 .env 中的 DEFAULT_LLM_CLIENT
+    default_client = settings.default_llm_client
+    if not default_client:
+        if settings.gemini_api_key:
+            default_client = "gemini"
+        elif settings.openrouter_api_key:
+            default_client = "openrouter"
+        elif settings.qwen_api_key:
+            default_client = "qwen"
+        else:
+            default_client = "gemini"
+
+    # Fallback 链: gemini → openrouter → qwen (按优先级)
+    fallback_chain = []
+    if settings.gemini_api_key:
+        fallback_chain.append("gemini")
+    if settings.openrouter_api_key:
+        fallback_chain.append("openrouter")
+    if settings.qwen_api_key:
+        fallback_chain.append("qwen")
+
+    return LLMService(
+        prompt_engine=PromptEngine(),
+        parser=ResponseParser(),
+        circuit_breaker=CircuitBreaker(),
+        budget_guard=BudgetGuard(redis) if redis and settings.gemini_api_key else None,
+        rate_limiter=RateLimiter(redis) if redis and settings.gemini_api_key else None,
+        default_client_name=default_client,
+        fallback_chain=fallback_chain,
+    )
+
+
 def _configure_logging() -> None:
     processors = [
         structlog.contextvars.merge_contextvars,
@@ -130,41 +200,9 @@ async def lifespan(app: FastAPI):
             deps.orphan_scanner = OrphanScanner(session_factory, redis)
             log.info("gateway_initialized")
 
-            # LLM Clients
-            from pdf_sku.llm_adapter.client.registry import register as register_client
-            if settings.gemini_api_key:
-                from pdf_sku.llm_adapter.client.gemini import GeminiClient
-                register_client("gemini", GeminiClient(
-                    api_key=settings.gemini_api_key,
-                    model=settings.gemini_model,
-                    timeout=settings.llm_timeout_seconds,
-                ))
-                log.info("llm_registered", client="gemini")
-            if settings.qwen_api_key:
-                from pdf_sku.llm_adapter.client.qwen import QwenClient
-                register_client("qwen", QwenClient(
-                    api_key=settings.qwen_api_key,
-                    model=settings.qwen_model,
-                    timeout=settings.llm_timeout_seconds,
-                ))
-                log.info("llm_registered", client="qwen")
-
-            # LLM Service
-            from pdf_sku.llm_adapter.service import LLMService
-            from pdf_sku.llm_adapter.prompt.engine import PromptEngine
-            from pdf_sku.llm_adapter.parser.response_parser import ResponseParser
-            from pdf_sku.llm_adapter.resilience.circuit_breaker import CircuitBreaker
-            from pdf_sku.llm_adapter.resilience.budget_guard import BudgetGuard
-            from pdf_sku.llm_adapter.resilience.rate_limiter import RateLimiter
-
-            llm_service = LLMService(
-                prompt_engine=PromptEngine(),
-                parser=ResponseParser(),
-                circuit_breaker=CircuitBreaker(),
-                budget_guard=BudgetGuard(redis) if settings.gemini_api_key else None,
-                rate_limiter=RateLimiter(redis) if settings.gemini_api_key else None,
-                default_client_name="gemini" if settings.gemini_api_key else "qwen",
-            )
+            # LLM Service (via factory)
+            llm_service = create_llm_service(redis=redis)
+            log.info("llm_service_created")
 
             # Evaluator
             from pdf_sku.evaluator.eval_cache import EvalCache

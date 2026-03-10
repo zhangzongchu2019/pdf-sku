@@ -41,9 +41,14 @@ class Settings(BaseSettings):
 
     # === LLM ===
     gemini_api_key: str = ""
+    gemini_api_base: str = "https://generativelanguage.googleapis.com"
     gemini_model: str = "gemini-2.0-flash"
     qwen_api_key: str = ""
     qwen_model: str = "qwen-vl-max"
+    openrouter_api_key: str = ""
+    openrouter_api_base: str = "https://openrouter.ai/api"
+    openrouter_model: str = "google/gemini-2.5-flash"
+    default_llm_client: str = ""
     llm_daily_budget_usd: float = 50.0
     llm_timeout_seconds: int = 60
 

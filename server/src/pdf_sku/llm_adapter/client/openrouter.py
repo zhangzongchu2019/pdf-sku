@@ -1,7 +1,8 @@
 """
-Google Gemini LLM 客户端。对齐: LLM Adapter 详设
+OpenRouter LLM 客户端。
 
-- Gemini 2.0 Flash / Pro
+- OpenAI 兼容 API 格式
+- 支持多模型路由 (Gemini, Claude, GPT 等)
 - 视觉支持 (图片 base64)
 - JSON mode
 """
@@ -15,24 +16,24 @@ from pdf_sku.llm_adapter.client.base import BaseLLMClient, LLMResponse
 
 logger = structlog.get_logger()
 
-DEFAULT_GEMINI_API_BASE = "https://generativelanguage.googleapis.com"
+DEFAULT_OPENROUTER_BASE = "https://openrouter.ai/api"
 
 
-class GeminiClient(BaseLLMClient):
-    """Google Gemini 客户端。支持官方 API 和兼容中转 (laozhang.ai 等)。"""
+class OpenRouterClient(BaseLLMClient):
+    """OpenRouter 客户端 (OpenAI 兼容)。"""
 
     def __init__(
         self,
         api_key: str = "",
-        model: str = "gemini-2.0-flash",
+        model: str = "google/gemini-2.5-flash",
         timeout: float = 60.0,
         api_base: str = "",
     ):
         self._api_key = api_key
         self._model = model
         self._timeout = timeout
-        base = (api_base or DEFAULT_GEMINI_API_BASE).rstrip("/")
-        self._api_base = f"{base}/v1beta/models"
+        base = (api_base or DEFAULT_OPENROUTER_BASE).rstrip("/")
+        self._api_url = f"{base}/v1/chat/completions"
         self._client = httpx.AsyncClient(timeout=timeout)
 
     async def complete(
@@ -44,56 +45,56 @@ class GeminiClient(BaseLLMClient):
         json_mode: bool = False,
         images: list[bytes] | None = None,
     ) -> LLMResponse:
-        parts = []
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
 
-        # 图片 (vision)
+        # 构建 user message content
         if images:
+            content_parts = []
             for img_bytes in images:
                 b64 = base64.b64encode(img_bytes).decode()
-                parts.append({
-                    "inline_data": {
-                        "mime_type": "image/jpeg",
-                        "data": b64,
-                    }
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
                 })
+            content_parts.append({"type": "text", "text": prompt})
+            messages.append({"role": "user", "content": content_parts})
+        else:
+            messages.append({"role": "user", "content": prompt})
 
-        parts.append({"text": prompt})
-
-        body = {
-            "contents": [{"parts": parts}],
-            "generationConfig": {
-                "temperature": temperature,
-                "maxOutputTokens": max_tokens,
-            },
+        body: dict = {
+            "model": self._model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
         }
-        if system:
-            body["systemInstruction"] = {"parts": [{"text": system}]}
         if json_mode:
-            body["generationConfig"]["responseMimeType"] = "application/json"
+            body["response_format"] = {"type": "json_object"}
 
-        url = f"{self._api_base}/{self._model}:generateContent?key={self._api_key}"
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+
         start = time.monotonic()
-        resp = await self._client.post(url, json=body)
+        resp = await self._client.post(self._api_url, json=body, headers=headers)
         latency = (time.monotonic() - start) * 1000
         resp.raise_for_status()
         data = resp.json()
 
-        candidates = data.get("candidates", [])
-        content = ""
-        if candidates:
-            parts_out = candidates[0].get("content", {}).get("parts", [])
-            content = "".join(p.get("text", "") for p in parts_out)
-
-        usage_meta = data.get("usageMetadata", {})
+        choices = data.get("choices", [])
+        content = choices[0].get("message", {}).get("content", "") if choices else ""
+        usage = data.get("usage", {})
 
         return LLMResponse(
             content=content,
             model=self._model,
             usage={
-                "input_tokens": usage_meta.get("promptTokenCount", 0),
-                "output_tokens": usage_meta.get("candidatesTokenCount", 0),
+                "input_tokens": usage.get("prompt_tokens", 0),
+                "output_tokens": usage.get("completion_tokens", 0),
             },
-            finish_reason=candidates[0].get("finishReason", "") if candidates else "",
+            finish_reason=choices[0].get("finish_reason", "") if choices else "",
             latency_ms=latency,
             raw_response=data,
         )
@@ -114,7 +115,7 @@ class GeminiClient(BaseLLMClient):
                 if attempt < max_retries:
                     import asyncio
                     await asyncio.sleep(1.5 * (attempt + 1))
-                    logger.warning("gemini_retry",
+                    logger.warning("openrouter_retry",
                                    attempt=attempt + 1, error=str(e))
         raise last_error  # type: ignore
 
@@ -124,4 +125,4 @@ class GeminiClient(BaseLLMClient):
 
     @property
     def provider(self) -> str:
-        return "gemini"
+        return "openrouter"

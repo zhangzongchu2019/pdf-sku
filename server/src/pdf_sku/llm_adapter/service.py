@@ -37,6 +37,7 @@ class LLMService:
         budget_guard: BudgetGuard | None = None,
         rate_limiter: RateLimiter | None = None,
         default_client_name: str = "gemini",
+        fallback_chain: list[str] | None = None,
     ) -> None:
         self._prompt = prompt_engine
         self._parser = parser
@@ -44,6 +45,7 @@ class LLMService:
         self._budget = budget_guard
         self._rate_limiter = rate_limiter
         self._default_client = default_client_name
+        self._fallback_chain = fallback_chain or []
 
     @property
     def current_model_name(self) -> str:
@@ -155,60 +157,84 @@ class LLMService:
     ) -> LLMResponse:
         """
         核心调用链: circuit → rate_limit → budget → client.complete → record。
-        带重试 (最多 MAX_RETRIES 次)。
+        带重试 + Provider Fallback 链。
         """
-        client_name = client_name or self._default_client
+        primary = client_name or self._default_client
+        # 构建尝试顺序: primary → fallback chain 中的其他 provider
+        providers = [primary]
+        for fb in self._fallback_chain:
+            if fb != primary and fb not in providers:
+                providers.append(fb)
 
-        for attempt in range(MAX_RETRIES + 1):
-            # 1. 熔断检查
-            self._circuit.check()
+        last_error = None
+        for provider_name in providers:
+            client = get_client(provider_name)
+            if not client:
+                continue
 
-            # 2. 限流检查
-            if self._rate_limiter:
-                await self._rate_limiter.check_and_acquire()
+            for attempt in range(MAX_RETRIES + 1):
+                # 1. 熔断检查
+                try:
+                    self._circuit.check()
+                except LLMCircuitOpenError:
+                    if provider_name == providers[-1]:
+                        raise
+                    break  # 跳到下一个 provider
 
-            # 3. 预算检查
-            if self._budget:
-                await self._budget.check(operation)
-
-            try:
-                client = get_client(client_name)
-
-                resp = await client.complete(
-                    prompt=prompt,
-                    images=images,
-                    json_mode=True,
-                )
-
-                # 成功
-                self._circuit.record_success()
-
-                # 记录消耗
-                input_tokens = resp.usage.get("input_tokens", 0)
-                output_tokens = resp.usage.get("output_tokens", 0)
-
-                if self._budget:
-                    cost = self._estimate_cost(client.provider, input_tokens, output_tokens)
-                    await self._budget.record_usage(cost)
-
+                # 2. 限流检查
                 if self._rate_limiter:
-                    await self._rate_limiter.record_tokens(
-                        input_tokens + output_tokens)
+                    await self._rate_limiter.check_and_acquire()
 
-                return resp
+                # 3. 预算检查
+                if self._budget:
+                    await self._budget.check(operation)
 
-            except LLMCircuitOpenError:
-                raise  # 不重试
-            except Exception as e:
-                self._circuit.record_failure()
-                if attempt < MAX_RETRIES:
-                    logger.warning("llm_call_retry",
-                                    attempt=attempt + 1, error=repr(e),
+                try:
+                    resp = await client.complete(
+                        prompt=prompt,
+                        images=images,
+                        json_mode=True,
+                    )
+
+                    # 成功
+                    self._circuit.record_success()
+
+                    # 记录消耗
+                    input_tokens = resp.usage.get("input_tokens", 0)
+                    output_tokens = resp.usage.get("output_tokens", 0)
+
+                    if self._budget:
+                        cost = self._estimate_cost(client.provider, input_tokens, output_tokens)
+                        await self._budget.record_usage(cost)
+
+                    if self._rate_limiter:
+                        await self._rate_limiter.record_tokens(
+                            input_tokens + output_tokens)
+
+                    if provider_name != primary:
+                        logger.info("llm_fallback_success",
+                                    provider=provider_name, operation=operation)
+
+                    return resp
+
+                except Exception as e:
+                    self._circuit.record_failure()
+                    last_error = e
+                    if attempt < MAX_RETRIES:
+                        logger.warning("llm_call_retry",
+                                        attempt=attempt + 1, error=repr(e),
+                                        operation=operation,
+                                        provider=provider_name)
+                        continue
+                    # 本 provider 重试耗尽，跳到下一个
+                    logger.warning("llm_provider_exhausted",
+                                    provider=provider_name, error=repr(e),
                                     operation=operation)
-                    continue
-                raise RetryableError(f"LLM call failed after {MAX_RETRIES + 1} attempts: {e}")
+                    break
 
-        raise RetryableError("LLM call exhausted all retries")
+        raise RetryableError(
+            f"LLM call failed after trying {len(providers)} providers: {last_error}"
+        )
 
     @staticmethod
     def _estimate_cost(provider: str, input_tokens: int, output_tokens: int) -> float:

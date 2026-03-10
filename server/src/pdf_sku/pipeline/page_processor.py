@@ -214,15 +214,18 @@ class PageProcessor:
         features: FeatureVector,
         llm_calls_used: int,
     ) -> list[SKUResult]:
-        """Phase 6: 两阶段 + 单阶段 Fallback。"""
+        """Phase 6: 两阶段 + 单阶段并行，取最优结果。"""
 
         # A 类: 规则表格提取
         if page_type == "A" and raw.tables:
             return self._table_extract(raw)
 
-        # B/C 类: 两阶段
         remaining = MAX_LLM_CALLS_PER_PAGE - llm_calls_used
-        if remaining >= 2:
+
+        # B/C 类: 两阶段和单阶段并行启动
+        async def try_two_stage() -> list[SKUResult]:
+            if remaining < 2:
+                return []
             try:
                 boundaries = await self._two_stage.identify_boundaries(
                     raw.text_blocks, None, screenshot)
@@ -237,14 +240,26 @@ class PageProcessor:
                                     invalid_ratio=invalid_count / len(skus))
             except Exception as e:
                 logger.warning("two_stage_failed", page=raw.page_no, error=str(e))
+            return []
 
-        # 单阶段 Fallback
-        try:
-            skus = await self._single_stage.extract(raw)
-            if skus:
-                return skus
-        except Exception as e:
-            logger.warning("single_stage_failed", page=raw.page_no, error=str(e))
+        async def try_single_stage() -> list[SKUResult]:
+            try:
+                skus = await self._single_stage.extract(raw)
+                return skus or []
+            except Exception as e:
+                logger.warning("single_stage_failed", page=raw.page_no, error=str(e))
+                return []
+
+        # 并行执行两阶段和单阶段
+        two_result, single_result = await asyncio.gather(
+            try_two_stage(), try_single_stage()
+        )
+
+        # 两阶段优先（质量更高），否则用单阶段
+        if two_result:
+            return two_result
+        if single_result:
+            return single_result
 
         # [C7] 最终兜底: 返回空
         return []
