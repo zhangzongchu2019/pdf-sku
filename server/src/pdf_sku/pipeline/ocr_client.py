@@ -17,15 +17,23 @@ import structlog
 logger = structlog.get_logger()
 
 
-async def call_ocr_on_image(image_bytes: bytes, timeout: int | None = None) -> list[dict] | None:
-    """调用 PaddleOCR-VL API，返回 parsing_res_list。
+async def call_ocr_on_image(
+    image_bytes: bytes,
+    timeout: int | None = None,
+    filename: str = "page.png",
+    content_type: str = "image/png",
+) -> tuple[list[dict], int, int] | None:
+    """调用 PaddleOCR-VL API，返回 (parsing_res_list, ocr_width, ocr_height)。
 
     Args:
-        image_bytes: 页面截图的 PNG/JPEG bytes。
+        image_bytes: 页面截图的 PNG/JPEG bytes，或单页 PDF bytes。
         timeout: 超时秒数，默认 120。
+        filename: 上传文件名，默认 "page.png"。发送 PDF 时传 "page.pdf"。
+        content_type: MIME 类型，默认 "image/png"。PDF 时传 "application/pdf"。
 
     Returns:
-        parsing_res_list (list of dicts with block_label/block_bbox/block_content)，
+        (parsing_res_list, ocr_width, ocr_height)，其中 ocr_width/ocr_height 是
+        OCR 实际处理的图片尺寸（可能因降采样而小于原始图片）。
         失败或超时返回 None。
     """
     try:
@@ -58,7 +66,7 @@ async def call_ocr_on_image(image_bytes: bytes, timeout: int | None = None) -> l
             settings.ocr_job_url,
             headers=headers,
             data=payload,
-            files={"file": ("page.png", image_bytes, "image/png")},
+            files={"file": (filename, image_bytes, content_type)},
         )
         resp.raise_for_status()
         job_id = resp.json()["data"]["jobId"]
@@ -88,6 +96,8 @@ async def call_ocr_on_image(image_bytes: bytes, timeout: int | None = None) -> l
         result_resp.raise_for_status()
         jsonl_text = result_resp.text
 
+    all_parsing_res: list[dict] = []
+    ocr_w, ocr_h = 0, 0
     for line in jsonl_text.strip().split("\n"):
         line = line.strip()
         if not line:
@@ -95,6 +105,9 @@ async def call_ocr_on_image(image_bytes: bytes, timeout: int | None = None) -> l
         result = json.loads(line)["result"]
         for layout_res in result.get("layoutParsingResults", []):
             pruned = layout_res.get("prunedResult", {})
-            return pruned.get("parsing_res_list", [])
+            if not ocr_w:
+                ocr_w = int(pruned.get("width", 0))
+                ocr_h = int(pruned.get("height", 0))
+            all_parsing_res.extend(pruned.get("parsing_res_list", []))
 
-    return []
+    return all_parsing_res, ocr_w, ocr_h

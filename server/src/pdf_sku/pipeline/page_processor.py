@@ -140,12 +140,13 @@ Return a JSON array:
 ]
 
 RULES:
-1. product_index: 0-based index from the product list above
-2. region_index: 0-based index matching the numbered colored box on the image
+1. product_index: 0-based index from the product list above (0 to {n_minus1})
+2. region_index: 0-based index matching the numbered colored box on the image (0 to {n_regions_minus1})
 3. photo_type: "product_photo" (clean/white background) or "lifestyle_photo" (room/scene setting)
 4. Every product must have exactly one "product_photo" entry
 5. "lifestyle_photo" entries are optional — only include if clearly visible
-6. Skip regions that are irrelevant (pure text blocks, headers, footers)
+6. Multiple products may map to the same region_index (e.g. color variants sharing one catalog photo)
+7. Skip regions that are irrelevant (pure text blocks, headers, footers)
 
 Respond ONLY with the JSON array, no other text."""
 
@@ -362,7 +363,7 @@ class PageProcessor:
             # 当页面只有 1 张全页大图且 SKU boundary bbox 各不相同时，
             # 为每个产品区域创建独立 ImageInfo（_region_），
             # _crop_composites 在 Phase 8 后从截图裁剪实际图片数据。
-            await self._maybe_create_product_regions(raw, skus, page_no, screenshot)
+            await self._maybe_create_product_regions(raw, skus, page_no, screenshot, file_path=file_path)
 
             # ═══ Phase 7: ID 分配 ═══
             hash_prefix = (file_hash or "unknown")[:8]
@@ -1259,10 +1260,6 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
         for i in range(n):
             clusters[find(i)].append(i)
 
-        # 超大聚类 (> MAX_COMPOSITE_TILES 个碎片) 说明是密集产品网格
-        # (如椅子页面每格各一张图), 不应合并成一张大图——保留各自作为独立商品图
-        MAX_COMPOSITE_TILES = 10
-
         # 瓦片页单张图片判定为商品图的最小短边 (150 DPI 像素)。
         # 比普通页门槛 (200px) 低，因为密集网格页每个商品格本身就小。
         TILE_PAGE_MIN_SHORT = 80
@@ -1291,16 +1288,29 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                 merged.append(img)
                 continue
 
-            if len(members) > MAX_COMPOSITE_TILES:
-                # 超大聚类: 密集产品网格，每张图是独立的商品图，直接保留
-                for m in members:
-                    img = images[m]
-                    img.is_fragmented = False
-                    img.search_eligible = True
-                    merged.append(img)
-                logger.info("tile_cluster_too_large_kept_individual",
-                            page_no=page_no, members=len(members))
-                continue
+            # 超大聚类：若各成员单独满足商品图门槛，说明是密集产品网格
+            # （如椅子/床头柜密集排列，每格各一张独立商品图），保留为独立图，
+            # 避免合并后 is_dense_imageset=False 导致 LLM 全页识别路径出错。
+            # 注：颜色色板等小瓦片（短边 < TILE_PAGE_MIN_SHORT）不满足此条件，
+            # 会正常走下面的合并逻辑，由 Phase 6.5 整体处理。
+            if len(members) > 10:
+                all_eligible = all(
+                    int(min(
+                        (images[m].bbox[2] - images[m].bbox[0]) * dpi_scale,
+                        (images[m].bbox[3] - images[m].bbox[1]) * dpi_scale,
+                    )) >= TILE_PAGE_MIN_SHORT
+                    for m in members
+                    if len(images[m].bbox) >= 4
+                )
+                if all_eligible:
+                    for m in members:
+                        img = images[m]
+                        img.is_fragmented = False
+                        img.search_eligible = True
+                        merged.append(img)
+                    logger.info("tile_cluster_product_grid_kept_individual",
+                                page_no=page_no, members=len(members))
+                    continue
 
             # 合并: 计算外接矩形
             x0 = min(images[m].bbox[0] for m in members)
@@ -1356,6 +1366,7 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
         skus: list[SKUResult],
         page_no: int,
         screenshot: bytes = b"",
+        file_path: str = "",
     ) -> None:
         """Phase 6.5: 单大图多商品页 → 用 LLM 检测商品子图区域。
 
@@ -1437,7 +1448,7 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
 
         # 主路：OCR 精确定位图框 + LLM 语义匹配（不再让 LLM 猜坐标）
         llm_photos = await self._detect_product_regions_with_ocr_llm(
-            screenshot, product_descs, page_w, page_h, page_no)
+            screenshot, product_descs, page_w, page_h, page_no, file_path=file_path)
         _detection_method = "ocr_llm"
 
         # 次路：纯 LLM（OCR API 不可用/超时时的 fallback）
@@ -1474,47 +1485,51 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
 
         if llm_photos is not None:
             # ── LLM 成功：为每张子图创建独立 ImageInfo ──
-            # LLM 返回 list[dict]，每项含 product_index / photo_type / bbox
+            # llm_photos 以 OCR 商品列表的 product_index 为 key，每条含 ocr_text。
+            # 直接遍历所有返回条目创建 ImageInfo，不依赖 unique_products 的数量。
             # product_photo → role="product_main"（白底产品图，用于搜索）
             # lifestyle_photo → role="product_detail"（生活场景图，作为附图）
-            from collections import defaultdict as _defaultdict
-            by_product: dict[int, list[dict]] = _defaultdict(list)
-            for photo in llm_photos:
-                by_product[photo["product_index"]].append(photo)
-
             new_region_images: list[ImageInfo] = []
-            model_to_main_bbox: dict[str, tuple] = {}   # model → product_photo bbox
-            for prod_idx, (model, _name, _rep_sku) in enumerate(unique_products):
-                for photo in by_product.get(prod_idx, []):
-                    bbox = photo["bbox"]
-                    role = "product_main" if photo["photo_type"] == "product_photo" else "product_detail"
-                    # CV 精修边界：
-                    # OCR+LLM 路径已提供像素级精确 bbox，跳过 CV 精修（避免跨区域融合导致重复）
-                    # 其余路径：product_main → 紧密裁剪，product_detail → 扩展到完整场景面板
-                    if _detection_method != "ocr_llm":
-                        if role == "product_main":
-                            bbox = self._tighten_product_bbox(
-                                screenshot, bbox, page_w, page_h)
-                        else:
-                            bbox = self._snap_scene_bbox(
-                                screenshot, bbox, page_w, page_h)
-                    dw = abs(bbox[2] - bbox[0]) * dpi_scale
-                    dh = abs(bbox[3] - bbox[1]) * dpi_scale
-                    short = int(min(dw, dh))
-                    # OCR+LLM bbox 已精确，放宽 search_eligible 阈值到 10px（仅过滤退化图框）；
-                    # 其余路径保留 150px（LLM 猜坐标时误差较大，过小说明坐标可靠性低）
-                    _se_thresh = 10 if _detection_method == "ocr_llm" else 150
-                    new_region_images.append(ImageInfo(
-                        image_id=f"p{page_no}_region_{img_idx}",
-                        bbox=bbox,
-                        width=int(dw), height=int(dh), short_edge=short,
-                        search_eligible=short >= _se_thresh,
-                        role=role,
-                        data=b"",
-                    ))
-                    if role == "product_main" and model:
-                        model_to_main_bbox[model] = bbox
-                    img_idx += 1
+            model_to_main_bbox: dict[str, tuple] = {}   # db_model → product_photo bbox
+            # 预建 DB model 集合，用于从 OCR 文字中反查 DB model（前缀/子串匹配）
+            db_models = [(model, model) for model, _, _ in unique_products if model]
+            for photo in llm_photos:
+                bbox = photo["bbox"]
+                role = "product_main" if photo["photo_type"] == "product_photo" else "product_detail"
+                ocr_text_val = photo.get("ocr_text", "")
+                # 尝试从 OCR 文字中找到对应的 DB model_number（供回绑用）
+                ocr_model = next(
+                    (m for m, _ in db_models if m and m in ocr_text_val),
+                    "",
+                )
+                # CV 精修边界：
+                # OCR+LLM 路径已提供像素级精确 bbox，跳过 CV 精修（避免跨区域融合导致重复）
+                # 其余路径：product_main → 紧密裁剪，product_detail → 扩展到完整场景面板
+                if _detection_method != "ocr_llm":
+                    if role == "product_main":
+                        bbox = self._tighten_product_bbox(
+                            screenshot, bbox, page_w, page_h)
+                    else:
+                        bbox = self._snap_scene_bbox(
+                            screenshot, bbox, page_w, page_h)
+                dw = abs(bbox[2] - bbox[0]) * dpi_scale
+                dh = abs(bbox[3] - bbox[1]) * dpi_scale
+                short = int(min(dw, dh))
+                # OCR+LLM bbox 已精确，放宽 search_eligible 阈值到 10px（仅过滤退化图框）；
+                # 其余路径保留 150px（LLM 猜坐标时误差较大，过小说明坐标可靠性低）
+                _se_thresh = 10 if _detection_method == "ocr_llm" else 150
+                new_region_images.append(ImageInfo(
+                    image_id=f"p{page_no}_region_{img_idx}",
+                    bbox=bbox,
+                    width=int(dw), height=int(dh), short_edge=short,
+                    search_eligible=short >= _se_thresh,
+                    role=role,
+                    data=b"",
+                ))
+                # model_to_main_bbox：用 OCR 提取的型号做 key，供后续 SKU 回绑
+                if role == "product_main" and ocr_model:
+                    model_to_main_bbox[ocr_model] = bbox
+                img_idx += 1
 
             # 安全检查: 若 LLM 坐标异常导致产品图片不足（如归一化坐标、bbox太小），
             # 则放弃 LLM 结果，降级为等比网格。
@@ -1527,6 +1542,8 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                 1 for img in new_region_images
                 if img.short_edge >= _eligible_threshold and img.role == "product_main"
             )
+            # OCR+LLM 路径：发现的商品数可能多于 DB SKU 数（n），也可能少于。
+            # 只要有至少 n 张可搜索的主图（覆盖 DB SKU 数量）即视为成功。
             has_eligible_llm = eligible_main_count >= n
             if not has_eligible_llm:
                 logger.warning(
@@ -1820,6 +1837,7 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
         page_w: float,
         page_h: float,
         page_no: int,
+        file_path: str = "",
     ) -> list[dict] | None:
         """OCR + LLM 两步法检测产品子图区域（主路）。
 
@@ -1845,53 +1863,134 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
             from pdf_sku.pipeline.ab_experiment_runner import annotate_img_boxes, ImgBox, TextBox
             import re as _re
 
-            # ── 1. 调用 OCR，获取 parsing_res_list ──
-            parsing_res = await call_ocr_on_image(screenshot, timeout=120)
-            if not parsing_res:
+            # ── 1. 调用 OCR，获取 parsing_res_list 及 OCR 实际处理尺寸 ──
+            # 优先使用单页 PDF 作为 OCR 输入——OCR 对 PDF 的文字识别效果远优于 PNG 截图。
+            # 若 file_path 可用，用 fitz 提取单页 PDF bytes；否则降级为 PNG 截图。
+            ocr_kwargs: dict = {"timeout": 120}
+            ocr_input = screenshot
+            if file_path:
+                try:
+                    import fitz as _fitz
+                    _doc = _fitz.open(file_path)
+                    _single = _fitz.open()
+                    _single.insert_pdf(_doc, from_page=page_no - 1, to_page=page_no - 1)
+                    _pdf_bytes = _single.tobytes()
+                    _doc.close()
+                    ocr_input = _pdf_bytes
+                    ocr_kwargs["filename"] = "page.pdf"
+                    ocr_kwargs["content_type"] = "application/pdf"
+                    logger.info("product_regions_ocr_llm_use_pdf", page=page_no,
+                                pdf_bytes=len(_pdf_bytes))
+                except Exception as _fe:
+                    logger.warning("product_regions_ocr_llm_pdf_extract_failed",
+                                   page=page_no, error=str(_fe))
+
+            ocr_result = await call_ocr_on_image(ocr_input, **ocr_kwargs)
+            if not ocr_result:
                 logger.info("product_regions_ocr_llm_no_result", page=page_no)
                 return None
+            parsing_res, ocr_img_w, ocr_img_h = ocr_result
 
-            # ── 2. 解析 img_boxes / text_boxes ──
+            # ── 2. 获取实际图片尺寸，计算坐标缩放比（OCR 可能对大图降采样）──
+            import io as _io
+            from PIL import Image as _PIL
+            pil = _PIL.open(_io.BytesIO(screenshot))
+            px_w, px_h = pil.size
+            # 若 OCR 返回的尺寸与截图不一致（降采样），需缩放 bbox 到截图坐标空间
+            scale_x = px_w / ocr_img_w if ocr_img_w and ocr_img_w != px_w else 1.0
+            scale_y = px_h / ocr_img_h if ocr_img_h and ocr_img_h != px_h else 1.0
+            if scale_x != 1.0 or scale_y != 1.0:
+                logger.info("product_regions_ocr_scale",
+                            page=page_no,
+                            ocr_size=f"{ocr_img_w}x{ocr_img_h}",
+                            px_size=f"{px_w}x{px_h}",
+                            scale=f"{scale_x:.3f}x{scale_y:.3f}")
+
+            # ── 3. 解析 img_boxes / text_boxes，坐标缩放到截图像素空间 ──
             img_boxes: list[ImgBox] = []
             text_boxes: list[TextBox] = []
-            ocr_img_w = ocr_img_h = 0
 
             for blk in parsing_res:
                 label = blk.get("block_label", "")
                 bbox = blk.get("block_bbox", [])
                 if not bbox or len(bbox) != 4:
                     continue
-                # 从第一个块推断 OCR 使用的图片尺寸（用 block_bbox 上界估计）
-                ocr_img_w = max(ocr_img_w, int(bbox[2]))
-                ocr_img_h = max(ocr_img_h, int(bbox[3]))
-
+                scaled_bbox = [
+                    bbox[0] * scale_x,
+                    bbox[1] * scale_y,
+                    bbox[2] * scale_x,
+                    bbox[3] * scale_y,
+                ]
                 if label == "image":
-                    img_boxes.append(ImgBox(bbox=list(bbox)))
+                    img_boxes.append(ImgBox(bbox=scaled_bbox))
                 else:
                     raw = blk.get("block_content", "")
                     clean = _re.sub(r"<[^>]+>", "", raw).strip()
                     if clean:
-                        text_boxes.append(TextBox(bbox=list(bbox), text=clean, label=label))
+                        text_boxes.append(TextBox(bbox=scaled_bbox, text=clean, label=label))
 
             if not img_boxes:
                 logger.info("product_regions_ocr_llm_no_img_boxes",
                             page=page_no, text_blocks=len(text_boxes))
                 return None
 
-            # ── 3. 生成标注图 ──
+            # ── 4. 生成标注图，并缩放到 LLM 可接受的尺寸 ──
             annotated = annotate_img_boxes(screenshot, img_boxes, text_boxes)
 
-            # ── 4. 获取实际图片尺寸（用于坐标换算）──
-            import io as _io
-            from PIL import Image as _PIL
-            pil = _PIL.open(_io.BytesIO(screenshot))
-            px_w, px_h = pil.size
-            # OCR bbox 坐标基于原始提交图片（即 screenshot），与 px_w/px_h 对齐
-            # 若 OCR 返回的坐标范围比截图小（极少情况），用截图尺寸兜底
-            ref_w = max(ocr_img_w, px_w) or px_w
-            ref_h = max(ocr_img_h, px_h) or px_h
+            # 大图缩放：避免超出 LLM API 请求体积限制
+            _MAX_LLM_DIM = 1600
+            if px_w > _MAX_LLM_DIM or px_h > _MAX_LLM_DIM:
+                _ann_scale = min(_MAX_LLM_DIM / px_w, _MAX_LLM_DIM / px_h)
+                _ann_w, _ann_h = int(px_w * _ann_scale), int(px_h * _ann_scale)
+                _ann_pil = _PIL.open(_io.BytesIO(annotated)).resize(
+                    (_ann_w, _ann_h), _PIL.LANCZOS
+                )
+                _ann_buf = _io.BytesIO()
+                _ann_pil.save(_ann_buf, format="JPEG", quality=80)
+                annotated_for_llm = _ann_buf.getvalue()
+                logger.info("product_regions_ocr_llm_img_resized",
+                            page=page_no, orig=f"{px_w}x{px_h}",
+                            resized=f"{_ann_w}x{_ann_h}",
+                            bytes=len(annotated_for_llm))
+            else:
+                annotated_for_llm = annotated
 
-            # ── 5. 构建 prompt ──
+            # ref_w/ref_h：截图像素尺寸（坐标已对齐到截图空间）
+            ref_w = px_w
+            ref_h = px_h
+
+            # ── 5. 构建商品列表（OCR text_boxes 优先，DB product_descs 兜底）──
+            # AB 实验验证：从 OCR text_boxes 自动构建商品列表，比 DB SKU 列表更准确（
+            # 扫描版 PDF 的 DB SKU 可能不完整，且命名格式与页面不一致）。
+            # 过滤规则与 AB 实验保持一致，去重后每条文字块作为一个独立商品条目。
+            _noise_pat = _re.compile(
+                r"too blurry|cannot recognize|image quality|recognize.*text|"
+                r"^\d{1,3}$|^page\s*\d",
+                _re.IGNORECASE,
+            )
+            ocr_product_texts: list[str] = []
+            _seen_ocr: set[str] = set()
+            for tb in text_boxes:
+                clean = " ".join(tb.text.strip().split())
+                if not clean or _noise_pat.search(clean):
+                    continue
+                if clean not in _seen_ocr:
+                    _seen_ocr.add(clean)
+                    ocr_product_texts.append(clean)
+
+            # effective_products：优先用 OCR text_boxes，否则 fall back 到 DB
+            if ocr_product_texts:
+                effective_products: list[tuple[str, str]] = [("", t) for t in ocr_product_texts]
+                logger.info("product_regions_ocr_llm_use_ocr_products",
+                            page=page_no, count=len(effective_products))
+            else:
+                effective_products = list(product_descs)
+                logger.info("product_regions_ocr_llm_use_db_products",
+                            page=page_no, count=len(effective_products))
+
+            n_eff = len(effective_products)
+
+            # ── 5b. 构建 prompt ──
             region_lines = []
             for i, box in enumerate(img_boxes):
                 x0, y0, x1, y1 = [int(v) for v in box.bbox]
@@ -1903,7 +2002,7 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                 ocr_lines.append(f"  {bstr} \"{tb.text}\"")
 
             product_list_lines = []
-            for idx, (model, name) in enumerate(product_descs):
+            for idx, (model, name) in enumerate(effective_products):
                 if model and name:
                     product_list_lines.append(f"  {idx}. {model} - {name}")
                 elif model:
@@ -1916,77 +2015,115 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                 n_regions_minus1=len(img_boxes) - 1,
                 region_bboxes="\n".join(region_lines),
                 ocr_text="\n".join(ocr_lines) if ocr_lines else "  (no text detected)",
-                n=n,
+                n=n_eff,
+                n_minus1=n_eff - 1,
                 product_list="\n".join(product_list_lines),
             )
 
-            # ── 6. 调用 LLM（发标注图 + prompt）──
-            resp = await self._llm.call_llm(
-                operation="detect_product_regions_ocr_llm",
-                prompt=prompt,
-                images=[annotated],
-            )
-
+            # ── 6. 调用 LLM（自适应 A→B 策略）──
+            # A 方案：标注图 + prompt（视觉+坐标双重信息）
+            # B 方案（降级）：纯结构化数据，不发图——
+            #   触发条件：① 图片超过 4MB；② A 方案返回的商品数少于预期（说明图片中
+            #   有限的编号框数量误导了 LLM，使其不愿为超过框数的商品重复分配 region）。
             from pdf_sku.llm_adapter.parser.response_parser import ResponseParser
-            parsed = ResponseParser().parse(resp.text, expected_type="array")
-            if not parsed.success or not isinstance(parsed.data, list):
-                logger.warning("product_regions_ocr_llm_parse_failed",
-                               page=page_no, text=resp.text[:200])
-                return None
 
-            # ── 7. 转换 region_index → PDF pts bbox ──
+            def _parse_photos(resp_text: str) -> list[dict]:
+                """解析 LLM 响应，返回 photos 列表（空列表表示解析失败）。"""
+                parsed = ResponseParser().parse(resp_text, expected_type="array")
+                if not parsed.success or not isinstance(parsed.data, list):
+                    return []
+                result: list[dict] = []
+                n_reg = len(img_boxes)
+                for item in parsed.data:
+                    prod_idx = item.get("product_index")
+                    region_idx = item.get("region_index")
+                    photo_type = item.get("photo_type", "product_photo")
+                    if prod_idx is None or region_idx is None:
+                        continue
+                    prod_idx = int(prod_idx)
+                    region_idx = int(region_idx)
+                    if not (0 <= prod_idx < n_eff) or not (0 <= region_idx < n_reg):
+                        continue
+                    px_bbox = img_boxes[region_idx].bbox
+                    pt_bbox = (
+                        px_bbox[0] * page_w / ref_w,
+                        px_bbox[1] * page_h / ref_h,
+                        px_bbox[2] * page_w / ref_w,
+                        px_bbox[3] * page_h / ref_h,
+                    )
+                    ocr_text_for_prod = effective_products[prod_idx][1] if prod_idx < n_eff else ""
+                    result.append({
+                        "product_index": prod_idx,
+                        "photo_type": photo_type,
+                        "bbox": pt_bbox,
+                        "ocr_text": ocr_text_for_prod,
+                    })
+                return result
+
+            _MAX_IMAGE_BYTES = 4 * 1024 * 1024  # 4MB
+            use_image = len(annotated_for_llm) <= _MAX_IMAGE_BYTES
+
+            # ── A 方案：标注图 + prompt ──
+            # 每个异常单独捕获，避免 API 连接中断时直接跳到函数级 except 而跳过 B 方案。
             photos: list[dict] = []
-            n_regions = len(img_boxes)
-            for item in parsed.data:
-                prod_idx = item.get("product_index")
-                region_idx = item.get("region_index")
-                photo_type = item.get("photo_type", "product_photo")
-                if prod_idx is None or region_idx is None:
-                    continue
-                prod_idx = int(prod_idx)
-                region_idx = int(region_idx)
-                if not (0 <= prod_idx < n) or not (0 <= region_idx < n_regions):
-                    continue
-                px_bbox = img_boxes[region_idx].bbox  # [x0, y0, x1, y1] 像素坐标
-                pt_bbox = (
-                    px_bbox[0] * page_w / ref_w,
-                    px_bbox[1] * page_h / ref_h,
-                    px_bbox[2] * page_w / ref_w,
-                    px_bbox[3] * page_h / ref_h,
-                )
-                photos.append({
-                    "product_index": prod_idx,
-                    "photo_type": photo_type,
-                    "bbox": pt_bbox,
-                })
+            n_covered_a = 0
+            if use_image:
+                try:
+                    resp_a = await self._llm.call_llm(
+                        operation="detect_product_regions_ocr_llm",
+                        prompt=prompt,
+                        images=[annotated_for_llm],
+                    )
+                    photos = _parse_photos(resp_a.text)
+                    n_covered_a = len({p["product_index"] for p in photos if p["photo_type"] == "product_photo"})
+                    logger.info("product_regions_ocr_llm_scheme_a",
+                                page=page_no, n_eff=n_eff, n_covered=n_covered_a)
+                except Exception as _a_err:
+                    # API 连接中断（内容过大）等异常：记录后直接降级 B 方案
+                    logger.warning("product_regions_ocr_llm_scheme_a_failed",
+                                   page=page_no, error=str(_a_err))
+                    photos = []
+                    n_covered_a = 0
+            else:
+                logger.info("product_regions_ocr_llm_skip_a_oversized",
+                            page=page_no, image_bytes=len(annotated_for_llm))
 
-            # ── 8. 验证 ──
-            # 8a. 每个产品必须有一张 product_photo
+            # ── B 方案（降级）：纯结构化数据，不发图 ──
+            # 触发条件：① A 方案异常/图片过大跳过；② A 方案返回商品数不足 n_eff。
+            if n_covered_a < n_eff:
+                logger.info("product_regions_ocr_llm_fallback_b",
+                            page=page_no, n_covered_a=n_covered_a, n_eff=n_eff)
+                try:
+                    resp_b = await self._llm.call_llm(
+                        operation="detect_product_regions_ocr_llm_b",
+                        prompt=prompt,
+                        images=None,
+                    )
+                    photos_b = _parse_photos(resp_b.text)
+                    n_covered_b = len({p["product_index"] for p in photos_b if p["photo_type"] == "product_photo"})
+                    logger.info("product_regions_ocr_llm_scheme_b",
+                                page=page_no, n_eff=n_eff, n_covered=n_covered_b)
+                    if n_covered_b > n_covered_a:
+                        photos = photos_b
+                except Exception as _b_err:
+                    logger.warning("product_regions_ocr_llm_scheme_b_failed",
+                                   page=page_no, error=str(_b_err))
+
+            # ── 7. 验证 ──
             covered = {p["product_index"] for p in photos if p["photo_type"] == "product_photo"}
-            if not all(i in covered for i in range(n)):
-                missing = [i for i in range(n) if i not in covered]
+            missing = [i for i in range(n_eff) if i not in covered]
+            # 允许漏掉最多 (n_eff - n) 个（OCR 多发现的商品若 LLM 找不到对应图框可接受）
+            max_allowed_missing = max(0, n_eff - n)
+            if len(missing) > max_allowed_missing:
                 logger.warning("product_regions_ocr_llm_missing_product_photos",
-                               page=page_no, missing=missing)
-                return None
-
-            # 8b. 唯一性检查（仅当图框数 >= SKU数时生效）
-            # - 图框数 >= SKU数：每个产品独占一个图框，若有重复说明 LLM 匹配有误 → 降级
-            # - 图框数 < SKU数：图框不够，允许多个 SKU 共享同一图框（变体款式共用主图）→ 不降级
-            main_regions = [p["region_index"] for p in parsed.data
-                            if p.get("photo_type") == "product_photo"
-                            and isinstance(p.get("region_index"), int)]
-            if n_regions >= n and len(set(main_regions)) < n:
-                logger.warning(
-                    "product_regions_ocr_llm_duplicate_regions",
-                    page=page_no, n_products=n,
-                    n_img_boxes=n_regions,
-                    main_regions=main_regions,
-                )
+                               page=page_no, missing_count=len(missing),
+                               max_allowed=max_allowed_missing, n_eff=n_eff, n_db=n)
                 return None
 
             logger.info("product_regions_ocr_llm_ok",
-                        page=page_no, n_products=n,
-                        n_img_boxes=n_regions, n_photos=len(photos))
+                        page=page_no, n_db_skus=n, n_eff=n_eff,
+                        n_img_boxes=len(img_boxes), n_photos=len(photos),
+                        n_covered=len(covered))
             return photos
 
         except Exception as e:

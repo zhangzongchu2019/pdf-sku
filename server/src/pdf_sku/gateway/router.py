@@ -624,29 +624,10 @@ async def run_page_ab_experiment(
 
     vlm_provider = body.get("vlm_provider", "gemini")
 
-    # 获取 products 列表（优先用请求体传入，否则从 DB 读取）
+    # AB 实验的商品列表：只用请求体显式传入的 products
+    # 不查 DB SKU——DB SKU 可能不完整，而 OCR text_boxes 才是页面的权威来源
+    # 若请求体也未传，run_ab_experiment 会在 OCR 完成后从 text_boxes 自动构建完整列表
     products: list[dict] = body.get("products", [])
-    if not products:
-        skus_result = await db.execute(
-            select(SKU).where(SKU.job_id == job_id, SKU.page_number == page_number)
-        )
-        skus = skus_result.scalars().all()
-        seen_models: set[str] = set()
-        for sku in skus:
-            attrs = sku.attributes or {}
-            model = attrs.get("model_number", "")
-            name = attrs.get("product_name", "")
-            if model and model not in seen_models:
-                seen_models.add(model)
-                products.append({"model": model, "name": name})
-            elif not model and name:
-                products.append({"model": "", "name": name})
-
-    if not products:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "当前页面无 SKU 数据，请先运行 AI 分析或手动传入 products 参数"},
-        )
 
     # 加载页面截图
     job_dir = Path(settings.job_data_dir) / str(job_id)
@@ -657,6 +638,21 @@ async def run_page_ab_experiment(
             content={"error": f"页面 {page_number} 截图不存在"},
         )
 
+    # 提取目标页的单页 PDF（发给 OCR 比 PNG 识别效果更好）
+    pdf_page_bytes: bytes | None = None
+    try:
+        import fitz as _fitz
+        pdf_path = job_dir / "source.pdf"
+        if pdf_path.exists():
+            doc = _fitz.open(str(pdf_path))
+            if 1 <= page_number <= doc.page_count:
+                page_doc = _fitz.open()
+                page_doc.insert_pdf(doc, from_page=page_number - 1, to_page=page_number - 1)
+                pdf_page_bytes = page_doc.tobytes()
+            doc.close()
+    except Exception as _e:
+        logger.warning("ab_experiment_pdf_extract_failed", error=str(_e))
+
     # 运行 AB 实验（耗时操作）
     try:
         from pdf_sku.pipeline.ab_experiment_runner import run_ab_experiment
@@ -664,6 +660,7 @@ async def run_page_ab_experiment(
             screenshot_bytes=png_bytes,
             products=products,
             vlm_provider=vlm_provider,
+            pdf_page_bytes=pdf_page_bytes,
         )
     except Exception as e:
         logger.exception("ab_experiment_failed", job_id=str(job_id), page=page_number, error=str(e))
