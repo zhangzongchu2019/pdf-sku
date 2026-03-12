@@ -20,6 +20,7 @@ from typing import Annotated
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response, Path as PathParam
+from starlette.requests import ClientDisconnect
 from fastapi.responses import JSONResponse, FileResponse
 from sqlalchemy import select, func, desc, delete, update, or_, and_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -131,7 +132,10 @@ async def tus_patch(
     content_type: str = Header("application/offset+octet-stream", alias="Content-Type"),
 ):
     """TUS PATCH — 写入分片"""
-    chunk = await request.body()
+    try:
+        chunk = await request.body()
+    except ClientDisconnect:
+        return Response(status_code=400, headers={"Tus-Resumable": "1.0.0"})
     handler = get_tus_handler()
     new_offset, is_complete = await handler.handle_patch(
         upload_id, upload_offset, chunk, upload_checksum
