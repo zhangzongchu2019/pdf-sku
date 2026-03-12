@@ -95,9 +95,17 @@ def _get_field_value(attrs: dict, candidates: list[str]) -> str:
     return ""
 
 
-IMG_MAX_PX = 400          # 导出图片最大边长（像素）
-IMG_COL_WIDTH = 57        # 图片列宽（Excel 字符单位，约 400px）
-IMG_ROW_HEIGHT = 300      # 图片行高（Excel point 单位，约 400px）
+IMG_MAX_PX = 400          # 导出图片最大边长（像素）默认值
+IMG_COL_WIDTH_PER_PX = 57 / 400   # 图片列宽每像素系数（字符单位）
+IMG_ROW_HEIGHT_PER_PX = 300 / 400  # 图片行高每像素系数（point 单位）
+
+
+def _img_col_width(max_px: int) -> float:
+    return IMG_COL_WIDTH_PER_PX * max_px
+
+
+def _img_row_height(max_px: int) -> float:
+    return IMG_ROW_HEIGHT_PER_PX * max_px
 
 
 def _preprocess_image(img_bytes: bytes, max_px: int = IMG_MAX_PX) -> bytes | None:
@@ -161,8 +169,8 @@ def _preprocess_rows_images(
     }
 
 
-def _apply_header_style(ws, headers: list[str], n_img_cols: int = 1) -> None:
-    """统一设置首行表头样式：浅蓝底色 + 加粗 + 居中。图片列宽 14，文字列宽 20。"""
+def _apply_header_style(ws, headers: list[str], n_img_cols: int = 1, img_max_px: int = IMG_MAX_PX) -> None:
+    """统一设置首行表头样式：浅蓝底色 + 加粗 + 居中。图片列宽按 img_max_px 比例缩放。"""
     from openpyxl.styles import PatternFill, Font, Alignment
     from openpyxl.utils import get_column_letter
 
@@ -175,11 +183,10 @@ def _apply_header_style(ws, headers: list[str], n_img_cols: int = 1) -> None:
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    # 图片列宽 IMG_COL_WIDTH，其余列宽 20
     for col_idx in range(1, len(headers) + 1):
         col_letter = get_column_letter(col_idx)
         if col_idx <= n_img_cols:
-            ws.column_dimensions[col_letter].width = IMG_COL_WIDTH
+            ws.column_dimensions[col_letter].width = _img_col_width(img_max_px)
         else:
             ws.column_dimensions[col_letter].width = 20
 
@@ -512,10 +519,11 @@ class ExcelExporter:
         return rows
 
     @staticmethod
-    def build_full_excel_sync(rows: list[ExportRow]) -> io.BytesIO:
+    def build_full_excel_sync(rows: list[ExportRow], img_max_px: int = IMG_MAX_PX) -> io.BytesIO:
         """
         File 1: 商品图片1 | 商品图片2 | ... | 页码 | SKU ID | 固定属性列 | 动态属性列
         多图支持: 每张子图占一列，最大列数 = max(len(row.images))。
+        img_max_px: 图片最大边长（像素），同时控制列宽/行高。
         """
         import openpyxl
         from openpyxl.styles import Alignment
@@ -564,10 +572,10 @@ class ExcelExporter:
             + [col[0] for col in fixed_cols]
             + extra_keys
         )
-        _apply_header_style(ws, headers, n_img_cols=n_img_cols)
+        _apply_header_style(ws, headers, n_img_cols=n_img_cols, img_max_px=img_max_px)
 
         # 并行预处理所有图片
-        preprocessed = _preprocess_rows_images(rows, n_img_cols)
+        preprocessed = _preprocess_rows_images(rows, n_img_cols, max_px=img_max_px)
 
         # 数据行
         for row_idx, row in enumerate(rows, 2):
@@ -602,22 +610,25 @@ class ExcelExporter:
                     _embed_png(ws, png, row_idx, img_idx + 1)
                     has_image = True
 
-            ws.row_dimensions[row_idx].height = IMG_ROW_HEIGHT if has_image else 15
+            ws.row_dimensions[row_idx].height = _img_row_height(img_max_px) if has_image else 15
 
         buf = io.BytesIO()
         wb.save(buf)
         buf.seek(0)
         return buf
 
-    def build_full_excel(self, rows: list[ExportRow]) -> io.BytesIO:
-        return self.build_full_excel_sync(rows)
+    def build_full_excel(self, rows: list[ExportRow], img_max_px: int = IMG_MAX_PX) -> io.BytesIO:
+        return self.build_full_excel_sync(rows, img_max_px=img_max_px)
 
     @staticmethod
     def build_keywords_excel_sync(
         rows: list[ExportRow],
         keyword_mapping: dict | None,
+        img_max_px: int = IMG_MAX_PX,
     ) -> io.BytesIO:
-        """纯同步构建关键词 Excel，供线程池调用。keyword_mapping 已由外部预先获取。"""
+        """纯同步构建关键词 Excel，供线程池调用。keyword_mapping 已由外部预先获取。
+        img_max_px: 图片最大边长（像素），同时控制列宽/行高。
+        """
         import openpyxl
         from openpyxl.styles import Alignment
 
@@ -629,7 +640,7 @@ class ExcelExporter:
         ws.title = "关键词导出"
 
         headers = ["商品图片"] * n_img_cols + [kf[0] for kf in KEYWORD_FIELDS]
-        _apply_header_style(ws, headers, n_img_cols=n_img_cols)
+        _apply_header_style(ws, headers, n_img_cols=n_img_cols, img_max_px=img_max_px)
 
         _FALLBACK_CANDIDATES: dict[str, list[str]] = {
             '售价':          ['unit_price', 'price', 'retail_price', '单价', '售价'],
@@ -645,7 +656,7 @@ class ExcelExporter:
         }
 
         # 并行预处理所有图片
-        preprocessed = _preprocess_rows_images(rows, n_img_cols)
+        preprocessed = _preprocess_rows_images(rows, n_img_cols, max_px=img_max_px)
 
         for row_idx, row in enumerate(rows, 2):
             attrs = row.attributes
@@ -699,7 +710,7 @@ class ExcelExporter:
                     _embed_png(ws, png, row_idx, img_idx + 1)
                     has_image = True
 
-            ws.row_dimensions[row_idx].height = IMG_ROW_HEIGHT if has_image else 15
+            ws.row_dimensions[row_idx].height = _img_row_height(img_max_px) if has_image else 15
 
         buf = io.BytesIO()
         wb.save(buf)

@@ -1424,6 +1424,7 @@ async def _run_export_task(
     session_factory,
     llm_service,
     job_data_dir: str,
+    img_size: int = 400,
 ) -> None:
     from pdf_sku.pipeline.exporter.excel_exporter import (
         ExcelExporter,
@@ -1463,10 +1464,10 @@ async def _run_export_task(
         if include_raw:
             import zipfile
             kw_fut = loop.run_in_executor(
-                None, ExcelExporter.build_keywords_excel_sync, rows, keyword_mapping
+                None, ExcelExporter.build_keywords_excel_sync, rows, keyword_mapping, img_size
             )
             full_fut = loop.run_in_executor(
-                None, ExcelExporter.build_full_excel_sync, rows
+                None, ExcelExporter.build_full_excel_sync, rows, img_size
             )
             kw_bytes, full_bytes = await asyncio.gather(kw_fut, full_fut)
             upd(step="building", progress=90, message="正在打包 ZIP...")
@@ -1479,7 +1480,7 @@ async def _run_export_task(
             filename = f"export_{job_id}.zip"
         else:
             kw_bytes = await loop.run_in_executor(
-                None, ExcelExporter.build_keywords_excel_sync, rows, keyword_mapping
+                None, ExcelExporter.build_keywords_excel_sync, rows, keyword_mapping, img_size
             )
             data = kw_bytes.getvalue()
             content_type = (
@@ -1507,6 +1508,7 @@ async def start_export_task(
     job_id: uuid.UUID,
     request: Request,
     include_raw: bool = Query(False),
+    img_size: int = Query(400, ge=50, le=1200, description="图片最大边长（像素），控制 Excel 中图片大小"),
 ):
     _cleanup_export_tasks()
     task_id = str(uuid.uuid4())
@@ -1518,7 +1520,7 @@ async def start_export_task(
     }
     sf = request.app.state.session_factory
     asyncio.create_task(
-        _run_export_task(task_id, job_id, include_raw, sf, get_llm_service(), settings.job_data_dir)
+        _run_export_task(task_id, job_id, include_raw, sf, get_llm_service(), settings.job_data_dir, img_size=img_size)
     )
     return {"task_id": task_id}
 
