@@ -334,9 +334,10 @@ class TwoStageExtractor:
     ) -> list[SKUResult]:
         """密集图片目录页按行/列分组提取。
 
-        将 boundary 按 Y 坐标分组为多行，并检测垂直列间隙（如双页并排 PDF）。
-        若检测到列分隔则每行再按左/右列分别裁剪，使每次 LLM 只看 ~4 个产品，
-        识别率显著优于全行 8 产品处理。
+        检测垂直列间隙（如双页并排 PDF）。
+        若检测到列分隔，先将 boundary 按左/右列分组，再在每列内独立按行分组，
+        避免左右列高度不一致导致的行分组级联问题（两侧产品行错误合并为超大行）。
+        未检测到列分隔时，仍按整体行分组处理。
         """
         import io
         try:
@@ -347,17 +348,6 @@ class TwoStageExtractor:
 
         # 检测垂直列间隙（如双页并排 PDF）
         col_split_x = self._detect_column_split(boundaries)
-
-        # 按行分组: 自适应 gap = 边界框高度中位数 × 0.3（最小 15pt）
-        heights = [b.bbox[3] - b.bbox[1] for b in boundaries if b.bbox[3] > b.bbox[1]]
-        heights.sort()
-        median_h = heights[len(heights) // 2] if heights else 80.0
-        adaptive_gap = max(15.0, median_h * 0.3)
-        rows = self._group_boundaries_by_row(boundaries, gap=adaptive_gap)
-        logger.info("dense_row_split", page=raw.page_no,
-                    total_boundaries=len(boundaries), row_count=len(rows),
-                    adaptive_gap=round(adaptive_gap, 1),
-                    col_split_x=round(col_split_x, 1) if col_split_x is not None else None)
 
         # 页面/截图尺寸及缩放比
         img = PILImage.open(io.BytesIO(screenshot))
@@ -370,99 +360,126 @@ class TwoStageExtractor:
         # 文字标签在图片下方的估算高度（向下扩展以包含型号/尺寸文字）
         TEXT_MARGIN_PT = 70
 
+        # 构建待处理分组列表: (col_idx, row_idx, group_bounds)
+        # 有列间隙时先按列分组再按行分组，避免左右列高度不同导致的行分组级联问题
+        processing_groups: list[tuple[int, int, list]] = []
+        if col_split_x is not None:
+            col_boundary_lists = [
+                [b for b in boundaries if (b.bbox[0] + b.bbox[2]) / 2 < col_split_x],
+                [b for b in boundaries if (b.bbox[0] + b.bbox[2]) / 2 >= col_split_x],
+            ]
+            for col_idx, col_bounds in enumerate(col_boundary_lists):
+                if not col_bounds:
+                    continue
+                col_heights = [b.bbox[3] - b.bbox[1] for b in col_bounds if b.bbox[3] > b.bbox[1]]
+                col_heights.sort()
+                col_median_h = col_heights[len(col_heights) // 2] if col_heights else 80.0
+                # 列内行分组使用更小的间距系数 (0.1 vs 0.3)，因为列分割页面产品行之间通常比较紧密
+                col_gap = max(15.0, col_median_h * 0.1)
+                col_rows = self._group_boundaries_by_row(col_bounds, gap=col_gap)
+                logger.info("dense_col_row_split", page=raw.page_no, col=col_idx + 1,
+                            boundaries=len(col_bounds), row_count=len(col_rows),
+                            adaptive_gap=round(col_gap, 1))
+                for row_idx, row_bounds in enumerate(col_rows):
+                    processing_groups.append((col_idx, row_idx, row_bounds))
+        else:
+            heights = [b.bbox[3] - b.bbox[1] for b in boundaries if b.bbox[3] > b.bbox[1]]
+            heights.sort()
+            median_h = heights[len(heights) // 2] if heights else 80.0
+            adaptive_gap = max(15.0, median_h * 0.3)
+            rows = self._group_boundaries_by_row(boundaries, gap=adaptive_gap)
+            logger.info("dense_row_split", page=raw.page_no,
+                        total_boundaries=len(boundaries), row_count=len(rows),
+                        adaptive_gap=round(adaptive_gap, 1))
+            for row_idx, row_bounds in enumerate(rows):
+                processing_groups.append((0, row_idx, row_bounds))
+
+        logger.info("dense_processing_groups", page=raw.page_no,
+                    col_split_x=round(col_split_x, 1) if col_split_x is not None else None,
+                    total_groups=len(processing_groups))
+
         all_results: list[SKUResult] = []
 
-        for row_idx, row_bounds in enumerate(rows):
+        for col_idx, row_idx, group_bounds in processing_groups:
+            if not group_bounds:
+                continue
             # 行在 PDF 坐标中的范围
-            row_y0 = min(b.bbox[1] for b in row_bounds)
-            row_y1 = max(b.bbox[3] for b in row_bounds)
+            row_y0 = min(b.bbox[1] for b in group_bounds)
+            row_y1 = max(b.bbox[3] for b in group_bounds)
             crop_y0_pt = max(0.0, row_y0 - 5)
             crop_y1_pt = min(ph, row_y1 + TEXT_MARGIN_PT)
             row_h_pt = max(1.0, crop_y1_pt - crop_y0_pt)
             crop_py0 = max(0, int(crop_y0_pt * scale_y))
             crop_py1 = min(img_h, int(crop_y1_pt * scale_y))
 
-            # 按列分组: 有列间隙则左/右各一组，否则整行一组
-            if col_split_x is not None:
-                col_groups = [
-                    [b for b in row_bounds if (b.bbox[0] + b.bbox[2]) / 2 < col_split_x],
-                    [b for b in row_bounds if (b.bbox[0] + b.bbox[2]) / 2 >= col_split_x],
-                ]
-            else:
-                col_groups = [row_bounds]
+            # 列组 X 范围（略向两侧扩展以包含边框/文字）
+            grp_x0_pt = max(0.0, min(b.bbox[0] for b in group_bounds) - 5)
+            grp_x1_pt = min(pw, max(b.bbox[2] for b in group_bounds) + 5)
+            grp_w_pt = max(1.0, grp_x1_pt - grp_x0_pt)
+            crop_px0 = max(0, int(grp_x0_pt * scale_x))
+            crop_px1 = min(img_w, int(grp_x1_pt * scale_x))
 
-            for col_idx, group_bounds in enumerate(col_groups):
-                if not group_bounds:
-                    continue
+            row_img = img.crop((crop_px0, crop_py0, crop_px1, crop_py1))
 
-                # 列组 X 范围（略向两侧扩展以包含边框/文字）
-                grp_x0_pt = max(0.0, min(b.bbox[0] for b in group_bounds) - 5)
-                grp_x1_pt = min(pw, max(b.bbox[2] for b in group_bounds) + 5)
-                grp_w_pt = max(1.0, grp_x1_pt - grp_x0_pt)
-                crop_px0 = max(0, int(grp_x0_pt * scale_x))
-                crop_px1 = min(img_w, int(grp_x1_pt * scale_x))
+            # 在裁剪图上标注编号红框（提高 LLM 对每个产品格的定位精度）
+            annotated_img, cell_map = self._annotate_group_cells(
+                row_img,
+                group_bounds,
+                grp_x0_pt, crop_y0_pt, grp_w_pt, row_h_pt,
+            )
+            buf = io.BytesIO()
+            annotated_img.save(buf, format="PNG")
+            row_screenshot = buf.getvalue()
 
-                row_img = img.crop((crop_px0, crop_py0, crop_px1, crop_py1))
+            n = len(cell_map)
+            prompt = DENSE_ANNOTATED_PROMPT.format(n=n)
 
-                # 在裁剪图上标注编号红框（提高 LLM 对每个产品格的定位精度）
-                annotated_img, cell_map = self._annotate_group_cells(
-                    row_img,
-                    group_bounds,
-                    grp_x0_pt, crop_y0_pt, grp_w_pt, row_h_pt,
+            try:
+                resp = await self._llm.call_llm(
+                    operation="extract_sku_dense_annotated",
+                    prompt=prompt,
+                    images=[row_screenshot],
                 )
-                buf = io.BytesIO()
-                annotated_img.save(buf, format="PNG")
-                row_screenshot = buf.getvalue()
-
-                n = len(cell_map)
-                prompt = DENSE_ANNOTATED_PROMPT.format(n=n)
-
-                try:
-                    resp = await self._llm.call_llm(
-                        operation="extract_sku_dense_annotated",
-                        prompt=prompt,
-                        images=[row_screenshot],
-                    )
-                    parsed = _parser.parse(resp.text, expected_type="array")
-                    if parsed.success and isinstance(parsed.data, list):
-                        # LLM 按顺序返回 CELL-1…CELL-N；按索引对应 cell_map（左→右）
-                        for cell_idx, boundary in enumerate(cell_map):
-                            if cell_idx >= len(parsed.data):
-                                break
-                            item = parsed.data[cell_idx]
-                            bbox = boundary.bbox
-                            bid = boundary.boundary_id
-                            if "products" in item:
-                                all_results.extend(
-                                    self._parse_products(item["products"], bid, bbox))
-                            else:
-                                attrs: dict = {}
-                                for key in ("product_name", "model_number", "size",
-                                            "material", "color", "price"):
-                                    v = item.get(key, "")
-                                    if v:
-                                        attrs[key] = str(v)
-                                variant_label = item.get("variant_label", "")
-                                validity = "valid" if (
-                                    attrs.get("model_number") or attrs.get("size")
-                                ) else "invalid"
-                                all_results.append(SKUResult(
-                                    attributes=attrs,
-                                    source_bbox=bbox,
-                                    validity=validity,
-                                    confidence=0.75,
-                                    extraction_method="two_stage_dense_annotated",
-                                    variant_label=variant_label if isinstance(
-                                        variant_label, str) else "",
-                                ))
-                        logger.info("dense_row_col_extracted",
-                                    page=raw.page_no, row=row_idx + 1, col=col_idx + 1,
-                                    boundaries=n, returned=len(parsed.data),
-                                    total_so_far=len(all_results))
-                except Exception as e:
-                    logger.warning("dense_row_extract_failed",
-                                   page=raw.page_no, row=row_idx + 1,
-                                   col=col_idx + 1, error=str(e))
+                parsed = _parser.parse(resp.text, expected_type="array")
+                if parsed.success and isinstance(parsed.data, list):
+                    # LLM 按顺序返回 CELL-1…CELL-N；按索引对应 cell_map（左→右）
+                    for cell_idx, boundary in enumerate(cell_map):
+                        if cell_idx >= len(parsed.data):
+                            break
+                        item = parsed.data[cell_idx]
+                        bbox = boundary.bbox
+                        bid = boundary.boundary_id
+                        if "products" in item:
+                            all_results.extend(
+                                self._parse_products(item["products"], bid, bbox))
+                        else:
+                            attrs: dict = {}
+                            for key in ("product_name", "model_number", "size",
+                                        "material", "color", "price"):
+                                v = item.get(key, "")
+                                if v:
+                                    attrs[key] = str(v)
+                            variant_label = item.get("variant_label", "")
+                            validity = "valid" if (
+                                attrs.get("model_number") or attrs.get("size")
+                            ) else "invalid"
+                            all_results.append(SKUResult(
+                                attributes=attrs,
+                                source_bbox=bbox,
+                                validity=validity,
+                                confidence=0.75,
+                                extraction_method="two_stage_dense_annotated",
+                                variant_label=variant_label if isinstance(
+                                    variant_label, str) else "",
+                            ))
+                    logger.info("dense_row_col_extracted",
+                                page=raw.page_no, row=row_idx + 1, col=col_idx + 1,
+                                boundaries=n, returned=len(parsed.data),
+                                total_so_far=len(all_results))
+            except Exception as e:
+                logger.warning("dense_row_extract_failed",
+                               page=raw.page_no, row=row_idx + 1,
+                               col=col_idx + 1, error=str(e))
 
         return all_results
 
