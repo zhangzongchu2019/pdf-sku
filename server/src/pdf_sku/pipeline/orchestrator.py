@@ -60,25 +60,40 @@ def _mark_hallucinated_skus_invalid(result: PageResult) -> None:
             logger.info("hallucinated_sku_invalidated", sku_id=sku.sku_id, product_name=name)
 
 
-def _merge_by_model_number(result: PageResult) -> None:
-    """合并同一页中 model_number 相同（且不同 product_id）的有效 SKU 为一个。
+def _normalize_product_name(name: str) -> str:
+    """规范化商品名称，用于合并判断：去括号内容、小写、去空格。
+    例："餐桌(Dining Table)" → "餐桌"，"沙发" → "沙发"
+    """
+    import re
+    # 去掉括号及括号内的英文/内容（中英文括号均处理）
+    name = re.sub(r'[\(（][^\)）]*[\)）]', '', name)
+    return name.strip().lower()
 
-    适用于：LLM 将同一型号的不同规格识别为独立产品但 product_id 各异时的兜底合并。
-    _merge_variant_skus 已按 product_id 合并；本函数进一步按 model_number 合并剩余分散项。
+
+def _merge_by_model_number(result: PageResult) -> None:
+    """合并同一页中 model_number 相同且 product_name 相同 的有效 SKU 为一个。
+
+    适用于：LLM 将同一型号同一商品的不同规格识别为独立产品但 product_id 各异时的兜底合并。
+    注意：同型号但不同商品名称（如 201# 茶几 vs 201# 电视柜）不合并，保留为独立 SKU。
+    _merge_variant_skus 已按 product_id 合并；本函数进一步按 (model_number, product_name) 合并剩余分散项。
     无效 SKU（validity != "valid"）直接透传，不参与合并。
     """
-    by_model: dict[str, list] = defaultdict(list)
+    # 按 (model_number, normalized_product_name) 分组
+    by_model_name: dict[tuple[str, str], list] = defaultdict(list)
     no_model = []
     for sku in result.skus:
         model = sku.attributes.get("model_number", "")
         if sku.validity == "valid" and model:
-            by_model[model].append(sku)
+            name = _normalize_product_name(sku.attributes.get("product_name", ""))
+            by_model_name[(model, name)].append(sku)
         else:
             no_model.append(sku)
 
+    by_model = by_model_name  # reuse variable name for rest of function
+
     merged_skus = list(no_model)
 
-    for model, group in by_model.items():
+    for (model, _name), group in by_model.items():
         if len(group) <= 1:
             merged_skus.extend(group)
             continue
@@ -125,8 +140,9 @@ def _merge_by_model_number(result: PageResult) -> None:
         result.bindings = [b for b in result.bindings if b.sku_id not in other_ids]
         result.bindings.extend(extra_bindings)
 
-        logger.info("model_skus_merged",
+        logger.info("model_name_skus_merged",
                     model_number=model,
+                    product_name=_name,
                     n_merged=len(others),
                     primary_sku=primary.sku_id,
                     sizes=all_sizes)

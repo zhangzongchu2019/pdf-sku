@@ -154,10 +154,12 @@ export const jobsApi = {
       { bbox, ...options },
     ),
 
-  startExportTask: async (jobId: string, includeRaw: boolean): Promise<string> => {
-    const res = await api.post<{ task_id: string }>(
-      `/jobs/${jobId}/export/excel/start${includeRaw ? "?include_raw=true" : ""}`
-    );
+  startExportTask: async (jobId: string, includeRaw: boolean, imgSize: number = 400): Promise<string> => {
+    const params = new URLSearchParams();
+    if (includeRaw) params.set("include_raw", "true");
+    if (imgSize !== 400) params.set("img_size", String(imgSize));
+    const qs = params.toString() ? `?${params.toString()}` : "";
+    const res = await api.post<{ task_id: string }>(`/jobs/${jobId}/export/excel/start${qs}`);
     return res.task_id;
   },
 

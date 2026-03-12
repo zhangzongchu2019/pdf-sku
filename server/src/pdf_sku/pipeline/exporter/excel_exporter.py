@@ -82,6 +82,8 @@ class ExportRow:
     image_ids: list[str] = field(default_factory=list)
     source_text: str = ""   # PDF 原始 OCR 文字（按页）
     variant_label: str = ""  # 座位/规格变体标签，如"1人位"/"2人位"
+    combined_text: str = ""  # 同图多商品时合并展示的多行文本
+    n_merged_products: int = 1  # 合并的独立商品数（>1 表示多商品同图）
 
 
 # ─────────────────────── 辅助函数 ───────────────────────
@@ -406,6 +408,66 @@ class ExcelExporter:
                                image_id=image_id, error=str(e))
                 return None
 
+        def _size_lines(val) -> list[str]:
+            """将 size 值转换为行列表：列表直接展开；字符串按 ' / ' 拆分。"""
+            if not val:
+                return []
+            if isinstance(val, list):
+                return [str(v).strip() for v in val if str(v).strip()]
+            s = str(val).strip()
+            if not s:
+                return []
+            parts = [p.strip() for p in s.split(" / ") if p.strip()]
+            return parts if parts else [s]
+
+        def _build_combined_text(sku_group: list) -> str:
+            """将一组 SKU 按 (model_number, product_name) 分组，生成多行合并展示文本。
+            例如同图包含沙发+茶几时输出:
+              WS-X970#（沙发）
+              单人位: 90x80x88cm
+              双人位: 145x80x88cm
+              WS-T201#（茶几）
+              长几: 120x60x45cm
+            """
+            seen_keys: list[tuple[str, str]] = []
+            sub_map: dict[tuple[str, str], list] = {}
+            for sku in sku_group:
+                a = sku.attributes or {}
+                model = str(a.get("model_number", "") or "").strip()
+                pname = str(a.get("product_name", "") or "").strip()
+                key = (model, pname)
+                if key not in sub_map:
+                    seen_keys.append(key)
+                    sub_map[key] = []
+                sub_map[key].append(sku)
+
+            lines: list[str] = []
+            for key in seen_keys:
+                model, pname = key
+                subs = sub_map[key]
+                # 商品标题行
+                if model and pname:
+                    lines.append(f"{model}（{pname}）")
+                elif model:
+                    lines.append(model)
+                elif pname:
+                    lines.append(pname)
+                # 规格变体行
+                for sku in subs:
+                    vl = (sku.variant_label or "").strip()
+                    if vl:
+                        # variant_label 已是 "a: x / b: y" 格式，拆成多行
+                        for part in vl.split(" / "):
+                            part = part.strip()
+                            if part:
+                                lines.append(part)
+                    else:
+                        a = sku.attributes or {}
+                        raw_size = (a.get("size") or a.get("规格") or
+                                    a.get("spec") or a.get("specification"))
+                        lines.extend(_size_lines(raw_size))
+            return "\n".join(lines)
+
         def _build_row(sku_group: list, group_id: str) -> ExportRow:
             """将一组 SKU 合并为一个 ExportRow。展示图仅含完整子图。"""
             # 按 SKU 顺序收集去重后的图片，仅展示完整子图（非碎片）
@@ -432,10 +494,12 @@ class ExcelExporter:
             for sku in sku_group:
                 vl = sku.variant_label or ""
                 a = sku.attributes or {}
-                size = str(
-                    a.get("size") or a.get("规格") or
-                    a.get("spec") or a.get("specification") or ""
-                ).strip()
+                raw_sz = (a.get("size") or a.get("规格") or
+                          a.get("spec") or a.get("specification"))
+                if isinstance(raw_sz, list):
+                    size = " / ".join(str(v).strip() for v in raw_sz if str(v).strip())
+                else:
+                    size = str(raw_sz).strip() if raw_sz else ""
                 if vl and size:
                     variant_parts.append(f"{vl}: {size}")
                 elif vl:
@@ -449,6 +513,13 @@ class ExcelExporter:
                 else (rep.variant_label or "")
             )
 
+            # 统计独立商品数（不同 (model, name) 对的数量）
+            n_products = len({
+                (str((s.attributes or {}).get('model_number', '') or ''),
+                 str((s.attributes or {}).get('product_name', '') or ''))
+                for s in sku_group
+            })
+
             return ExportRow(
                 page_number=rep.page_number,
                 sku_id=group_id,
@@ -457,6 +528,8 @@ class ExcelExporter:
                 image_ids=ordered_ids,
                 source_text=source_filename,
                 variant_label=variant_label,
+                combined_text=_build_combined_text(sku_group),
+                n_merged_products=n_products,
             )
 
         # 5. 对所有 SKU 统一用 Union-Find 分组
@@ -567,12 +640,15 @@ class ExcelExporter:
         variant_col = ["变体规格"] if has_variant else []
         headers = (
             img_headers
-            + ["页码", "SKU ID"]
+            + ["页码", "SKU ID", "商品信息"]
             + variant_col
             + [col[0] for col in fixed_cols]
             + extra_keys
         )
         _apply_header_style(ws, headers, n_img_cols=n_img_cols, img_max_px=img_max_px)
+        # 商品信息列宽加宽，方便多行文本展示
+        from openpyxl.utils import get_column_letter as _gcl
+        ws.column_dimensions[_gcl(n_img_cols + 3)].width = 40
 
         # 并行预处理所有图片
         preprocessed = _preprocess_rows_images(rows, n_img_cols, max_px=img_max_px)
@@ -585,6 +661,7 @@ class ExcelExporter:
             text_data: list = [
                 row.page_number,
                 row.sku_id,
+                row.combined_text,
             ]
             if has_variant:
                 text_data.append(row.variant_label)
@@ -673,6 +750,9 @@ class ExcelExporter:
             name_parts.append(size)
             product_name_val = " ".join(p for p in name_parts if p)
 
+            # 多商品合并行：用 combined_text 展示全部商品信息，避免丢失非首个商品
+            is_multi = row.n_merged_products > 1 and bool(row.combined_text)
+
             kw_data: list[str] = []
             for col_name, _ in KEYWORD_FIELDS:
                 if col_name in _EMPTY_KW_COLS:
@@ -680,9 +760,9 @@ class ExcelExporter:
                 elif col_name == _SOURCE_COL:
                     kw_data.append(row.source_text)
                 elif col_name == _NAME_COL:
-                    kw_data.append(product_name_val)
+                    kw_data.append(row.combined_text if is_multi else product_name_val)
                 elif col_name == _MODEL_COL:
-                    kw_data.append(model)
+                    kw_data.append(row.combined_text if is_multi else model)
                 elif keyword_mapping is not None:
                     candidates = keyword_mapping.get(col_name, [])
                     value = ""

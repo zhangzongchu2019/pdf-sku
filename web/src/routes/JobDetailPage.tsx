@@ -546,8 +546,8 @@ function PageVerifyPanel({
               ref={screenshotImgRef}
               src={screenshotUrl(page.page_number)}
               alt={`page-${page.page_number}`}
-              style={{ width: "100%", borderRadius: 4, border: "1px solid #2D3548", cursor: cropMode ? "crosshair" : "pointer", display: "block" }}
-              onClick={(e) => { e.stopPropagation(); if (!cropMode) onLightbox(screenshotUrl(page.page_number)); }}
+              style={{ width: "100%", borderRadius: 4, border: "1px solid #2D3548", cursor: (cropMode || skuExtractMode) ? "crosshair" : "pointer", display: "block" }}
+              onClick={(e) => { e.stopPropagation(); if (!cropMode && !skuExtractMode) onLightbox(screenshotUrl(page.page_number)); }}
               onLoad={(e) => { const img = e.target as HTMLImageElement; setNaturalSize([img.naturalWidth, img.naturalHeight]); }}
               draggable={false}
             />
@@ -920,6 +920,7 @@ export default function JobDetailPage() {
   const [activities, setActivities] = useState<ActivityEntry[]>([]);
   const [exporting, setExporting] = useState(false);
   const [includeRaw, setIncludeRaw] = useState(false);
+  const [imgSize, setImgSize] = useState(200);
   const [abExperimentPage, setAbExperimentPage] = useState<number | null>(null);
   const [abExperimentLoading, setAbExperimentLoading] = useState(false);
   const [abExperimentResult, setAbExperimentResult] = useState<AbExperimentResult | null>(null);
@@ -1183,6 +1184,30 @@ export default function JobDetailPage() {
         <label
           style={{
             display: "flex", alignItems: "center", gap: 4,
+            fontSize: 12, color: "#94A3B8", marginRight: 4,
+            userSelect: "none",
+          }}
+          title="Excel 中图片的最大边长（像素），越小文件越小"
+        >
+          图片尺寸
+          <input
+            type="number"
+            value={imgSize}
+            min={50}
+            max={1200}
+            step={50}
+            onChange={(e) => setImgSize(Math.max(50, Math.min(1200, Number(e.target.value) || 200)))}
+            style={{
+              width: 60, padding: "1px 4px", fontSize: 12,
+              backgroundColor: "#0F172A", border: "1px solid #2D3548",
+              borderRadius: 3, color: "#E2E8F0", textAlign: "center",
+            }}
+          />
+          px
+        </label>
+        <label
+          style={{
+            display: "flex", alignItems: "center", gap: 4,
             fontSize: 12, color: "#94A3B8", cursor: "pointer", marginRight: 4,
             userSelect: "none",
           }}
@@ -1202,7 +1227,7 @@ export default function JobDetailPage() {
             setExporting(true);
             setExportProgress({ progress: 0, message: "准备中...", step: "starting" });
             try {
-              const taskId = await jobsApi.startExportTask(jobId, includeRaw);
+              const taskId = await jobsApi.startExportTask(jobId, includeRaw, imgSize);
               const apiBase = (import.meta.env.VITE_API_BASE as string) || "/api/v1";
               await new Promise<void>((resolve, reject) => {
                 const es = new EventSource(`${apiBase}/jobs/${jobId}/export/excel/${taskId}/events`);
