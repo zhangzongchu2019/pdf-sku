@@ -19,17 +19,96 @@ from uuid import UUID
 from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from collections import defaultdict
+
 from pdf_sku.common.models import PDFJob, Page
 from pdf_sku.common.enums import JobInternalStatus, PageStatus
 from pdf_sku.gateway.event_bus import event_bus
 from pdf_sku.gateway.user_status import update_job_status, refresh_job_page_stats
-from pdf_sku.pipeline.ir import PageResult
+from pdf_sku.pipeline.ir import PageResult, BindingResult
 from pdf_sku.pipeline.page_processor import PageProcessor
 import structlog
 
 logger = structlog.get_logger()
 
 PIPELINE_CONCURRENCY_FALLBACK = int(os.environ.get("PIPELINE_CONCURRENCY", "5"))
+
+_SIZE_KEYS = ["size", "尺寸", "规格", "specification", "spec"]
+
+
+def _merge_variant_skus(result: PageResult) -> None:
+    """合并同一页中 product_id 相同的多个规格 SKU 为一个。
+
+    - 规格合并为列表，格式 "variant_label: size"（若无 label 则只保留 size）
+    - 其余 SKU 的图片绑定重新指向主 SKU（已绑定的图片不重复添加）
+    - 非主 SKU 从 result.skus / result.bindings 中移除
+    """
+    by_product: dict[str, list] = defaultdict(list)
+    no_product = []
+    for sku in result.skus:
+        if sku.product_id:
+            by_product[sku.product_id].append(sku)
+        else:
+            no_product.append(sku)
+
+    merged_skus = list(no_product)
+
+    for product_id, group in by_product.items():
+        if len(group) <= 1:
+            merged_skus.extend(group)
+            continue
+
+        group_sorted = sorted(group, key=lambda s: s.sku_id)
+        primary = group_sorted[0]
+        others = group_sorted[1:]
+
+        # 合并规格：拼接 variant_label
+        all_sizes: list[str] = []
+        for sku in group_sorted:
+            sz = next((str(sku.attributes[k]) for k in _SIZE_KEYS
+                       if k in sku.attributes and isinstance(sku.attributes[k], str)), None)
+            if not sz:
+                continue
+            label = (sku.variant_label or "").strip()
+            entry = f"{label}: {sz}" if label else sz
+            if entry not in all_sizes:
+                all_sizes.append(entry)
+
+        if all_sizes:
+            size_key = next((k for k in _SIZE_KEYS if k in primary.attributes), _SIZE_KEYS[0])
+            primary.attributes = {**primary.attributes, size_key: all_sizes}
+
+        # 重新指向绑定
+        other_ids = {s.sku_id for s in others}
+        primary_images = {b.image_id for b in result.bindings if b.sku_id == primary.sku_id}
+        max_rank = max((b.rank for b in result.bindings if b.sku_id == primary.sku_id), default=0)
+
+        extra_bindings: list[BindingResult] = []
+        for b in result.bindings:
+            if b.sku_id in other_ids and b.image_id and b.image_id not in primary_images:
+                primary_images.add(b.image_id)
+                max_rank += 1
+                extra_bindings.append(BindingResult(
+                    sku_id=primary.sku_id,
+                    image_id=b.image_id,
+                    confidence=b.confidence,
+                    method=b.method,
+                    is_ambiguous=b.is_ambiguous,
+                    rank=max_rank,
+                ))
+
+        result.bindings = [b for b in result.bindings if b.sku_id not in other_ids]
+        result.bindings.extend(extra_bindings)
+
+        logger.info("variant_skus_merged",
+                    product_id=product_id,
+                    n_merged=len(others),
+                    primary_sku=primary.sku_id,
+                    sizes=all_sizes,
+                    extra_bindings=len(extra_bindings))
+        merged_skus.append(primary)
+
+    result.skus = merged_skus
 
 # Redis key for pipeline concurrency rules
 CONCURRENCY_RULES_KEY = "pdf_sku:pipeline_concurrency_rules"
@@ -232,6 +311,12 @@ class Orchestrator:
         每页完成: 落库 → 事件 → 人工任务(如需)。
         [C5] 导入成功后才保存 Checkpoint
         """
+        # 合并同 product_id 的多规格变体（必须在 sku_count 写入前执行，保证计数一致）
+        _merge_variant_skus(result)
+
+        # 只统计有效 SKU 数量（与 _persist_skus 中实际入库的保持一致）
+        valid_sku_count = len([s for s in result.skus if s.validity == "valid"])
+
         # 更新 Page 记录
         status_map = {
             "AI_COMPLETED": PageStatus.AI_COMPLETED.value,
@@ -248,7 +333,7 @@ class Orchestrator:
             ).values(
                 status=new_status,
                 page_type=result.page_type,
-                sku_count=len(result.skus),
+                sku_count=valid_sku_count,
                 needs_review=result.needs_review,
                 extraction_method=result.extraction_method,
                 llm_model_used=result.llm_model_used,
@@ -278,7 +363,7 @@ class Orchestrator:
             "job_id": str(job.job_id),
             "page_no": page_no,
             "status": result.status,
-            "sku_count": len(result.skus),
+            "sku_count": valid_sku_count,
             "needs_review": result.needs_review,
         })
 
