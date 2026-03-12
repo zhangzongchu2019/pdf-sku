@@ -1493,6 +1493,9 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
             model_to_main_bbox: dict[str, tuple] = {}   # db_model → product_photo bbox
             # 预建 DB model 集合，用于从 OCR 文字中反查 DB model（前缀/子串匹配）
             db_models = [(model, model) for model, _, _ in unique_products if model]
+            # 按 (bbox, role) 去重：OCR+LLM 可能把多个文字条目映射到同一图框，
+            # 导致同一区域被重复创建多张图片。记录已见 bbox+role 组合，跳过重复。
+            _seen_bbox_role: set[tuple] = set()
             for photo in llm_photos:
                 bbox = photo["bbox"]
                 role = "product_main" if photo["photo_type"] == "product_photo" else "product_detail"
@@ -1512,6 +1515,15 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                     else:
                         bbox = self._snap_scene_bbox(
                             screenshot, bbox, page_w, page_h)
+                # 即使跳过重复图框，仍更新 model_to_main_bbox（不同型号可能共用同一图框）
+                if role == "product_main" and ocr_model:
+                    model_to_main_bbox[ocr_model] = bbox
+                # 去重：同一 bbox+role 只创建一张图片
+                _bbox_role_key = (round(bbox[0]), round(bbox[1]),
+                                  round(bbox[2]), round(bbox[3]), role)
+                if _bbox_role_key in _seen_bbox_role:
+                    continue
+                _seen_bbox_role.add(_bbox_role_key)
                 dw = abs(bbox[2] - bbox[0]) * dpi_scale
                 dh = abs(bbox[3] - bbox[1]) * dpi_scale
                 short = int(min(dw, dh))
@@ -1526,9 +1538,6 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                     role=role,
                     data=b"",
                 ))
-                # model_to_main_bbox：用 OCR 提取的型号做 key，供后续 SKU 回绑
-                if role == "product_main" and ocr_model:
-                    model_to_main_bbox[ocr_model] = bbox
                 img_idx += 1
 
             # 安全检查: 若 LLM 坐标异常导致产品图片不足（如归一化坐标、bbox太小），
@@ -1574,17 +1583,33 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                     raw.images.extend(new_region_images)
 
                     # 将每个 SKU 的 source_bbox 指向对应产品的 product_main 照片
+                    # 先按 model_number 精确匹配，再对未匹配的 SKU 做贪心空间最近邻匹配
+                    _main_imgs_for_src = [
+                        img for img in new_region_images if img.role == "product_main"
+                    ]
+                    _assigned_sku_ids: set[str] = set()
+                    # 第一轮：model_number 精确匹配
                     for sku in skus:
                         model = sku.attributes.get("model_number", "")
-                        sb = sku.source_bbox
                         if model and model in model_to_main_bbox:
                             sku.source_bbox = model_to_main_bbox[model]
-                        elif not model and sb and sb != (0, 0, 0, 0):
-                            # fallback：找最近的 product_main 图片
-                            near_bboxes = [b for b in model_to_main_bbox.values()]
-                            if near_bboxes:
-                                cx, cy = (sb[0] + sb[2]) / 2, (sb[1] + sb[3]) / 2
-                                sku.source_bbox = min(near_bboxes, key=lambda b: _min_dist_to_bbox(cx, cy, b))
+                            _assigned_sku_ids.add(sku.sku_id)
+                    # 第二轮：对未匹配 SKU 做贪心空间最近邻（防止两个 SKU 映射到同一 product_main）
+                    _unmatched = [s for s in skus if s.sku_id not in _assigned_sku_ids]
+                    _free_main_bboxes = [img.bbox for img in _main_imgs_for_src]
+                    for sku in sorted(_unmatched, key=lambda s: (
+                        (s.source_bbox[1] + s.source_bbox[3]) / 2 if s.source_bbox else 0
+                    )):
+                        sb = sku.source_bbox
+                        if not sb or sb == (0, 0, 0, 0) or not _free_main_bboxes:
+                            continue
+                        cx, cy = (sb[0] + sb[2]) / 2, (sb[1] + sb[3]) / 2
+                        nearest = min(_free_main_bboxes, key=lambda b: _min_dist_to_bbox(cx, cy, b))
+                        sku.source_bbox = nearest
+                        _free_main_bboxes.remove(nearest)
+                        if not _free_main_bboxes:
+                            # 所有 product_main 已分配完，重置允许多 SKU 共用
+                            _free_main_bboxes = [img.bbox for img in _main_imgs_for_src]
 
                     n_images = img_idx
                     used_method = f"{_detection_method}_individual"

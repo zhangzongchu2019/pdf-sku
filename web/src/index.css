@@ -190,6 +190,7 @@ a:hover { text-decoration: underline; }
   cursor: pointer; transition: all 0.2s; }
 .sku-card:hover { border-color: var(--primary); }
 .sku-card.selected { border-color: var(--primary); background: #e6f7ff; }
+.sku-card.hovered { border-color: var(--primary); background: #f0f8ff; }
 .sku-card-header { display: flex; align-items: center; gap: 6px; }
 .sku-id { font-family: monospace; font-size: 12px; flex: 1; }
 .annotation-badge { font-size: 11px; background: var(--warning); color: white; padding: 1px 6px;

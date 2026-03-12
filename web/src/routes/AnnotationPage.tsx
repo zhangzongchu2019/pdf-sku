@@ -29,6 +29,7 @@ export default function AnnotationPage() {
   const [pageImageUrl, setPageImageUrl] = useState<string | null>(null);
   const [showSubmitConfirm, setShowSubmitConfirm] = useState(false);
   const [drawingMode, setDrawingMode] = useState(false);
+  const [hoveredSkuId, setHoveredSkuId] = useState<string | null>(null);
   const skipSubmitConfirm = useSettingsStore((s) => s.skipSubmitConfirm);
 
   // OCR + multi-bbox state
@@ -278,6 +279,8 @@ export default function AnnotationPage() {
             drawingMode={drawingMode}
             onBoxDrawn={handleBoxDrawn}
             extraBboxes={extraBboxes}
+            hoveredSkuId={hoveredSkuId}
+            onHoverSku={setHoveredSkuId}
           />
         </div>
 
@@ -293,6 +296,8 @@ export default function AnnotationPage() {
             ocrLoadingSkuIds={ocrLoadingSkuIds}
             skuSourceTexts={skuSourceTexts}
             extraBboxes={extraBboxes}
+            hoveredSkuId={hoveredSkuId}
+            onHoverSku={setHoveredSkuId}
           />
         </div>
       </div>

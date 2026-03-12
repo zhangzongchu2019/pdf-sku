@@ -13,6 +13,8 @@ interface Props {
   ocrLoadingSkuIds?: Set<string>;
   skuSourceTexts?: Record<string, string>;
   extraBboxes?: Record<string, number[][]>;
+  hoveredSkuId?: string | null;
+  onHoverSku?: (id: string | null) => void;
 }
 
 /** Controlled editable attribute row — syncs with upstream value (e.g. OCR fill) while allowing local edits. */
@@ -54,6 +56,8 @@ export default function GroupPanel({
   ocrLoadingSkuIds = new Set(),
   skuSourceTexts = {},
   extraBboxes = {},
+  hoveredSkuId,
+  onHoverSku,
 }: Props) {
   const [expandedSku, setExpandedSku] = useState<string | null>(null);
 
@@ -84,10 +88,14 @@ export default function GroupPanel({
             ? [...new Set([...ATTRIBUTE_KEYS, ...attrKeys])]
             : attrKeys;
 
+          const isHovered = hoveredSkuId === sku.sku_id;
+
           return (
             <div key={sku.sku_id}
-                 className={`sku-card ${isSelected ? "selected" : ""}`}
-                 onClick={() => onSelectSku(sku.sku_id)}>
+                 className={`sku-card ${isSelected ? "selected" : ""} ${isHovered && !isSelected ? "hovered" : ""}`}
+                 onClick={() => onSelectSku(sku.sku_id)}
+                 onMouseEnter={() => onHoverSku?.(sku.sku_id)}
+                 onMouseLeave={() => onHoverSku?.(null)}>
               <div className="sku-card-header">
                 <span className="sku-id">{sku.sku_id.slice(0, 12)}</span>
                 {isManual && (

@@ -84,11 +84,14 @@ CRITICAL rule — how to count products:
   Each boundary has a "bbox_norm" field with normalized [x0, y0, x1, y1] coordinates (0.0-1.0)
   indicating WHERE on the screenshot that product is located. Use this to locate and read the
   product label/text in that specific region of the screenshot. Extract ONE product per boundary.
-  You MUST return an entry for EVERY boundary_id, even if the text is hard to read — do your best.
+  ONLY include a boundary in your response if product text (product_name or model_number) is
+  clearly visible in the image for that region. If no text is readable, omit that boundary entirely.
+  Do NOT invent or guess product names — only extract what is explicitly visible in the PDF.
 - Only expand a SINGLE 型号 into multiple variant SKUs when that same 型号 has multiple
   different sizes/dimensions listed (e.g. "型号：WS-100 规格：1500/1800/2000mm" → 3 SKUs).
 
 Additional rules:
+- STRICT EXTRACTION: Only extract attributes that are explicitly written in the PDF text or clearly visible in the image. Do NOT infer, guess, or fabricate any attribute value. If an attribute is not present, omit it.
 - Material and color lines describe the ENTIRE product series, NOT individual variants → put in "common_attrs".
 - Do NOT create separate SKUs for different colors or materials.
 - CRITICAL: When a product has N座位/人位/seater variants listed (e.g. "1人位", "2人位", "3人位"),

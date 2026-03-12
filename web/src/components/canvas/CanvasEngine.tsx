@@ -10,11 +10,13 @@ interface Props {
   drawingMode?: boolean;
   onBoxDrawn?: (bbox: number[]) => void;
   extraBboxes?: Record<string, number[][]>;
+  hoveredSkuId?: string | null;
+  onHoverSku?: (id: string | null) => void;
 }
 
 const COLORS = ["#1890ff", "#52c41a", "#faad14", "#eb2f96", "#722ed1", "#13c2c2"];
 
-export default function CanvasEngine({ imageUrl, skus, selectedSkuId, onSelectSku, annotations, drawingMode = false, onBoxDrawn, extraBboxes = {} }: Props) {
+export default function CanvasEngine({ imageUrl, skus, selectedSkuId, onSelectSku, annotations, drawingMode = false, onBoxDrawn, extraBboxes = {}, hoveredSkuId, onHoverSku }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [img, setImg] = useState<HTMLImageElement | null>(null);
@@ -24,6 +26,7 @@ export default function CanvasEngine({ imageUrl, skus, selectedSkuId, onSelectSk
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   const [drawStart, setDrawStart] = useState<{ x: number; y: number } | null>(null);
   const [drawCurrent, setDrawCurrent] = useState<{ x: number; y: number } | null>(null);
+  const lastHoveredRef = useRef<string | null>(null);
 
   // Load image
   useEffect(() => {
@@ -78,12 +81,20 @@ export default function CanvasEngine({ imageUrl, skus, selectedSkuId, onSelectSk
       const [x1, y1, x2, y2] = sku.source_bbox;
       const color = COLORS[i % COLORS.length];
       const isSelected = sku.sku_id === selectedSkuId;
+      const isHovered = sku.sku_id === hoveredSkuId;
       const hasAnnotation = annotations.some((a) => a.payload?.sku_id === sku.sku_id);
 
-      ctx.strokeStyle = isSelected ? "#ff4d4f" : hasAnnotation ? "#faad14" : color;
-      ctx.lineWidth = isSelected ? 3 : 2;
+      // Hover fill
+      if (isHovered && !isSelected) {
+        ctx.fillStyle = color + "26";
+        ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+      }
+
+      ctx.strokeStyle = isSelected ? "#ff4d4f" : isHovered ? color : hasAnnotation ? "#faad14" : color;
+      ctx.lineWidth = isSelected ? 3 : isHovered ? 2.5 : 2;
       ctx.setLineDash(hasAnnotation ? [5, 3] : []);
       ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+      ctx.setLineDash([]);
 
       // Label
       const label = sku.sku_id.slice(-6);
@@ -97,6 +108,10 @@ export default function CanvasEngine({ imageUrl, skus, selectedSkuId, onSelectSk
         extras.forEach((eb) => {
           if (eb.length < 4) return;
           const [ex1, ey1, ex2, ey2] = eb;
+          if (isHovered && !isSelected) {
+            ctx.fillStyle = color + "26";
+            ctx.fillRect(ex1, ey1, ex2 - ex1, ey2 - ey1);
+          }
           ctx.strokeStyle = isSelected ? "#ff4d4f" : color;
           ctx.lineWidth = isSelected ? 2 : 1.5;
           ctx.setLineDash([4, 4]);
@@ -120,7 +135,7 @@ export default function CanvasEngine({ imageUrl, skus, selectedSkuId, onSelectSk
     }
 
     ctx.restore();
-  }, [img, skus, selectedSkuId, annotations, scale, offset, drawStart, drawCurrent, extraBboxes]);
+  }, [img, skus, selectedSkuId, hoveredSkuId, annotations, scale, offset, drawStart, drawCurrent, extraBboxes]);
 
   useEffect(() => {
     const raf = requestAnimationFrame(render);
@@ -189,6 +204,30 @@ export default function CanvasEngine({ imageUrl, skus, selectedSkuId, onSelectSk
     }
     if (drawStart) {
       setDrawCurrent(screenToImage(e));
+      return;
+    }
+    if (onHoverSku) {
+      const { x: cx, y: cy } = screenToImage(e);
+      const hit = skus.find((sku) => {
+        if (sku.source_bbox && sku.source_bbox.length >= 4) {
+          const [x1, y1, x2, y2] = sku.source_bbox;
+          if (cx >= x1 && cx <= x2 && cy >= y1 && cy <= y2) return true;
+        }
+        const extras = extraBboxes[sku.sku_id];
+        if (extras) {
+          for (const eb of extras) {
+            if (eb.length < 4) continue;
+            const [x1, y1, x2, y2] = eb;
+            if (cx >= x1 && cx <= x2 && cy >= y1 && cy <= y2) return true;
+          }
+        }
+        return false;
+      });
+      const newId = hit?.sku_id ?? null;
+      if (newId !== lastHoveredRef.current) {
+        lastHoveredRef.current = newId;
+        onHoverSku(newId);
+      }
     }
   };
 
@@ -217,7 +256,7 @@ export default function CanvasEngine({ imageUrl, skus, selectedSkuId, onSelectSk
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
-        onMouseLeave={() => { setDragging(false); setDrawStart(null); setDrawCurrent(null); }}
+        onMouseLeave={() => { setDragging(false); setDrawStart(null); setDrawCurrent(null); if (onHoverSku && lastHoveredRef.current !== null) { lastHoveredRef.current = null; onHoverSku(null); } }}
         style={{ cursor: dragging ? "grabbing" : drawingMode ? "crosshair" : "default" }}
       />
       <div className="canvas-controls">
