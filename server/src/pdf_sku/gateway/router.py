@@ -552,7 +552,7 @@ async def reprocess_single_page(
         "job_id": str(job_id),
         "page_number": page_number,
         "status": result.status,
-        "sku_count": len(result.skus),
+        "sku_count": len([s for s in result.skus if s.validity == "valid"]),
     }
 
 

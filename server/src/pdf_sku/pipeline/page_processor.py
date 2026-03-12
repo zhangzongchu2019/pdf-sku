@@ -1425,12 +1425,29 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
 
         # 如果有 model_number 的产品不足 2 个，退而用所有有位置的 SKU
         if len(unique_products) < 2:
+            # 若已有至少 1 个唯一型号（且全部相同），说明这些 SKU 是同产品的不同规格/配置，
+            # 不需要切分图片，使用整张大图即可。
+            if len(seen_models) >= 1:
+                return
+            import re as _re2
+            _chinese_re2 = _re2.compile(r'[\u4e00-\u9fff]')
+            _size_keys2 = {"size", "尺寸", "规格", "specification", "spec"}
+
+            def _is_ghost_sku(s) -> bool:
+                """幻觉 SKU 判断：无型号 + 无中文名 + 无尺寸（LLM 臆想的通用英文家具词）。"""
+                model = s.attributes.get("model_number", "")
+                name = s.attributes.get("product_name", "")
+                has_size = any(k in s.attributes for k in _size_keys2)
+                return not model and not _chinese_re2.search(name) and not has_size
+
             seen_bboxes: list[tuple] = []
             unique_products = []
             for sku in sorted(skus, key=lambda s: (
                 round((s.source_bbox[1] if s.source_bbox else 0) / 50) * 50,
                 s.source_bbox[0] if s.source_bbox else 0,
             )):
+                if _is_ghost_sku(sku):
+                    continue
                 sb = sku.source_bbox
                 if not sb or sb == (0, 0, 0, 0):
                     continue

@@ -35,6 +35,105 @@ PIPELINE_CONCURRENCY_FALLBACK = int(os.environ.get("PIPELINE_CONCURRENCY", "5"))
 
 _SIZE_KEYS = ["size", "尺寸", "规格", "specification", "spec"]
 
+import re as _re
+_CHINESE_RE = _re.compile(r'[\u4e00-\u9fff]')
+
+
+def _mark_hallucinated_skus_invalid(result: PageResult) -> None:
+    """将无型号、无尺寸、且商品名仅含 ASCII 通用词的 SKU 标记为 invalid。
+
+    典型场景：LLM 看到生活场景图，按肉眼臆想出 "armchair"/"sofa" 等英文名称，
+    但实际 PDF 上无任何产品规格文字可读。
+    判断条件（全部满足才标记为 invalid）：
+      1. model_number 为空
+      2. product_name 不含中文字符
+      3. 无任何尺寸/规格属性
+    """
+    for sku in result.skus:
+        if sku.validity != "valid":
+            continue
+        model = sku.attributes.get("model_number", "")
+        name = sku.attributes.get("product_name", "")
+        has_size = any(k in sku.attributes for k in _SIZE_KEYS)
+        if not model and not _CHINESE_RE.search(name) and not has_size:
+            sku.validity = "invalid"
+            logger.info("hallucinated_sku_invalidated", sku_id=sku.sku_id, product_name=name)
+
+
+def _merge_by_model_number(result: PageResult) -> None:
+    """合并同一页中 model_number 相同（且不同 product_id）的有效 SKU 为一个。
+
+    适用于：LLM 将同一型号的不同规格识别为独立产品但 product_id 各异时的兜底合并。
+    _merge_variant_skus 已按 product_id 合并；本函数进一步按 model_number 合并剩余分散项。
+    无效 SKU（validity != "valid"）直接透传，不参与合并。
+    """
+    by_model: dict[str, list] = defaultdict(list)
+    no_model = []
+    for sku in result.skus:
+        model = sku.attributes.get("model_number", "")
+        if sku.validity == "valid" and model:
+            by_model[model].append(sku)
+        else:
+            no_model.append(sku)
+
+    merged_skus = list(no_model)
+
+    for model, group in by_model.items():
+        if len(group) <= 1:
+            merged_skus.extend(group)
+            continue
+
+        group_sorted = sorted(group, key=lambda s: s.sku_id)
+        primary = group_sorted[0]
+        others = group_sorted[1:]
+
+        # 合并规格（与 _merge_variant_skus 逻辑一致）
+        all_sizes: list[str] = []
+        for sku in group_sorted:
+            sz = next((str(sku.attributes[k]) for k in _SIZE_KEYS
+                       if k in sku.attributes and isinstance(sku.attributes[k], str)), None)
+            if not sz:
+                continue
+            label = (sku.variant_label or "").strip()
+            entry = f"{label}: {sz}" if label else sz
+            if entry not in all_sizes:
+                all_sizes.append(entry)
+
+        if all_sizes:
+            size_key = next((k for k in _SIZE_KEYS if k in primary.attributes), _SIZE_KEYS[0])
+            primary.attributes = {**primary.attributes, size_key: all_sizes}
+
+        # 将 others 的绑定移到 primary
+        other_ids = {s.sku_id for s in others}
+        primary_images = {b.image_id for b in result.bindings if b.sku_id == primary.sku_id}
+        max_rank = max((b.rank for b in result.bindings if b.sku_id == primary.sku_id), default=0)
+
+        extra_bindings: list[BindingResult] = []
+        for b in result.bindings:
+            if b.sku_id in other_ids and b.image_id and b.image_id not in primary_images:
+                primary_images.add(b.image_id)
+                max_rank += 1
+                extra_bindings.append(BindingResult(
+                    sku_id=primary.sku_id,
+                    image_id=b.image_id,
+                    confidence=b.confidence,
+                    method=b.method,
+                    is_ambiguous=b.is_ambiguous,
+                    rank=max_rank,
+                ))
+
+        result.bindings = [b for b in result.bindings if b.sku_id not in other_ids]
+        result.bindings.extend(extra_bindings)
+
+        logger.info("model_skus_merged",
+                    model_number=model,
+                    n_merged=len(others),
+                    primary_sku=primary.sku_id,
+                    sizes=all_sizes)
+        merged_skus.append(primary)
+
+    result.skus = merged_skus
+
 
 def _merge_variant_skus(result: PageResult) -> None:
     """合并同一页中 product_id 相同的多个规格 SKU 为一个。
@@ -311,8 +410,16 @@ class Orchestrator:
         每页完成: 落库 → 事件 → 人工任务(如需)。
         [C5] 导入成功后才保存 Checkpoint
         """
-        # 合并同 product_id 的多规格变体（必须在 sku_count 写入前执行，保证计数一致）
+        # 1. 幻觉检测：无型号+无中文+无尺寸的 SKU 标记为 invalid
+        _mark_hallucinated_skus_invalid(result)
+        # 2. 合并同 product_id 的多规格变体
         _merge_variant_skus(result)
+        # 3. 合并同型号但 product_id 不同的变体（LLM 错误地分配了不同 product_id）
+        _merge_by_model_number(result)
+        # 4. 清理无效 SKU 的绑定，避免 FK 异常
+        _invalid_ids = {s.sku_id for s in result.skus if s.validity != "valid"}
+        if _invalid_ids:
+            result.bindings = [b for b in result.bindings if b.sku_id not in _invalid_ids]
 
         # 只统计有效 SKU 数量（与 _persist_skus 中实际入库的保持一致）
         valid_sku_count = len([s for s in result.skus if s.validity == "valid"])
