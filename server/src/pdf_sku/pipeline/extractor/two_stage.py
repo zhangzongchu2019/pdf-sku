@@ -91,7 +91,7 @@ CRITICAL rule — how to count products:
   different sizes/dimensions listed (e.g. "型号：WS-100 规格：1500/1800/2000mm" → 3 SKUs).
 
 Additional rules:
-- STRICT EXTRACTION: Only extract attributes that are explicitly written in the PDF text or clearly visible in the image. Do NOT infer, guess, or fabricate any attribute value. If an attribute is not present, omit it.
+- STRICT EXTRACTION: Only extract attributes that are explicitly written as TEXT in the PDF (labels, captions, model numbers, specs). Do NOT describe products by their visual appearance (e.g. do NOT write "Grey Tufted Sofa" just because you see a grey sofa in a photo). Do NOT infer, guess, or fabricate any attribute value. If an attribute is not present in the text, omit it.
 - Material and color lines describe the ENTIRE product series, NOT individual variants → put in "common_attrs".
 - Do NOT create separate SKUs for different colors or materials.
 - CRITICAL: When a product has N座位/人位/seater variants listed (e.g. "1人位", "2人位", "3人位"),

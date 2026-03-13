@@ -1421,7 +1421,18 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
 
         # 无 DB SKU 时仍可尝试 OCR+LLM：OCR 直接从 PDF 检测图框和文字，
         # 不依赖 DB 中的产品列表，能在 SKU 提取失败/跳过的页面上独立发现商品子图。
-        no_db_products = len(skus) < 2
+        # 全部 SKU 均为 ghost（幻觉英文名、无型号、无中文、无尺寸）时等同于"无可信 DB SKU"，
+        # 同样允许 OCR+LLM 独立检测区域——否则 ghost SKU 会阻断产品子图划分。
+        import re as _re_ghost
+        _ghost_re = _re_ghost.compile(r'[\u4e00-\u9fff]')
+        _ghost_sz = {"size", "尺寸", "规格", "specification", "spec"}
+        _all_ghost = len(skus) > 0 and all(
+            not s.attributes.get("model_number")
+            and not _ghost_re.search(s.attributes.get("product_name", ""))
+            and not any(k in s.attributes for k in _ghost_sz)
+            for s in skus
+        )
+        no_db_products = len(skus) < 2 or _all_ghost
 
         # ── 1. 收集唯一 source_bbox（IoU 去重）──
         def _iou(a: tuple, b: tuple) -> float:
@@ -1989,6 +2000,34 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                             page=page_no, text_blocks=len(text_boxes))
                 return None
 
+            # ── 3b. 无 DB 产品时：直接用 OCR img_boxes 作产品区域，跳过 LLM ──
+            # product_descs 为空 = SKU 提取无有效结果（全幻觉或页面无文字）。
+            # OCR img_boxes 即商品图框，直接用于产品区域划分。
+            # 若仍交给 LLM 匹配，因缺少匹配基准，LLM 仅返回 n_eff 个区域，
+            # 大量 img_boxes 白白浪费（如页面有 5 张商品图但只有 1 个品牌 logo 文字
+            # → n_eff=1 → 只创建 1 个区域）。
+            if not product_descs:
+                if len(img_boxes) < 2:
+                    logger.info("product_regions_ocr_direct_no_db_single_box",
+                                page=page_no, n_img_boxes=len(img_boxes))
+                    return None
+                logger.info("product_regions_ocr_direct_no_db",
+                            page=page_no, n_img_boxes=len(img_boxes))
+                return [
+                    {
+                        "product_index": i,
+                        "photo_type": "product_photo",
+                        "bbox": (
+                            box.bbox[0] * page_w / px_w,
+                            box.bbox[1] * page_h / px_h,
+                            box.bbox[2] * page_w / px_w,
+                            box.bbox[3] * page_h / px_h,
+                        ),
+                        "ocr_text": "",
+                    }
+                    for i, box in enumerate(img_boxes)
+                ]
+
             # ── 4. 生成标注图，压缩后发给 LLM ──
             annotated = annotate_img_boxes(screenshot, img_boxes, text_boxes)
 
@@ -2041,6 +2080,12 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                             page=page_no, count=len(effective_products))
 
             n_eff = len(effective_products)
+            # product_descs 为空时已在上方提前返回，此处 n_eff==0 只在
+            # product_descs 非空但 effective_products 被意外清空时触发（安全保护）
+            if n_eff == 0:
+                logger.info("product_regions_ocr_llm_no_effective_products",
+                            page=page_no, img_boxes=len(img_boxes))
+                return None
 
             # ── 5b. 构建 prompt（坐标统一转为千分制 0-1000）──
             region_lines = []

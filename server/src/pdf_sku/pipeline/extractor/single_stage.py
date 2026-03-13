@@ -15,6 +15,13 @@ _parser = ResponseParser()
 SINGLE_STAGE_PROMPT = """Extract ALL products and their SKU variants from this PDF page.
 Each product may have multiple SKU variants.
 
+CRITICAL — anti-hallucination rules:
+- STRICT EXTRACTION ONLY: Extract ONLY attributes that are explicitly written as TEXT in the PDF page (labels, captions, model numbers, price tags, spec sheets, etc.).
+- Do NOT describe products by their visual appearance. Do NOT infer product names, materials, or colors from how a product looks in a photo.
+- Example of what NOT to do: seeing a grey sofa and writing "product_name: Grey Tufted Sofa" — this is hallucination.
+- If no text label is visible for a product region, do NOT include it in your response.
+- If an attribute value is not explicitly written in the page, leave it null — do NOT guess or infer it.
+
 IMPORTANT rules for variant splitting:
 - ONLY split into multiple SKUs when the text explicitly lists multiple sizes/dimensions (e.g. "规格-1500/1800/2000mm" → 3 SKUs).
 - Material and color lines (e.g. "材质-进口橡木 颜色-板栗色/宝马灰") describe the ENTIRE product series, NOT individual variants. Put them in "common_attrs".
