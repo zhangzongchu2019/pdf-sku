@@ -582,13 +582,44 @@ class ExcelExporter:
             group_id = next((s.product_id for s in grp if s.product_id), grp[0].sku_id)
             rows.append(_build_row(grp, group_id))
 
+        # 6. 补充无 SKU 绑定的商品子图（search_eligible=True, is_fragmented=False）
+        #    这类图片不在任何 SKU 绑定中，以空属性行形式追加到导出
+        unbound_imgs = (await db.execute(
+            select(Image)
+            .where(
+                Image.job_id == job_id,
+                Image.is_fragmented == False,
+                Image.search_eligible == True,
+                Image.image_id.notin_(all_bound_image_ids) if all_bound_image_ids
+                else True,
+            )
+            .order_by(Image.page_number, Image.image_id)
+        )).scalars().all()
+
+        for img in unbound_imgs:
+            try:
+                img_data = (job_dir / img.extracted_path).read_bytes()
+            except Exception as e:
+                logger.warning("excel_unbound_image_read_failed",
+                               image_id=img.image_id, error=str(e))
+                img_data = None
+            rows.append(ExportRow(
+                page_number=img.page_number,
+                sku_id=img.image_id,
+                attributes={},
+                images=[img_data] if img_data else [],
+                image_ids=[img.image_id],
+                source_text=source_filename,
+            ))
+
         rows.sort(key=lambda r: r.page_number)
 
         logger.info("excel_export_rows_loaded",
                     job_id=str(job_id),
                     total_rows=len(rows),
                     total_skus=len(skus),
-                    union_groups=len(union_groups))
+                    union_groups=len(union_groups),
+                    unbound_images=len(unbound_imgs))
         return rows
 
     @staticmethod

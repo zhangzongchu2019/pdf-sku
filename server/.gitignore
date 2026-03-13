@@ -21,3 +21,7 @@ htmlcov/
 /tmp/
 /models/*.pt
 /models/*.onnx
+test_data/
+yolo_demo.py
+ocr_demo.py
+ocr_json.md
