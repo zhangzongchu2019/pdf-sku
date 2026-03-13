@@ -136,9 +136,8 @@ def _slice_img_dense(meta: FitzPageMeta) -> list[tuple] | None:
 
     if meta.grid and meta.grid[0] >= 2:
         rows = meta.grid[0]
-        # 每 2-3 行一片
-        rows_per_slice = 2 if rows >= 6 else (2 if rows >= 4 else rows)
-        n_slices = max(1, (rows + rows_per_slice - 1) // rows_per_slice)
+        # 每行一片（密集页需要足够分辨率识别每个产品）
+        n_slices = rows
 
         if n_slices <= 1:
             return None
@@ -146,9 +145,8 @@ def _slice_img_dense(meta: FitzPageMeta) -> list[tuple] | None:
         row_height = ph / rows
         slices = []
         for i in range(n_slices):
-            y0 = max(0, i * rows_per_slice * row_height - TALL_OVERLAP) if i > 0 else 0
-            y1_row = min(rows, (i + 1) * rows_per_slice)
-            y1 = min(ph, y1_row * row_height + TALL_OVERLAP) if i < n_slices - 1 else ph
+            y0 = max(0, i * row_height - TALL_OVERLAP) if i > 0 else 0
+            y1 = min(ph, (i + 1) * row_height + TALL_OVERLAP) if i < n_slices - 1 else ph
             slices.append((0, y0, pw, y1))
 
         return slices if len(slices) > 1 else None

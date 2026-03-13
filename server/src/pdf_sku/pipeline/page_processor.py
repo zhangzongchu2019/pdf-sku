@@ -43,6 +43,7 @@ from pdf_sku.pipeline.extractor.ocr_guided import OcrGuidedExtractor
 from pdf_sku.pipeline.extractor.consistency_validator import ConsistencyValidator
 from pdf_sku.pipeline.extractor.sku_dedup import (
     run_dedup_chain, dedup_by_model, dedup_by_similarity,
+    pre_filter, ocr_cross_validate,
 )
 from pdf_sku.pipeline.extractor.sku_reviewer import SKUReviewer
 from pdf_sku.pipeline.binder.binder import SKUImageBinder
@@ -371,7 +372,15 @@ class PageProcessor:
             if skus:
                 before = len(skus)
                 ocr_full_text = OcrEngine.blocks_to_text(ocr_blocks) if ocr_blocks else ""
-                skus = run_dedup_chain(skus, ocr_text=ocr_full_text)
+
+                # IMG_DENSE + grid → 放宽去重（网格产品名称相似是正常的）
+                if plan.page_class == IMG_DENSE and fitz_meta.grid:
+                    skus = pre_filter(skus)
+                    if ocr_full_text:
+                        skus = ocr_cross_validate(skus, ocr_full_text)
+                    skus = dedup_by_model(skus)
+                else:
+                    skus = run_dedup_chain(skus, ocr_text=ocr_full_text)
                 if len(skus) < before:
                     logger.info("dedup_chain_applied",
                                 page=page_no, before=before, after=len(skus))
@@ -492,7 +501,7 @@ class PageProcessor:
             # 跨切片去重 (重叠区域可能产生重复)
             before = len(all_skus)
             all_skus = dedup_by_model(all_skus)
-            all_skus = dedup_by_similarity(all_skus, threshold=0.90)
+            all_skus = dedup_by_similarity(all_skus, threshold=0.98)
             if len(all_skus) < before:
                 logger.info("slice_dedup", before=before, after=len(all_skus))
 
