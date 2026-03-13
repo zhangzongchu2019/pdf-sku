@@ -23,17 +23,26 @@ GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
 class GeminiClient(BaseLLMClient):
-    """Google Gemini 原生 API 客户端（直连 Google）。"""
+    """Google Gemini 原生 API 客户端。
+
+    支持两种鉴权模式：
+    - use_bearer_auth=False（默认）：Google 官方 ?key=... 方式
+    - use_bearer_auth=True：代理服务 Authorization: Bearer ... 方式
+    """
 
     def __init__(
         self,
         api_key: str = "",
         model: str = "gemini-2.0-flash",
         timeout: float = 60.0,
+        api_base: str = "",
+        use_bearer_auth: bool = False,
     ):
         self._api_key = api_key
         self._model = model
         self._timeout = timeout
+        self._api_base = api_base.rstrip("/") if api_base else GEMINI_API_BASE
+        self._use_bearer_auth = use_bearer_auth
         self._client = httpx.AsyncClient(timeout=timeout)
 
     async def complete(
@@ -67,10 +76,15 @@ class GeminiClient(BaseLLMClient):
         if json_mode:
             body["generationConfig"]["responseMimeType"] = "application/json"
 
-        url = f"{GEMINI_API_BASE}/{self._model}:generateContent?key={self._api_key}"
+        if self._use_bearer_auth:
+            url = f"{self._api_base}/{self._model}:generateContent"
+            headers = {"Authorization": f"Bearer {self._api_key}"}
+        else:
+            url = f"{self._api_base}/{self._model}:generateContent?key={self._api_key}"
+            headers = {}
         start = time.monotonic()
         effective_timeout = httpx.Timeout(timeout) if timeout else None
-        resp = await self._client.post(url, json=body, timeout=effective_timeout)
+        resp = await self._client.post(url, json=body, headers=headers, timeout=effective_timeout)
         latency = (time.monotonic() - start) * 1000
         if resp.is_error:
             body_text = resp.text[:500]

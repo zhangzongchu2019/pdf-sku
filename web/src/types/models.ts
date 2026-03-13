@@ -76,6 +76,8 @@ export interface Page {
   parse_time_ms?: number;
   llm_time_ms?: number;
   task_id?: string | null;
+  screenshot_width?: number | null;
+  screenshot_height?: number | null;
 }
 
 export interface PageInfo {

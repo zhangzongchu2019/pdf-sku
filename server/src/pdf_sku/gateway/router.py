@@ -710,8 +710,10 @@ async def get_page_screenshot(
     job_id: uuid.UUID,
     db: DBSession,
     page_number: int = PathParam(..., ge=1),
+    thumbnail: bool = False,
+    max_size: int = 1200,
 ):
-    """返回指定页面的截图 (PNG)。"""
+    """返回指定页面的截图 (PNG)。thumbnail=true 时压缩为 JPEG 返回。"""
 
     job_result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
     job = job_result.scalar_one_or_none()
@@ -759,8 +761,29 @@ async def get_page_screenshot(
         except Exception:
             return False
 
+    def _compress_screenshot(png_data: bytes) -> Response:
+        from PIL import Image as _PILImg
+        import io as _io
+        pil = _PILImg.open(_io.BytesIO(png_data))
+        orig_w, orig_h = pil.size
+        pil.thumbnail((max_size, max_size * 2), _PILImg.LANCZOS)
+        buf = _io.BytesIO()
+        pil.convert("RGB").save(buf, format="JPEG", quality=75, optimize=True)
+        return Response(
+            content=buf.getvalue(),
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "public, max-age=86400",
+                "X-Original-Width": str(orig_w),
+                "X-Original-Height": str(orig_h),
+                "Access-Control-Expose-Headers": "X-Original-Width, X-Original-Height",
+            },
+        )
+
     # 优先返回有效的缓存截图
     if _cached_screenshot_valid(cache_path):
+        if thumbnail:
+            return _compress_screenshot(cache_path.read_bytes())
         return FileResponse(str(cache_path), media_type="image/png")
 
     # 缓存不存在或 DPI 不匹配时删除旧缓存，重新渲染
@@ -776,6 +799,8 @@ async def get_page_screenshot(
         if not explicit.is_absolute():
             explicit = job_dir / explicit
         if explicit.exists() and _cached_screenshot_valid(explicit):
+            if thumbnail:
+                return _compress_screenshot(explicit.read_bytes())
             return FileResponse(str(explicit), media_type="image/png")
 
     source_pdf = job_dir / "source.pdf"
@@ -836,6 +861,8 @@ async def get_page_screenshot(
             error=str(e),
         )
 
+    if thumbnail:
+        return _compress_screenshot(png_bytes)
     return Response(content=png_bytes, media_type="image/png")
 
 
@@ -844,8 +871,14 @@ async def get_job_image(
     job_id: uuid.UUID,
     image_id: str,
     db: DBSession,
+    thumbnail: bool = False,
+    max_size: int = 400,
 ):
-    """返回 Job 中提取的图片文件。"""
+    """返回 Job 中提取的图片文件。
+
+    thumbnail=true 时返回压缩缩略图（前端展示用），原图不变。
+    max_size 控制缩略图长边像素（默认 400）。
+    """
     result = await db.execute(
         select(Image).where(Image.job_id == job_id, Image.image_id == image_id)
     )
@@ -863,6 +896,24 @@ async def get_job_image(
             "error_code": "IMAGE_FILE_MISSING",
             "message": "Image file not found on disk",
         })
+
+    if thumbnail:
+        try:
+            from PIL import Image as PILImage
+            import io
+            pil = PILImage.open(file_path)
+            pil.thumbnail((max_size, max_size), PILImage.LANCZOS)
+            buf = io.BytesIO()
+            pil.convert("RGB").save(buf, format="JPEG", quality=70, optimize=True)
+            buf.seek(0)
+            from fastapi.responses import Response
+            return Response(
+                content=buf.read(),
+                media_type="image/jpeg",
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
+        except Exception:
+            pass  # 压缩失败降级返回原图
 
     media = "image/jpeg" if img.format == "jpg" else f"image/{img.format or 'jpeg'}"
     return FileResponse(str(file_path), media_type=media)
@@ -922,8 +973,26 @@ async def get_page_detail(
                     "rank": b.rank,
                 })
 
+    # 读取截图实际像素尺寸（用于前端 bbox overlay 坐标换算）
+    screenshot_w: int | None = None
+    screenshot_h: int | None = None
+    try:
+        import struct as _struct
+        _ss_path = Path(settings.job_data_dir) / str(job_id) / "screenshots" / f"page-{page_number}.png"
+        if _ss_path.exists():
+            _data = _ss_path.read_bytes()[:24]
+            if len(_data) >= 24 and _data[:4] == b'\x89PNG':
+                screenshot_w = _struct.unpack('>I', _data[16:20])[0]
+                screenshot_h = _struct.unpack('>I', _data[20:24])[0]
+    except Exception:
+        pass
+
+    page_dict = _page_to_dict(pg)
+    page_dict["screenshot_width"] = screenshot_w
+    page_dict["screenshot_height"] = screenshot_h
+
     return {
-        "page": _page_to_dict(pg),
+        "page": page_dict,
         "skus": [{
             "sku_id": s.sku_id, "page_number": s.page_number,
             "attributes": s.attributes, "status": s.status,

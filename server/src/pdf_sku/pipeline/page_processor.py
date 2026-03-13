@@ -119,10 +119,10 @@ _OCR_LLM_PROMPT = """\
 This furniture catalog page has {n_regions} image regions detected by OCR, marked with colored numbered boxes (0 to {n_regions_minus1}).
 Yellow dashed boxes show OCR-detected text areas.
 
-Image region bboxes (pixel coordinates, index: [x0,y0,x1,y1]):
+Image region bboxes (per-mille coordinates 0-1000, index: [x0,y0,x1,y1]):
 {region_bboxes}
 
-OCR text blocks detected on the page (format: [x0,y0,x1,y1] "text"):
+OCR text blocks detected on the page (per-mille coordinates 0-1000, format: [x0,y0,x1,y1] "text"):
 {ocr_text}
 
 The following {n} products have been identified on this page:
@@ -133,19 +133,19 @@ Key spatial rule: the text block describing a product (model number, dimensions,
 
 Return a JSON array:
 [
-  {{"product_index": 0, "region_index": 2, "photo_type": "product_photo"}},
-  {{"product_index": 0, "region_index": 5, "photo_type": "lifestyle_photo"}},
-  {{"product_index": 1, "region_index": 3, "photo_type": "product_photo"}},
+  {{"product_index": 0, "photo_type": "product_photo", "bbox": [x0,y0,x1,y1]}},
+  {{"product_index": 0, "photo_type": "lifestyle_photo", "bbox": [x0,y0,x1,y1]}},
+  {{"product_index": 1, "photo_type": "product_photo", "bbox": [x0,y0,x1,y1]}},
   ...
 ]
 
 RULES:
 1. product_index: 0-based index from the product list above (0 to {n_minus1})
-2. region_index: 0-based index matching the numbered colored box on the image (0 to {n_regions_minus1})
+2. bbox: copy the per-mille coordinates from the matching image region bbox above
 3. photo_type: "product_photo" (clean/white background) or "lifestyle_photo" (room/scene setting)
 4. Every product must have exactly one "product_photo" entry
 5. "lifestyle_photo" entries are optional — only include if clearly visible
-6. Multiple products may map to the same region_index (e.g. color variants sharing one catalog photo)
+6. Multiple products may share the same bbox (e.g. color variants sharing one catalog photo)
 7. Skip regions that are irrelevant (pure text blocks, headers, footers)
 
 Respond ONLY with the JSON array, no other text."""
@@ -1182,6 +1182,32 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                     loser.is_duplicate = True
                     loser.search_eligible = False
 
+        # 4. 包含过滤: 小图 bbox 的 ≥85% 面积落在大图 bbox 内 → 小图是大图的内嵌细节图，排除
+        active2 = [img for img in images if not img.is_duplicate and img.search_eligible
+                   and len(img.bbox) >= 4]
+        for i in range(len(active2)):
+            if not active2[i].search_eligible:
+                continue
+            bi = active2[i].bbox
+            ai = max(1, (bi[2] - bi[0]) * (bi[3] - bi[1]))
+            for j in range(len(active2)):
+                if i == j or not active2[j].search_eligible:
+                    continue
+                bj = active2[j].bbox
+                aj = max(1, (bj[2] - bj[0]) * (bj[3] - bj[1]))
+                # 只检查 i 是否被 j 包含（i 更小）
+                if ai >= aj:
+                    continue
+                ox0 = max(bi[0], bj[0]); oy0 = max(bi[1], bj[1])
+                ox1 = min(bi[2], bj[2]); oy1 = min(bi[3], bj[3])
+                overlap = max(0, ox1 - ox0) * max(0, oy1 - oy0)
+                if overlap / ai >= 0.85:
+                    active2[i].search_eligible = False
+                    logger.info("image_contained_excluded",
+                                small=active2[i].image_id, large=active2[j].image_id,
+                                containment=round(overlap / ai, 2))
+                    break
+
         deduped = sum(1 for img in images if img.is_duplicate)
         if deduped > 0:
             logger.info("image_dedup", total=len(images), deduped=deduped)
@@ -1393,8 +1419,9 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
         if img_area / (page_w * page_h) < 0.70:
             return
 
-        if len(skus) < 2:
-            return
+        # 无 DB SKU 时仍可尝试 OCR+LLM：OCR 直接从 PDF 检测图框和文字，
+        # 不依赖 DB 中的产品列表，能在 SKU 提取失败/跳过的页面上独立发现商品子图。
+        no_db_products = len(skus) < 2
 
         # ── 1. 收集唯一 source_bbox（IoU 去重）──
         def _iou(a: tuple, b: tuple) -> float:
@@ -1457,7 +1484,8 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                 unique_products.append(("", sku.attributes.get("product_name", ""), sku))
 
         n = len(unique_products)
-        if n < 2:
+        if n < 2 and not no_db_products:
+            # 有 DB SKU 但去重后只剩 1 个产品 → 同产品不同规格，无需切分
             return
 
         # ── 2. 检测产品子图区域：OCR+LLM 主路，降级链兜底 ──
@@ -1467,6 +1495,12 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
         llm_photos = await self._detect_product_regions_with_ocr_llm(
             screenshot, product_descs, page_w, page_h, page_no, file_path=file_path)
         _detection_method = "ocr_llm"
+
+        # 无 DB SKU 时仅依赖 OCR+LLM：其余降级路径（纯 LLM/YOLO/CV/等比网格）
+        # 都需要预先知道商品数量，在 OCR 失败时无法可靠工作，直接退出。
+        if llm_photos is None and no_db_products:
+            logger.info("product_regions_no_db_products_ocr_failed", page=page_no)
+            return
 
         # 次路：纯 LLM（OCR API 不可用/超时时的 fallback）
         if llm_photos is None:
@@ -1568,9 +1602,13 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                 1 for img in new_region_images
                 if img.short_edge >= _eligible_threshold and img.role == "product_main"
             )
-            # OCR+LLM 路径：发现的商品数可能多于 DB SKU 数（n），也可能少于。
-            # 只要有至少 n 张可搜索的主图（覆盖 DB SKU 数量）即视为成功。
-            has_eligible_llm = eligible_main_count >= n
+            # OCR+LLM 路径：图框数 <= SKU 数属于正常（场景页多 SKU 共用同一 image box）。
+            # bbox 来自 OCR 精确检测，只要 ≥1 张可搜索主图即视为成功；
+            # 纯 LLM 路径：LLM 猜坐标，要求 >= n 张（bbox 不足说明坐标质量不可靠）。
+            if _detection_method == "ocr_llm":
+                has_eligible_llm = eligible_main_count >= 1
+            else:
+                has_eligible_llm = eligible_main_count >= n
             if not has_eligible_llm:
                 logger.warning(
                     "product_regions_llm_no_eligible",
@@ -1632,40 +1670,15 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                     used_method = f"{_detection_method}_individual"
 
         if llm_photos is None:
-            # ── 降级：等比网格，每产品一个区域（旧行为）──
-            # ── 3. 标记原大图为不可搜索 ──
-            full_img.search_eligible = False
-            grid_cells = self._make_equal_product_grid(n, page_w, page_h)
-            for cell_bbox in grid_cells:
-                x0, y0, x1, y1 = cell_bbox
-                dw = abs(x1 - x0) * dpi_scale
-                dh = abs(y1 - y0) * dpi_scale
-                short = int(min(dw, dh))
-                raw.images.append(ImageInfo(
-                    image_id=f"p{page_no}_region_{img_idx}",
-                    bbox=cell_bbox,
-                    width=int(dw), height=int(dh), short_edge=short,
-                    search_eligible=short >= 150,
-                    role="unknown",
-                    data=b"",
-                ))
-                img_idx += 1
-
-            model_to_region: dict[str, tuple] = {
-                model: grid_cells[i] for i, (model, _, _) in enumerate(unique_products)
-                if model and i < len(grid_cells)
-            }
-            for sku in skus:
-                model = sku.attributes.get("model_number", "")
-                sb = sku.source_bbox
-                if model and model in model_to_region:
-                    sku.source_bbox = model_to_region[model]
-                elif not model and sb and sb != (0, 0, 0, 0) and grid_cells:
-                    cx, cy = (sb[0] + sb[2]) / 2, (sb[1] + sb[3]) / 2
-                    sku.source_bbox = min(grid_cells, key=lambda c: _min_dist_to_bbox(cx, cy, c))
-
-            n_images = img_idx
-            used_method = "equal_grid"
+            # 检测方法全部失败：不做等比网格切割，保留原大图（search_eligible 维持不变）。
+            # 等比网格对生活场景页、混排页等非规则页面会产生错误切割，
+            # 不如让所有 SKU 共用整张大图，结果虽然粗糙但不会误导图片搜索。
+            logger.info(
+                "product_regions_detection_failed_keep_full_img",
+                page=page_no,
+                n_products=n,
+            )
+            return
 
         logger.info(
             "product_regions_created",
@@ -1976,26 +1989,23 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
                             page=page_no, text_blocks=len(text_boxes))
                 return None
 
-            # ── 4. 生成标注图，并缩放到 LLM 可接受的尺寸 ──
+            # ── 4. 生成标注图，压缩后发给 LLM ──
             annotated = annotate_img_boxes(screenshot, img_boxes, text_boxes)
 
-            # 大图缩放：避免超出 LLM API 请求体积限制
-            _MAX_LLM_DIM = 1600
-            if px_w > _MAX_LLM_DIM or px_h > _MAX_LLM_DIM:
-                _ann_scale = min(_MAX_LLM_DIM / px_w, _MAX_LLM_DIM / px_h)
-                _ann_w, _ann_h = int(px_w * _ann_scale), int(px_h * _ann_scale)
-                _ann_pil = _PIL.open(_io.BytesIO(annotated)).resize(
-                    (_ann_w, _ann_h), _PIL.LANCZOS
-                )
-                _ann_buf = _io.BytesIO()
-                _ann_pil.save(_ann_buf, format="JPEG", quality=80)
-                annotated_for_llm = _ann_buf.getvalue()
-                logger.info("product_regions_ocr_llm_img_resized",
-                            page=page_no, orig=f"{px_w}x{px_h}",
-                            resized=f"{_ann_w}x{_ann_h}",
-                            bytes=len(annotated_for_llm))
-            else:
-                annotated_for_llm = annotated
+            # 统一压缩：限制长边 ≤ 1024px + JPEG quality=60，减少请求体积避免超时
+            _MAX_LLM_DIM = 1024
+            _ann_scale = min(1.0, _MAX_LLM_DIM / px_w, _MAX_LLM_DIM / px_h)
+            _ann_w, _ann_h = max(1, int(px_w * _ann_scale)), max(1, int(px_h * _ann_scale))
+            _ann_pil = _PIL.open(_io.BytesIO(annotated))
+            if _ann_scale < 1.0:
+                _ann_pil = _ann_pil.resize((_ann_w, _ann_h), _PIL.LANCZOS)
+            _ann_buf = _io.BytesIO()
+            _ann_pil.save(_ann_buf, format="JPEG", quality=60)
+            annotated_for_llm = _ann_buf.getvalue()
+            logger.info("product_regions_ocr_llm_img_compressed",
+                        page=page_no, orig=f"{px_w}x{px_h}",
+                        out=f"{_ann_w}x{_ann_h}",
+                        bytes=len(annotated_for_llm))
 
             # ref_w/ref_h：截图像素尺寸（坐标已对齐到截图空间）
             ref_w = px_w
@@ -2032,15 +2042,20 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
 
             n_eff = len(effective_products)
 
-            # ── 5b. 构建 prompt ──
+            # ── 5b. 构建 prompt（坐标统一转为千分制 0-1000）──
             region_lines = []
             for i, box in enumerate(img_boxes):
-                x0, y0, x1, y1 = [int(v) for v in box.bbox]
-                region_lines.append(f"  {i}: [{x0},{y0},{x1},{y1}]")
+                x0, y0, x1, y1 = box.bbox
+                x0m = round(x0 * 1000 / px_w); y0m = round(y0 * 1000 / px_h)
+                x1m = round(x1 * 1000 / px_w); y1m = round(y1 * 1000 / px_h)
+                region_lines.append(f"  {i}: [{x0m},{y0m},{x1m},{y1m}]")
 
             ocr_lines = []
             for tb in text_boxes:
-                bstr = "[{},{},{},{}]".format(*[int(v) for v in tb.bbox])
+                x0, y0, x1, y1 = tb.bbox
+                x0m = round(x0 * 1000 / px_w); y0m = round(y0 * 1000 / px_h)
+                x1m = round(x1 * 1000 / px_w); y1m = round(y1 * 1000 / px_h)
+                bstr = f"[{x0m},{y0m},{x1m},{y1m}]"
                 ocr_lines.append(f"  {bstr} \"{tb.text}\"")
 
             product_list_lines = []
@@ -2070,28 +2085,28 @@ Respond with ONLY a JSON array of [sku_index, image_index] pairs:
             from pdf_sku.llm_adapter.parser.response_parser import ResponseParser
 
             def _parse_photos(resp_text: str) -> list[dict]:
-                """解析 LLM 响应，返回 photos 列表（空列表表示解析失败）。"""
+                """解析 LLM 响应，返回 photos 列表（空列表表示解析失败）。
+                LLM 返回千分制 bbox，转换为 PDF points 后输出。
+                """
                 parsed = ResponseParser().parse(resp_text, expected_type="array")
                 if not parsed.success or not isinstance(parsed.data, list):
                     return []
                 result: list[dict] = []
-                n_reg = len(img_boxes)
                 for item in parsed.data:
                     prod_idx = item.get("product_index")
-                    region_idx = item.get("region_index")
+                    bbox_raw = item.get("bbox")
                     photo_type = item.get("photo_type", "product_photo")
-                    if prod_idx is None or region_idx is None:
+                    if prod_idx is None or not bbox_raw or len(bbox_raw) != 4:
                         continue
                     prod_idx = int(prod_idx)
-                    region_idx = int(region_idx)
-                    if not (0 <= prod_idx < n_eff) or not (0 <= region_idx < n_reg):
+                    if not (0 <= prod_idx < n_eff):
                         continue
-                    px_bbox = img_boxes[region_idx].bbox
+                    # 千分制 → PDF points
                     pt_bbox = (
-                        px_bbox[0] * page_w / ref_w,
-                        px_bbox[1] * page_h / ref_h,
-                        px_bbox[2] * page_w / ref_w,
-                        px_bbox[3] * page_h / ref_h,
+                        bbox_raw[0] / 1000 * page_w,
+                        bbox_raw[1] / 1000 * page_h,
+                        bbox_raw[2] / 1000 * page_w,
+                        bbox_raw[3] / 1000 * page_h,
                     )
                     ocr_text_for_prod = effective_products[prod_idx][1] if prod_idx < n_eff else ""
                     result.append({

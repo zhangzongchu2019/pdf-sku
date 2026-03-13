@@ -364,7 +364,7 @@ function SkuVerifyCard({
 // ── 页面验证面板 ──────────────────────────────────────────────────────────────
 function PageVerifyPanel({
   page, pageDetail, pages, reviewCompleting, jobId,
-  screenshotUrl, imageUrl, onReviewComplete, onNavigate, onLightbox, onUpdated,
+  screenshotUrl, screenshotFullUrl, imageUrl, onReviewComplete, onNavigate, onLightbox, onUpdated,
 }: {
   page: { page_number: number; sku_count: number; needs_review: boolean; [key: string]: any };
   pageDetail: PageDetail | null;
@@ -372,6 +372,7 @@ function PageVerifyPanel({
   reviewCompleting: boolean;
   jobId: string;
   screenshotUrl: (pageNo: number) => string;
+  screenshotFullUrl: (pageNo: number) => string;
   imageUrl: (imageId: string) => string;
   onReviewComplete: (pageNo: number) => void;
   onNavigate: (pageNo: number) => void;
@@ -390,6 +391,12 @@ function PageVerifyPanel({
   const [cropping, setCropping] = useState(false);
   const [skuExtracting, setSkuExtracting] = useState(false);
   const screenshotImgRef = useRef<HTMLImageElement>(null);
+
+  // bbox overlay 坐标基准：优先用 API 返回的原始截图尺寸，否则 fallback 到 naturalSize
+  const screenshotW = pageDetail?.page?.screenshot_width;
+  const screenshotH = pageDetail?.page?.screenshot_height;
+  const bboxBase: [number, number] | null =
+    screenshotW && screenshotH ? [screenshotW, screenshotH] : naturalSize;
 
   let hoveredBboxes: number[][] = [];
   if (hoveredSkuId && pageDetail) {
@@ -547,17 +554,17 @@ function PageVerifyPanel({
               src={screenshotUrl(page.page_number)}
               alt={`page-${page.page_number}`}
               style={{ width: "100%", borderRadius: 4, border: "1px solid #2D3548", cursor: (cropMode || skuExtractMode) ? "crosshair" : "pointer", display: "block" }}
-              onClick={(e) => { e.stopPropagation(); if (!cropMode && !skuExtractMode) onLightbox(screenshotUrl(page.page_number)); }}
+              onClick={(e) => { e.stopPropagation(); if (!cropMode && !skuExtractMode) onLightbox(screenshotFullUrl(page.page_number)); }}
               onLoad={(e) => { const img = e.target as HTMLImageElement; setNaturalSize([img.naturalWidth, img.naturalHeight]); }}
               draggable={false}
             />
-            {naturalSize && hoveredBboxes.map((bbox, i) => (
+            {bboxBase && hoveredBboxes.map((bbox, i) => (
               <div key={i} style={{
                 position: "absolute",
-                left: `${(bbox[0] / naturalSize[0]) * 100}%`,
-                top: `${(bbox[1] / naturalSize[1]) * 100}%`,
-                width: `${((bbox[2] - bbox[0]) / naturalSize[0]) * 100}%`,
-                height: `${((bbox[3] - bbox[1]) / naturalSize[1]) * 100}%`,
+                left: `${(bbox[0] / bboxBase[0]) * 100}%`,
+                top: `${(bbox[1] / bboxBase[1]) * 100}%`,
+                width: `${((bbox[2] - bbox[0]) / bboxBase[0]) * 100}%`,
+                height: `${((bbox[3] - bbox[1]) / bboxBase[1]) * 100}%`,
                 border: "2px solid #22D3EE", borderRadius: 2,
                 pointerEvents: "none", boxShadow: "0 0 0 2px #22D3EE33",
               }} />
@@ -974,6 +981,8 @@ export default function JobDetailPage() {
 
   const apiBase = import.meta.env.VITE_API_BASE || "/api/v1";
   const screenshotUrl = (pageNo: number) =>
+    `${apiBase}/jobs/${jobId}/pages/${pageNo}/screenshot?thumbnail=true`;
+  const screenshotFullUrl = (pageNo: number) =>
     `${apiBase}/jobs/${jobId}/pages/${pageNo}/screenshot`;
   const imageUrl = (imageId: string) =>
     jobsApi.getImageUrl(jobId!, imageId);
@@ -1361,6 +1370,7 @@ export default function JobDetailPage() {
                         reviewCompleting={reviewCompleting}
                         jobId={jobId!}
                         screenshotUrl={screenshotUrl}
+                        screenshotFullUrl={screenshotFullUrl}
                         imageUrl={imageUrl}
                         onReviewComplete={handleReviewComplete}
                         onNavigate={toggleExpand}

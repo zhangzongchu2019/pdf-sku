@@ -56,7 +56,7 @@ export default function AnnotationPage() {
       setSkus(useJobStore.getState().skus);
     });
     // Page screenshot URL
-    setPageImageUrl(`/api/v1/jobs/${currentTask.job_id}/pages/${currentTask.page_number}/screenshot`);
+    setPageImageUrl(`/api/v1/jobs/${currentTask.job_id}/pages/${currentTask.page_number}/screenshot?thumbnail=true`);
 
     return () => reset();
   }, [currentTask?.task_id]);

@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     # === LLM ===
     gemini_api_key: str = ""
     gemini_api_base: str = ""  # 留空用官方，填写则走中转（如 https://api.laozhang.ai）
+    gemini_api_format: str = "openai_compat"  # "openai_compat" | "native"（原生 Google generateContent 格式）
     gemini_model: str = "gemini-2.5-flash"
     qwen_api_key: str = ""
     qwen_api_base: str = ""  # 留空用官方，填写则走中转

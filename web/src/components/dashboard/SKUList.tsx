@@ -90,7 +90,7 @@ export function SKUList({ skus, jobId, onReconcile, onSkuUpdated }: SKUListProps
   const [saving, setSaving] = useState(false);
   const apiBase = import.meta.env.VITE_API_BASE || "/api/v1";
   const imgUrl = (imageId: string) =>
-    jobId ? `${apiBase}/jobs/${jobId}/images/${imageId}` : "";
+    jobId ? `${apiBase}/jobs/${jobId}/images/${imageId}?thumbnail=true` : "";
   const validCount = skus.filter((s) => s.validity === "valid").length;
   const needsReviewCount = skus.filter((s) => s.validity === "needs_review").length;
   const invalidCount = skus.filter((s) => s.validity === "invalid").length;

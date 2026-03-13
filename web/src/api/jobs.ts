@@ -94,9 +94,10 @@ export const jobsApi = {
   getPageDetail: (jobId: string, pageNo: number) =>
     api.get<PageDetail>(`/jobs/${jobId}/pages/${pageNo}/detail`),
 
-  getImageUrl: (jobId: string, imageId: string) => {
+  getImageUrl: (jobId: string, imageId: string, thumbnail = true) => {
     const base = import.meta.env.VITE_API_BASE || "/api/v1";
-    return `${base}/jobs/${jobId}/images/${imageId}`;
+    const url = `${base}/jobs/${jobId}/images/${imageId}`;
+    return thumbnail ? `${url}?thumbnail=true` : url;
   },
 
   updateSku: (jobId: string, skuId: string, data: { attributes?: Record<string, string | null>; validity?: string }) =>

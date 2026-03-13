@@ -196,11 +196,23 @@ async def lifespan(app: FastAPI):
                 if settings.gemini_api_base:
                     proxy_host = _extract_proxy_name(settings.gemini_api_base)
                     client_name = f"{model_name}.{proxy_host}"
-                    _register_openai_compat(
-                        client_name, settings.gemini_api_key,
-                        settings.gemini_api_base, settings.gemini_model,
-                        proxy_host, settings.llm_timeout_seconds,
-                    )
+                    if getattr(settings, "gemini_api_format", "openai_compat") == "native":
+                        # 代理使用 Google 原生格式（/v1beta/models/:generateContent + Bearer auth）
+                        from pdf_sku.llm_adapter.client.gemini import GeminiClient
+                        _base = settings.gemini_api_base.rstrip("/") + "/v1beta/models"
+                        register_client(client_name, GeminiClient(
+                            api_key=settings.gemini_api_key,
+                            model=settings.gemini_model,
+                            timeout=settings.llm_timeout_seconds,
+                            api_base=_base,
+                            use_bearer_auth=True,
+                        ))
+                    else:
+                        _register_openai_compat(
+                            client_name, settings.gemini_api_key,
+                            settings.gemini_api_base, settings.gemini_model,
+                            proxy_host, settings.llm_timeout_seconds,
+                        )
                     provider_entries.append(LLMProviderEntry(
                         name=client_name, provider_type="gemini",
                         access_mode="proxy", proxy_service=proxy_host,
