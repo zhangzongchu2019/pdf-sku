@@ -341,7 +341,7 @@ def cross_page_dedup(all_skus: list[SKUResult]) -> list[SKUResult]:
         return all_skus
     before = len(all_skus)
     result = dedup_by_model(all_skus)
-    result = dedup_by_similarity(result, threshold=0.95)
+    result = dedup_by_similarity(result, threshold=0.98)
     removed = before - len(result)
     if removed:
         logger.info("cross_page_dedup_done", before=before, after=len(result), removed=removed)

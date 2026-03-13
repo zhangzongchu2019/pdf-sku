@@ -396,8 +396,10 @@ class PageProcessor:
                                     page=page_no, rescued=len(skus))
 
             # ═══ Phase 6.6: SKUReviewer Pass 2 (B/C 类 + 有 SKU) ═══
+            # IMG_DENSE+grid 是纯图片目录，无文字标注，Reviewer 会误判全部 discard → 跳过
             review_screenshot = screenshot or effective_screenshot
-            if page_type in ("B", "C") and skus and review_screenshot:
+            skip_review = (plan.page_class == IMG_DENSE and fitz_meta.grid)
+            if page_type in ("B", "C") and skus and review_screenshot and not skip_review:
                 before_review = len(skus)
                 skus = await self._reviewer.review(skus, screenshot=review_screenshot)
                 if len(skus) < before_review:
@@ -501,7 +503,9 @@ class PageProcessor:
             # 跨切片去重 (重叠区域可能产生重复)
             before = len(all_skus)
             all_skus = dedup_by_model(all_skus)
-            all_skus = dedup_by_similarity(all_skus, threshold=0.98)
+            # IMG_DENSE 页面产品名称高度相似，跳过 similarity 去重
+            if plan.page_class != IMG_DENSE:
+                all_skus = dedup_by_similarity(all_skus, threshold=0.98)
             if len(all_skus) < before:
                 logger.info("slice_dedup", before=before, after=len(all_skus))
 
