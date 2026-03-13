@@ -340,8 +340,8 @@ def cross_page_dedup(all_skus: list[SKUResult]) -> list[SKUResult]:
     if len(all_skus) <= 1:
         return all_skus
     before = len(all_skus)
+    # 跨页去重只按 model_number: 跨页同名不等于同产品（如不同页的"餐椅"）
     result = dedup_by_model(all_skus)
-    result = dedup_by_similarity(result, threshold=0.98)
     removed = before - len(result)
     if removed:
         logger.info("cross_page_dedup_done", before=before, after=len(result), removed=removed)
