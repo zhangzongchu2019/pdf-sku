@@ -11,7 +11,7 @@ import structlog
 
 from pdf_sku.pipeline.classifier.fitz_classifier import (
     FitzPageMeta, PagePlan,
-    SINGLE_LARGE, SINGLE_TALL, IMG_DENSE,
+    SINGLE_LARGE, SINGLE_TALL, IMG_DENSE, IMG_LABEL,
 )
 
 logger = structlog.get_logger()
@@ -37,7 +37,7 @@ def plan_slices(meta: FitzPageMeta, plan: PagePlan) -> list[tuple] | None:
         return _slice_single_large(meta)
     elif pc == SINGLE_TALL:
         return _slice_single_tall(meta)
-    elif pc == IMG_DENSE:
+    elif pc in (IMG_DENSE, IMG_LABEL):
         return _slice_img_dense(meta)
 
     return None

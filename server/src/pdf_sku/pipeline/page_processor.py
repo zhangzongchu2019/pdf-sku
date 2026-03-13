@@ -36,6 +36,7 @@ from pdf_sku.pipeline.classifier.page_classifier import PageClassifier
 from pdf_sku.pipeline.classifier.fitz_classifier import (
     FitzClassifier, FitzPageMeta, PagePlan, extract_fitz_meta,
     BLANK, TABLE, SINGLE_LARGE, SINGLE_TALL, IMG_DENSE,
+    IMG_LABEL, MIXED_TABLE,
 )
 from pdf_sku.pipeline.slicer.page_slicer import plan_slices, render_slice
 from pdf_sku.pipeline.extractor.single_stage import SingleStageExtractor
@@ -329,7 +330,8 @@ class PageProcessor:
                     raw, page_type, screenshot, features,
                     ocr_blocks, layout_regions, ocr_text_len,
                     sku_count_hint=plan.expected_sku_range,
-                    scene_filter=plan.scene_filter)
+                    scene_filter=plan.scene_filter,
+                    plan=plan)
                 extraction_method = skus[0].extraction_method if skus else None
 
             # ═══ Phase 6.3: 低提取二次 Pass (rescue) ═══
@@ -373,8 +375,9 @@ class PageProcessor:
                 before = len(skus)
                 ocr_full_text = OcrEngine.blocks_to_text(ocr_blocks) if ocr_blocks else ""
 
-                # IMG_DENSE + grid → 放宽去重（网格产品名称相似是正常的）
-                if plan.page_class == IMG_DENSE and fitz_meta.grid:
+                # IMG_DENSE/IMG_LABEL + grid → 放宽去重（网格产品名称相似是正常的）
+                is_image_catalog = plan.page_class in (IMG_DENSE, IMG_LABEL) and fitz_meta.grid
+                if is_image_catalog:
                     skus = pre_filter(skus)
                     if ocr_full_text:
                         skus = ocr_cross_validate(skus, ocr_full_text)
@@ -396,9 +399,9 @@ class PageProcessor:
                                     page=page_no, rescued=len(skus))
 
             # ═══ Phase 6.6: SKUReviewer Pass 2 (B/C 类 + 有 SKU) ═══
-            # IMG_DENSE+grid 是纯图片目录，无文字标注，Reviewer 会误判全部 discard → 跳过
+            # IMG_DENSE/IMG_LABEL+grid 是图片目录，无/少文字标注，Reviewer 会误判全部 discard → 跳过
             review_screenshot = screenshot or effective_screenshot
-            skip_review = (plan.page_class == IMG_DENSE and fitz_meta.grid)
+            skip_review = plan.page_class in (IMG_DENSE, IMG_LABEL) and fitz_meta.grid
             if page_type in ("B", "C") and skus and review_screenshot and not skip_review:
                 before_review = len(skus)
                 skus = await self._reviewer.review(skus, screenshot=review_screenshot)
@@ -503,8 +506,8 @@ class PageProcessor:
             # 跨切片去重 (重叠区域可能产生重复)
             before = len(all_skus)
             all_skus = dedup_by_model(all_skus)
-            # IMG_DENSE 页面产品名称高度相似，跳过 similarity 去重
-            if plan.page_class != IMG_DENSE:
+            # IMG_DENSE/IMG_LABEL 页面产品名称高度相似，跳过 similarity 去重
+            if plan.page_class not in (IMG_DENSE, IMG_LABEL):
                 all_skus = dedup_by_similarity(all_skus, threshold=0.98)
             if len(all_skus) < before:
                 logger.info("slice_dedup", before=before, after=len(all_skus))
@@ -522,6 +525,7 @@ class PageProcessor:
         ocr_text_len: int,
         sku_count_hint: tuple[int, int] | None = None,
         scene_filter: bool = False,
+        plan: PagePlan | None = None,
     ) -> list[SKUResult]:
         """Phase 6: 融合策略提取。
 
@@ -530,12 +534,22 @@ class PageProcessor:
         """
 
         # A 类: 规则表格提取
+        has_screenshot = bool(screenshot)
         if page_type == "A" and raw.tables:
-            return self._table_extract(raw)
+            table_skus = self._table_extract(raw)
+            # MIXED_TABLE: 表格面积不够大，补充 Vision 提取非表格区域
+            if plan and plan.page_class == MIXED_TABLE and has_screenshot:
+                vision_skus = await self._single_stage.extract(
+                    raw, screenshot=screenshot,
+                    sku_count_hint=sku_count_hint,
+                    scene_filter=scene_filter)
+                if vision_skus:
+                    table_skus.extend(vision_skus)
+                    table_skus = dedup_by_model(table_skus)
+            return table_skus
 
         # B/C 类: OCR-Guided + Vision 并行融合
         has_ocr = (ocr_text_len >= settings.ocr_min_text_length and ocr_blocks)
-        has_screenshot = bool(screenshot)
 
         tasks: list[asyncio.Task] = []
         task_labels: list[str] = []

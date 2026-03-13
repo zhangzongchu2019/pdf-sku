@@ -367,5 +367,5 @@ class FitzClassifier:
                 plan.expected_sku_range = (1, 5)
 
         # 场景过滤: 对大图覆盖但产品数少的页面启用
-        if pc in (SINGLE_STD, SINGLE_LARGE, IMG_LABEL) and m.img_coverage > 0.60:
+        if pc in (SINGLE_STD, SINGLE_LARGE, IMG_LABEL, MULTI_SPARSE) and m.img_coverage > 0.60:
             plan.scene_filter = True
