@@ -4,6 +4,7 @@ LLM 统一服务入口。对齐: LLM Adapter 详设 §5.2
 调用链: check_budget → check_rate → check_circuit → render_prompt → client.complete → parse → record
 """
 from __future__ import annotations
+import itertools
 import time
 from pdf_sku.llm_adapter.client.base import BaseLLMClient, LLMResponse
 from pdf_sku.llm_adapter.client.registry import get_client
@@ -46,6 +47,11 @@ class LLMService:
         self._rate_limiter = rate_limiter
         self._default_client = default_client_name
         self._fallback_chain = fallback_chain or []
+        # 多 key 轮询: 从 fallback_chain 中找出同类 provider (如 openrouter_0, openrouter_1)
+        self._robin_pool = [
+            n for n in self._fallback_chain if n.startswith(default_client_name)
+        ] or [default_client_name]
+        self._robin_iter = itertools.cycle(self._robin_pool)
 
     @property
     def current_model_name(self) -> str:
@@ -159,7 +165,13 @@ class LLMService:
         核心调用链: circuit → rate_limit → budget → client.complete → record。
         带重试 + Provider Fallback 链。
         """
-        primary = client_name or self._default_client
+        # 轮询选择 primary: 当未指定 client 时，从同类 provider 池中 round-robin
+        if client_name:
+            primary = client_name
+        elif len(self._robin_pool) > 1:
+            primary = next(self._robin_iter)
+        else:
+            primary = self._default_client
         # 构建尝试顺序: primary → fallback chain 中的其他 provider
         providers = [primary]
         for fb in self._fallback_chain:

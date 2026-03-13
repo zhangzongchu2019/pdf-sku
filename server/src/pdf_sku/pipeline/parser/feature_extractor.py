@@ -3,8 +3,18 @@ from __future__ import annotations
 import re
 from pdf_sku.pipeline.ir import ParsedPageIR, FeatureVector
 
-PRICE_PATTERN = re.compile(r'[\$¥€£]\s*\d+[.,]?\d*|[\d,]+\.\d{2}\s*(?:元|USD|RMB)')
-MODEL_PATTERN = re.compile(r'[A-Z]{1,5}[-\s]?\d{2,10}|(?:型号|Model|SKU|Art\.?\s*No)[.:：\s]*\S+', re.IGNORECASE)
+PRICE_PATTERN = re.compile(
+    r'[\$¥€£]\s*\d+[.,]?\d*'           # $100, ¥128.00
+    r'|[\d,]+\.\d{2}\s*(?:元|USD|RMB)'  # 128.00元
+    r'|\d+\s*元/?\s*\w*'                # 128元, 128元/个
+    r'|(?:售价|单价|价格)[：:]\s*\d+',    # 售价：128
+    re.IGNORECASE,
+)
+MODEL_PATTERN = re.compile(
+    r'[A-Za-z]{1,5}[-\s]?\d{2,10}'                    # SJ-2001, HY103
+    r'|(?:型号|货号|编号|Model|SKU|Art\.?\s*No)[.:：\s]*\S+',  # 型号：SJ-2001
+    re.IGNORECASE,
+)
 
 
 class FeatureExtractor:

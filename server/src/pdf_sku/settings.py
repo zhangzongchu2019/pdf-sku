@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     qwen_api_key: str = ""
     qwen_model: str = "qwen-vl-max"
     openrouter_api_key: str = ""
+    openrouter_api_keys: str = ""  # 多 key 轮询: 逗号分隔 "key1,key2,key3"
     openrouter_api_base: str = "https://openrouter.ai/api"
     openrouter_model: str = "google/gemini-2.5-flash"
     default_llm_client: str = ""
@@ -68,6 +69,14 @@ class Settings(BaseSettings):
     # === Paths ===
     tus_upload_dir: str = "/data/tus-uploads"
     job_data_dir: str = "/data/jobs"
+
+    # === Layout Detection & OCR ===
+    layout_detect_enabled: bool = True
+    doclayout_model_path: str = ""
+    layout_detect_confidence: float = 0.25
+    ocr_enabled: bool = True
+    ocr_dpi: int = 200
+    ocr_min_text_length: int = 50  # 低于此阈值不启用 OCR-guided (20→50, 避免短文本噪音)
 
     # === Limits ===
     max_upload_size_mb: int = 16384

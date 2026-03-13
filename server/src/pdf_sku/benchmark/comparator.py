@@ -1,6 +1,7 @@
 """SKU 对比引擎 — 匹配 + F1 指标 + 字段级 diff。"""
 from __future__ import annotations
 
+import re
 from difflib import SequenceMatcher
 from typing import Any
 
@@ -17,14 +18,23 @@ ATTR_FIELD_MAP = {
     "product_name": "product_name",
     "model_number": "model_number",
     "price": "price",
-    "size": "specs",
+    "specs": "specs",
+    "size": "specs",        # 兼容旧字段
     "color": "color",
+    "tag": "tag",
+    "source": "source",
 }
 
 
 def _normalize(s: str) -> str:
     """归一化字符串用于比较。"""
     return s.strip().lower().replace(" ", "").replace("\u3000", "")
+
+
+def _normalize_model(s: str) -> str:
+    """归一化型号用于匹配: 去除尾部 #/*，统一大小写去空格。"""
+    n = s.strip().lower().replace(" ", "").replace("\u3000", "")
+    return n.rstrip("#*")
 
 
 def _fuzzy_match(a: str, b: str, threshold: float = 0.6) -> bool:
@@ -39,6 +49,19 @@ def _fuzzy_match(a: str, b: str, threshold: float = 0.6) -> bool:
     return SequenceMatcher(None, na, nb).ratio() >= threshold
 
 
+def _extract_model_prefix(name: str) -> str | None:
+    """从 product_name 提取型号前缀（如 SJ-2001、HY-103）。"""
+    m = re.search(r'[A-Za-z]{1,5}[-\s]?\d{2,10}', name)
+    return m.group(0).upper().replace(" ", "") if m else None
+
+
+def _first_line(s: str) -> str:
+    """取 product_name 首行用于模糊比较。"""
+    if not s:
+        return ""
+    return s.split("\n")[0].strip()
+
+
 def _extract_all_skus(run_result: dict) -> list[dict[str, Any]]:
     """从 runner 输出提取所有 valid SKU 的 attributes。"""
     skus = []
@@ -51,6 +74,17 @@ def _extract_all_skus(run_result: dict) -> list[dict[str, Any]]:
                 attrs["_confidence"] = sku.get("confidence", 0)
                 skus.append(attrs)
     return skus
+
+
+def extraction_method_stats(run_result: dict) -> dict[str, int]:
+    """统计 Pipeline 输出中各提取方法的 SKU 数量。"""
+    stats: dict[str, int] = {}
+    for page in run_result.get("pages", []):
+        method = page.get("extraction_method") or "unknown"
+        sku_count = len(page.get("skus", []))
+        if sku_count > 0:
+            stats[method] = stats.get(method, 0) + sku_count
+    return stats
 
 
 def compare_dataset(
@@ -71,29 +105,58 @@ def compare_dataset(
     matched_expected: set[int] = set()
     matched_actual: set[int] = set()
 
-    # Pass 1: model_number 精确匹配
+    # Pass 0: 从 product_name 提取型号前缀匹配
     for ei, exp in enumerate(expected):
-        if not exp.model_number:
+        if ei in matched_expected:
+            continue
+        exp_prefix = _extract_model_prefix(exp.product_name)
+        if not exp_prefix:
             continue
         for ai, act in enumerate(actual_list):
             if ai in matched_actual:
                 continue
+            # 先尝试用 actual 的 model_number
             act_model = str(act.get("model_number", ""))
-            if _normalize(exp.model_number) == _normalize(act_model):
+            if act_model and _normalize_model(act_model) == _normalize_model(exp_prefix):
+                result.matches.append(_make_match(exp, act, "model_prefix"))
+                matched_expected.add(ei)
+                matched_actual.add(ai)
+                break
+            # 再尝试从 actual 的 product_name 提取
+            act_name = str(act.get("product_name", ""))
+            act_prefix = _extract_model_prefix(act_name)
+            if act_prefix and _normalize_model(exp_prefix) == _normalize_model(act_prefix):
+                result.matches.append(_make_match(exp, act, "model_prefix"))
+                matched_expected.add(ei)
+                matched_actual.add(ai)
+                break
+
+    # Pass 1: model_number 匹配 (规范化: 去尾缀 #/*)
+    for ei, exp in enumerate(expected):
+        if ei in matched_expected or not exp.model_number:
+            continue
+        exp_model_n = _normalize_model(exp.model_number)
+        for ai, act in enumerate(actual_list):
+            if ai in matched_actual:
+                continue
+            act_model = str(act.get("model_number", ""))
+            if _normalize_model(act_model) == exp_model_n:
                 result.matches.append(_make_match(exp, act, "model_number"))
                 matched_expected.add(ei)
                 matched_actual.add(ai)
                 break
 
-    # Pass 2: product_name 模糊匹配
+    # Pass 2: product_name 首行模糊匹配
     for ei, exp in enumerate(expected):
         if ei in matched_expected or not exp.product_name:
             continue
+        exp_first = _first_line(exp.product_name)
         for ai, act in enumerate(actual_list):
             if ai in matched_actual:
                 continue
             act_name = str(act.get("product_name", ""))
-            if _fuzzy_match(exp.product_name, act_name):
+            act_first = _first_line(act_name)
+            if _fuzzy_match(exp_first, act_first):
                 result.matches.append(_make_match(exp, act, "product_name"))
                 matched_expected.add(ei)
                 matched_actual.add(ai)
@@ -120,9 +183,18 @@ def _make_match(
     exp: GroundTruthSKU, act: dict[str, Any], method: str
 ) -> SKUMatch:
     diffs = []
+    seen_fields: set[str] = set()
     for attr_key, field_name in ATTR_FIELD_MAP.items():
-        exp_val = getattr(exp, field_name, "")
-        act_val = str(act.get(attr_key, ""))
+        if field_name in seen_fields:
+            continue
+        seen_fields.add(field_name)
+        exp_val = getattr(exp, field_name, "") or ""
+        # 尝试新字段名，回退到旧字段名
+        act_val = str(act.get(attr_key, "") or "")
+        # product_name 比较用首行
+        if field_name == "product_name":
+            exp_val = _first_line(exp_val)
+            act_val = _first_line(act_val)
         diffs.append(FieldDiff(
             field_name=field_name,
             expected=exp_val,

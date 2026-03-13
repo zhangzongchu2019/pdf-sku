@@ -14,6 +14,7 @@ import structlog
 
 from pdf_sku.pipeline.ir import PageResult, SKUResult
 from pdf_sku.pipeline.page_processor import PageProcessor
+from pdf_sku.pipeline.extractor.sku_dedup import cross_page_dedup
 from pdf_sku.config.service import DEFAULT_PROFILE
 
 from .models import ReferenceDataset
@@ -24,8 +25,8 @@ CACHE_DIR = Path("/home/zzc/pdf-sku/server/data/benchmark_cache")
 # 页面并发数，与 Orchestrator 保持一致
 # 总 LLM 并发上限 = DATASET_CONCURRENCY × PAGE_CONCURRENCY
 # 建议保持 ≤ 20 避免 API 超时
-PAGE_CONCURRENCY = int(os.environ.get("BENCHMARK_CONCURRENCY", "8"))
-DATASET_CONCURRENCY = int(os.environ.get("BENCHMARK_DATASET_CONCURRENCY", "2"))
+PAGE_CONCURRENCY = int(os.environ.get("BENCHMARK_CONCURRENCY", "16"))
+DATASET_CONCURRENCY = int(os.environ.get("BENCHMARK_DATASET_CONCURRENCY", "4"))
 
 
 def _file_hash(path: Path) -> str:
@@ -79,7 +80,7 @@ class BenchmarkRunner:
         # 替换为宽松熔断器
         llm_service._circuit = noop_breaker
 
-        self._pool = ProcessPoolExecutor(max_workers=2)
+        self._pool = ProcessPoolExecutor(max_workers=4)
 
         # 创建一个无 DB 的 ConfigProvider mock
         from pdf_sku.config.service import ConfigProvider
@@ -167,6 +168,41 @@ class BenchmarkRunner:
 
         # 按页码排序
         pages = [results[p] for p in sorted(results.keys())]
+
+        # ═══ 跨页去重 ═══
+        all_skus_flat: list[tuple[int, int, dict]] = []  # (page_idx, sku_idx, sku_dict)
+        for pi, page in enumerate(pages):
+            for si, sku in enumerate(page.get("skus", [])):
+                all_skus_flat.append((pi, si, sku))
+
+        if len(all_skus_flat) > 1:
+            # 转换为 SKUResult 进行去重
+            sku_results = [
+                SKUResult(
+                    attributes=s[2].get("attributes", {}),
+                    confidence=s[2].get("confidence", 0.5),
+                    extraction_method=s[2].get("extraction_method", ""),
+                    sku_id=s[2].get("sku_id"),
+                    validity=s[2].get("validity", "valid"),
+                )
+                for s in all_skus_flat
+            ]
+            deduped = cross_page_dedup(sku_results)
+            # 找出保留的 SKU (通过 id 匹配)
+            kept_ids = {id(s) for s in deduped}
+            # 重建 pages 中的 skus
+            remove_set: set[tuple[int, int]] = set()
+            for (pi, si, _), sr in zip(all_skus_flat, sku_results):
+                if id(sr) not in kept_ids:
+                    remove_set.add((pi, si))
+            if remove_set:
+                for pi, page in enumerate(pages):
+                    page["skus"] = [
+                        s for si, s in enumerate(page.get("skus", []))
+                        if (pi, si) not in remove_set
+                    ]
+                    page["sku_count"] = len(page["skus"])
+
         total_skus = sum(len(p.get("skus", [])) for p in pages)
 
         elapsed = time.time() - t0

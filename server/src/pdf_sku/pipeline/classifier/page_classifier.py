@@ -26,34 +26,14 @@ class PageClassifier:
         features: FeatureVector,
         raw_text: str = "",
     ) -> ClassifyResult:
-        """页面分类: 优先规则判断, 低信心时 LLM 补充。"""
+        """页面分类: 规则优先，规则无法判断时默认 B 类。LLM 仅在极低信心时调用。"""
         # 规则快速路径
         rule_result = self._rule_classify(features, raw_text)
-        if rule_result and rule_result.confidence >= 0.85:
+        if rule_result:
             return rule_result
 
-        # LLM 分类
-        if self._llm:
-            try:
-                resp = await self._llm._call_llm(
-                    operation="classify_page",
-                    prompt=f"Classify this PDF page. Features: {features.to_prompt_context()}",
-                    images=[screenshot] if screenshot else None,
-                    timeout=30.0,
-                )
-                parsed = _parser.parse(resp.text, expected_type="object")
-                if parsed.success and isinstance(parsed.data, dict):
-                    return ClassifyResult(
-                        page_type=parsed.data.get("page_type", "B"),
-                        layout_type=parsed.data.get("layout_type", "freeform"),
-                        confidence=float(parsed.data.get("confidence", 0.7)),
-                        raw_response=resp.text,
-                    )
-            except Exception as e:
-                logger.warning("llm_classify_failed", error=str(e))
-
-        # Fallback: 使用规则结果或默认
-        return rule_result or ClassifyResult(page_type="B", confidence=0.5)
+        # 规则无法判断 → 默认 B 类 (无需 LLM)
+        return ClassifyResult(page_type="B", layout_type="freeform", confidence=0.6)
 
     def _rule_classify(self, features: FeatureVector, raw_text: str) -> ClassifyResult | None:
         """基于特征的规则分类。"""

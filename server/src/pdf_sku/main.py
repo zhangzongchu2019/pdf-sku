@@ -48,33 +48,42 @@ def create_llm_service(redis=None):
             model=settings.qwen_model,
             timeout=settings.llm_timeout_seconds,
         ))
-    if settings.openrouter_api_key:
+    # 多 key 轮询: OPENROUTER_API_KEYS 优先，否则回退单 key
+    openrouter_keys: list[str] = []
+    if settings.openrouter_api_keys:
+        openrouter_keys = [k.strip() for k in settings.openrouter_api_keys.split(",") if k.strip()]
+    elif settings.openrouter_api_key:
+        openrouter_keys = [settings.openrouter_api_key]
+
+    openrouter_names: list[str] = []
+    if openrouter_keys:
         from pdf_sku.llm_adapter.client.openrouter import OpenRouterClient
-        register_client("openrouter", OpenRouterClient(
-            api_key=settings.openrouter_api_key,
-            model=settings.openrouter_model,
-            timeout=settings.llm_timeout_seconds,
-            api_base=settings.openrouter_api_base,
-        ))
+        for idx, key in enumerate(openrouter_keys):
+            name = "openrouter" if idx == 0 else f"openrouter_{idx}"
+            register_client(name, OpenRouterClient(
+                api_key=key,
+                model=settings.openrouter_model,
+                timeout=settings.llm_timeout_seconds,
+                api_base=settings.openrouter_api_base,
+            ))
+            openrouter_names.append(name)
 
     # 选择默认客户端: 优先用 .env 中的 DEFAULT_LLM_CLIENT
     default_client = settings.default_llm_client
     if not default_client:
-        if settings.gemini_api_key:
-            default_client = "gemini"
-        elif settings.openrouter_api_key:
+        if openrouter_names:
             default_client = "openrouter"
+        elif settings.gemini_api_key:
+            default_client = "gemini"
         elif settings.qwen_api_key:
             default_client = "qwen"
         else:
-            default_client = "gemini"
+            default_client = "openrouter"
 
-    # Fallback 链: gemini → openrouter → qwen (按优先级)
-    fallback_chain = []
+    # Fallback 链: 所有 openrouter keys → gemini → qwen
+    fallback_chain = list(openrouter_names)
     if settings.gemini_api_key:
         fallback_chain.append("gemini")
-    if settings.openrouter_api_key:
-        fallback_chain.append("openrouter")
     if settings.qwen_api_key:
         fallback_chain.append("qwen")
 

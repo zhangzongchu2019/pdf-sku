@@ -153,8 +153,107 @@ def scan_datasets(data_root: Path | None = None) -> list[ReferenceDataset]:
     return datasets
 
 
+def _split_multiline_skus(skus: list[GroundTruthSKU]) -> list[GroundTruthSKU]:
+    """拆分多行 product_name 中包含多条 SKU 的情况。
+
+    模式 A (HQ系列): 每 2 行一组 (型号+品名, 尺寸+价格)
+      B617-2018 班台
+      2000Wx1800Dx750Hmm P4667
+      B617-2218 班台
+      ...
+
+    模式 B (卡奇尔): 多个 "品类：型号#" 子产品
+      大床：3009#
+      床头柜：201#
+      规格：1500/1800
+    """
+    result: list[GroundTruthSKU] = []
+
+    # 型号行检测: 以型号开头 (如 B617-2018, H102-3212, HW040)
+    model_line_re = re.compile(
+        r'^[A-Za-z]{1,5}\d{1,5}\s*[-]?\s*\d{0,6}\s*[#*]?\s*[\u4e00-\u9fff]')
+    # 子产品检测: "品类：型号#" (型号必须含字母或纯数字+#结尾)
+    _attr_prefixes = {"规格", "颜色", "尺寸", "材质", "品牌", "型号", "货号", "价格", "备注",
+                      "单人", "双人", "三人", "四人", "单人位", "双人位", "三人位", "四人位",
+                      "贵妃位", "贵妃", "脚踏", "台面", "副柜", "主柜", "镜子", "凳子",
+                      "抽屉", "搁板", "层板", "柜门", "柜体"}
+    sub_product_re = re.compile(
+        r'^([\u4e00-\u9fff]{1,6})[：:]\s*([A-Za-z][-A-Za-z0-9#]+|\d{2,6}[#])')
+
+    for sku in skus:
+        name = sku.product_name
+        if '\n' not in name:
+            result.append(sku)
+            continue
+
+        lines = [l.strip() for l in name.split('\n') if l.strip()]
+
+        # 模式 B: 检测 "大床：3009#\n床头柜：201#" 格式
+        sub_matches = [sub_product_re.match(l) for l in lines]
+        # 排除属性行 (规格、颜色等)
+        sub_matches = [
+            m if m and m.group(1) not in _attr_prefixes else None
+            for m in sub_matches
+        ]
+        sub_count = sum(1 for m in sub_matches if m)
+        if sub_count >= 2:
+            # 提取共享属性 (规格、颜色等)
+            shared_specs = []
+            for l in lines:
+                if not sub_product_re.match(l):
+                    shared_specs.append(l)
+            shared_text = ' '.join(shared_specs)
+
+            for m in sub_matches:
+                if m:
+                    category, model = m.group(1), m.group(2)
+                    result.append(GroundTruthSKU(
+                        row_index=sku.row_index,
+                        product_name=category,
+                        model_number=model.rstrip('#*'),
+                        price=sku.price,
+                        specs=shared_text or sku.specs,
+                        color=sku.color,
+                        tag=sku.tag,
+                        source=sku.source,
+                        raw_row=sku.raw_row,
+                    ))
+            continue
+
+        # 模式 A: 检测交替的 "型号行 + 规格行" 格式
+        model_lines = [i for i, l in enumerate(lines) if model_line_re.match(l)]
+        if len(model_lines) >= 2:
+            for ml_idx in model_lines:
+                line = lines[ml_idx]
+                # 提取型号和品名
+                pm = re.match(r'^([A-Za-z]{1,5}\d{1,5}\s*[-]?\s*\d{0,6}\s*[#*]?)\s*([\u4e00-\u9fff]+)', line)
+                if pm:
+                    model = pm.group(1).replace(' ', '')
+                    pname = pm.group(2)
+                    # 下一行通常是尺寸+价格
+                    spec_line = lines[ml_idx + 1] if ml_idx + 1 < len(lines) and ml_idx + 1 not in model_lines else ""
+                    result.append(GroundTruthSKU(
+                        row_index=sku.row_index,
+                        product_name=pname,
+                        model_number=model,
+                        price=sku.price,
+                        specs=spec_line or sku.specs,
+                        color=sku.color,
+                        tag=sku.tag,
+                        source=sku.source,
+                        raw_row=sku.raw_row,
+                    ))
+            continue
+
+        # 无法拆分，保持原样
+        result.append(sku)
+
+    return result
+
+
 def load_dataset(ds: ReferenceDataset) -> ReferenceDataset:
     """加载数据集的 Excel 内容。"""
     if ds.excel_path and ds.excel_path.exists():
         ds.skus = parse_excel(ds.excel_path)
+        ds.skus = _split_multiline_skus(ds.skus)
     return ds

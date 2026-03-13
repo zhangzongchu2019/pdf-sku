@@ -14,19 +14,35 @@ import structlog
 logger = structlog.get_logger()
 _parser = ResponseParser()
 
-BOUNDARY_PROMPT = """Identify SKU product boundaries in this PDF page.
-For each product, return its bounding box coordinates and brief text content.
+BOUNDARY_PROMPT = """识别这个 PDF 页面中的商品(SKU)边界。
+对每个商品，返回其边界框坐标和简要文本内容。
 
-Respond with ONLY a JSON array:
-[{{"boundary_id": 1, "bbox": [x0, y0, x1, y1], "text_content": "product name...", "confidence": 0.9}}]"""
+重要规则:
+- 只提取页面上实际可见的商品，不要虚构或编造任何商品
+- 如果页面没有商品，返回空数组 []
+- 保持原文语言，中文商品用中文，不要翻译成英文
 
-ATTR_PROMPT = """Extract product attributes for each SKU boundary.
-Required attributes: product_name, model_number, price, description, material, color, size, weight.
-Only extract attributes that are clearly visible. Leave missing attributes as null.
+仅返回 JSON 数组:
+[{{"boundary_id": 1, "bbox": [x0, y0, x1, y1], "text_content": "商品名称...", "confidence": 0.9}}]"""
 
-Boundaries: {boundaries}
+ATTR_PROMPT = """为每个商品边界提取属性。
+提取字段: product_name, model_number, price, specs, color, tag, source。
+只提取页面上清晰可见的属性，缺失的填 null。
 
-Respond with ONLY a JSON array:
+重要规则:
+- product_name: 包含完整商品描述，含型号、尺寸、材质等信息，可以多行（用换行符 \\n 分隔）
+- price: 售价，保留原始格式（如 ¥128.00）
+- model_number: 货号/型号
+- specs: 商品规格（尺寸、重量等）
+- color: 颜色
+- tag: 标签/分类
+- source: 来源
+- 不要虚构任何信息，只提取实际可见的内容
+- 保持原文语言，中文商品用中文
+
+商品边界: {boundaries}
+
+仅返回 JSON 数组:
 [{{"boundary_id": 1, "attributes": {{"product_name": "...", "model_number": "...", "price": "..."}}}}]"""
 
 
@@ -73,6 +89,7 @@ class TwoStageExtractor:
         boundaries: list[SKUBoundary],
         raw: ParsedPageIR,
         profile: dict | None = None,
+        screenshot: bytes | None = None,
     ) -> list[SKUResult]:
         """阶段2: 批量属性提取。"""
         if not boundaries:
@@ -91,6 +108,7 @@ class TwoStageExtractor:
             resp = await self._llm._call_llm(
                 operation="extract_sku_attrs",
                 prompt=prompt,
+                images=[screenshot] if screenshot else None,
             )
             parsed = _parser.parse(resp.text, expected_type="array")
             if parsed.success and isinstance(parsed.data, list):

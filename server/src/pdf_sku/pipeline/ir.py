@@ -180,6 +180,8 @@ class PageResult:
     fallback_reason: str | None = None
     degrade_reason: str | None = None
     error: str | None = None
+    fitz_page_class: str = ""     # fitz 预分类结果 (10 种类型)
+    slice_count: int = 0          # 切片数 (0=未切片)
 
     def to_dict(self) -> dict:
         return {

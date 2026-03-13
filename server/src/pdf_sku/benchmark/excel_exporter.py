@@ -38,7 +38,10 @@ ATTR_TO_COL = {
     "product_name": 2,   # C: *商品名称/描述
     "price": 3,          # D: 售价
     "model_number": 4,   # E: 货号
-    "size": 9,           # J: 商品规格
+    "tag": 6,            # G: 标签
+    "source": 7,         # H: 来源
+    "specs": 9,          # J: 商品规格
+    "size": 9,           # J: 商品规格 (兼容旧字段)
     "color": 10,         # K: 颜色
 }
 
