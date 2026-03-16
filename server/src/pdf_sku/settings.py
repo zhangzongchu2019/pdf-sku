@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     openrouter_api_keys: str = ""  # 多 key 轮询: 逗号分隔 "key1,key2,key3"
     openrouter_api_base: str = "https://openrouter.ai/api"
     openrouter_model: str = "google/gemini-2.5-flash"
+    apiyi_api_key: str = ""
+    apiyi_api_base: str = "https://api.apiyi.com"
+    apiyi_model: str = "gemini-2.5-flash"
     default_llm_client: str = ""
     llm_daily_budget_usd: float = 50.0
     llm_timeout_seconds: int = 60
@@ -77,6 +80,12 @@ class Settings(BaseSettings):
     ocr_enabled: bool = True
     ocr_dpi: int = 200
     ocr_min_text_length: int = 50  # 低于此阈值不启用 OCR-guided (20→50, 避免短文本噪音)
+
+    # === Combo Catalog Detection ===
+    combo_detect_enabled: bool = True
+    combo_keyword_page_ratio: float = 0.3
+    combo_multi_category_page_ratio: float = 0.5
+    combo_max_avg_sku_per_page: float = 3.0
 
     # === Limits ===
     max_upload_size_mb: int = 16384

@@ -169,9 +169,10 @@ def _split_multiline_skus(skus: list[GroundTruthSKU]) -> list[GroundTruthSKU]:
     """
     result: list[GroundTruthSKU] = []
 
-    # 型号行检测: 以型号开头 (如 B617-2018, H102-3212, HW040)
+    # 型号行检测: 以型号开头 (如 B617-2018, H102-3212, HW040, BT-BD711)
+    # 支持: 字母+数字 | 字母-字母数字 (如 BT-BD711, BT-NT713)
     model_line_re = re.compile(
-        r'^[A-Za-z]{1,5}\d{1,5}\s*[-]?\s*\d{0,6}\s*[#*]?\s*[\u4e00-\u9fff]')
+        r'^[A-Za-z]{1,5}[-]?[A-Za-z]{0,3}\d{1,5}\s*[-]?\s*\d{0,6}\s*[#*]?\s*[\u4e00-\u9fff]')
     # 子产品检测: "品类：型号#" (型号必须含字母或纯数字+#结尾)
     _attr_prefixes = {"规格", "颜色", "尺寸", "材质", "品牌", "型号", "货号", "价格", "备注",
                       "单人", "双人", "三人", "四人", "单人位", "双人位", "三人位", "四人位",
@@ -226,7 +227,7 @@ def _split_multiline_skus(skus: list[GroundTruthSKU]) -> list[GroundTruthSKU]:
             for ml_idx in model_lines:
                 line = lines[ml_idx]
                 # 提取型号和品名
-                pm = re.match(r'^([A-Za-z]{1,5}\d{1,5}\s*[-]?\s*\d{0,6}\s*[#*]?)\s*([\u4e00-\u9fff]+)', line)
+                pm = re.match(r'^([A-Za-z]{1,5}[-]?[A-Za-z]{0,3}\d{1,5}\s*[-]?\s*\d{0,6}\s*[#*]?)\s*([\u4e00-\u9fff]+)', line)
                 if pm:
                     model = pm.group(1).replace(' ', '')
                     pname = pm.group(2)

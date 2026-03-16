@@ -369,3 +369,9 @@ class FitzClassifier:
         # 场景过滤: 对大图覆盖但产品数少的页面启用
         if pc in (SINGLE_STD, SINGLE_LARGE, IMG_LABEL, MULTI_SPARSE) and m.img_coverage > 0.60:
             plan.scene_filter = True
+        # IMG_DENSE: 高图片覆盖 + 低文字量 → 场景渲染图册
+        if pc == IMG_DENSE and m.img_coverage > 0.60 and m.text_len < 50:
+            plan.scene_filter = True
+        # SINGLE_TALL: 高图片覆盖 → 长条场景图
+        if pc == SINGLE_TALL and m.img_coverage > 0.60:
+            plan.scene_filter = True

@@ -68,6 +68,18 @@ def create_llm_service(redis=None):
             ))
             openrouter_names.append(name)
 
+    # Apiyi (OpenAI 兼容中转) — 命名为 openrouter_apiyi* 以加入 openrouter 轮询池
+    if settings.apiyi_api_key:
+        from pdf_sku.llm_adapter.client.openrouter import OpenRouterClient as _ORC
+        name = f"openrouter_apiyi"
+        register_client(name, _ORC(
+            api_key=settings.apiyi_api_key,
+            model=settings.apiyi_model,
+            timeout=settings.llm_timeout_seconds,
+            api_base=settings.apiyi_api_base,
+        ))
+        openrouter_names.append(name)
+
     # 选择默认客户端: 优先用 .env 中的 DEFAULT_LLM_CLIENT
     default_client = settings.default_llm_client
     if not default_client:

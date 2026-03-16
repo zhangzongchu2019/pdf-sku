@@ -94,9 +94,15 @@ def export_dataset(
             if source_name:
                 ws.cell(row=row_num, column=8, value=source_name)
 
+            # A: 商品图片路径
+            image_path = sku.get("image_path", "")
+            if image_path:
+                ws.cell(row=row_num, column=1, value=image_path)
+
             row_num += 1
 
     # 列宽调整
+    ws.column_dimensions["A"].width = 40
     ws.column_dimensions["C"].width = 40
     ws.column_dimensions["E"].width = 15
     ws.column_dimensions["G"].width = 15

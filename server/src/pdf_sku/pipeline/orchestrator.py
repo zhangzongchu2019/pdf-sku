@@ -24,6 +24,7 @@ from pdf_sku.gateway.event_bus import event_bus
 from pdf_sku.gateway.user_status import update_job_status, refresh_job_page_stats
 from pdf_sku.pipeline.ir import PageResult
 from pdf_sku.pipeline.page_processor import PageProcessor
+from pdf_sku.pipeline.catalog_profiler import scan_catalog, CatalogProfile
 import structlog
 
 logger = structlog.get_logger()
@@ -79,7 +80,11 @@ class Orchestrator:
             non_blank = [p for p in range(1, job.total_pages + 1)
                          if p not in blank_pages]
 
-            await self._process_parallel(job, non_blank, file_path)
+            # 图册级预扫描: 识别主营品类
+            catalog_profile = scan_catalog(file_path)
+
+            await self._process_parallel(job, non_blank, file_path,
+                                          catalog_profile=catalog_profile)
 
             # 终态判定 — 用新 session
             async with self._db_factory() as final_db:
@@ -104,6 +109,7 @@ class Orchestrator:
         job: PDFJob,
         pages: list[int],
         file_path: str,
+        catalog_profile: CatalogProfile | None = None,
     ) -> None:
         """并行处理所有页面（Semaphore 控制并发）。"""
         semaphore = asyncio.Semaphore(PIPELINE_CONCURRENCY)
@@ -112,7 +118,8 @@ class Orchestrator:
             async with semaphore:
                 async with self._db_factory() as page_db:
                     result = await self._process_single_page(
-                        page_db, job, page_no, file_path)
+                        page_db, job, page_no, file_path,
+                        catalog_profile=catalog_profile)
                     await self._on_page_done(page_db, job, page_no, result)
                     await page_db.commit()
 
@@ -132,6 +139,7 @@ class Orchestrator:
         job: PDFJob,
         page_no: int,
         file_path: str,
+        catalog_profile: CatalogProfile | None = None,
     ) -> PageResult:
         """单页处理 + 异常降级。"""
         try:
@@ -148,6 +156,7 @@ class Orchestrator:
                 file_hash=job.file_hash or "",
                 category=job.category,
                 frozen_config_version=job.frozen_config_version,
+                catalog_profile=catalog_profile,
             )
             return result
 

@@ -72,6 +72,8 @@ def _extract_all_skus(run_result: dict) -> list[dict[str, Any]]:
                 attrs["_sku_id"] = sku.get("sku_id", "")
                 attrs["_page_no"] = page.get("page_no", 0)
                 attrs["_confidence"] = sku.get("confidence", 0)
+                attrs["_fitz_page_class"] = page.get("fitz_page_class", "")
+                attrs["_extraction_method"] = page.get("extraction_method", "")
                 skus.append(attrs)
     return skus
 

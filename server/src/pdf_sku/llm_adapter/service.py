@@ -4,7 +4,9 @@ LLM 统一服务入口。对齐: LLM Adapter 详设 §5.2
 调用链: check_budget → check_rate → check_circuit → render_prompt → client.complete → parse → record
 """
 from __future__ import annotations
+import asyncio
 import itertools
+import os
 import time
 from pdf_sku.llm_adapter.client.base import BaseLLMClient, LLMResponse
 from pdf_sku.llm_adapter.client.registry import get_client
@@ -21,6 +23,8 @@ logger = structlog.get_logger()
 
 MAX_RETRIES = 2
 EVAL_BATCH_SIZE = 5
+# 全局 LLM 并发上限，防止 API 429。通过环境变量 LLM_MAX_CONCURRENCY 可调。
+LLM_MAX_CONCURRENCY = int(os.environ.get("LLM_MAX_CONCURRENCY", "12"))
 
 
 class LLMService:
@@ -47,6 +51,7 @@ class LLMService:
         self._rate_limiter = rate_limiter
         self._default_client = default_client_name
         self._fallback_chain = fallback_chain or []
+        self._llm_semaphore = asyncio.Semaphore(LLM_MAX_CONCURRENCY)
         # 多 key 轮询: 从 fallback_chain 中找出同类 provider (如 openrouter_0, openrouter_1)
         self._robin_pool = [
             n for n in self._fallback_chain if n.startswith(default_client_name)
@@ -162,9 +167,22 @@ class LLMService:
         timeout: float = 60.0,
     ) -> LLMResponse:
         """
-        核心调用链: circuit → rate_limit → budget → client.complete → record。
+        核心调用链: semaphore → circuit → rate_limit → budget → client.complete → record。
         带重试 + Provider Fallback 链。
         """
+        async with self._llm_semaphore:
+            return await self._call_llm_inner(
+                operation, prompt, images, client_name, timeout)
+
+    async def _call_llm_inner(
+        self,
+        operation: str,
+        prompt: str,
+        images: list[bytes] | None = None,
+        client_name: str | None = None,
+        timeout: float = 60.0,
+    ) -> LLMResponse:
+        """实际 LLM 调用（已在 Semaphore 内）。"""
         # 轮询选择 primary: 当未指定 client 时，从同类 provider 池中 round-robin
         if client_name:
             primary = client_name

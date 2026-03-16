@@ -47,7 +47,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 
 async def _async_run(args: argparse.Namespace) -> None:
-    from .runner import BenchmarkRunner, DATASET_CONCURRENCY
+    from .runner import BenchmarkRunner, DATASET_CONCURRENCY, archive_cache, clear_cache
 
     data_root = Path(args.data_root) if args.data_root else None
     datasets = scan_datasets(data_root)
@@ -57,6 +57,16 @@ async def _async_run(args: argparse.Namespace) -> None:
     if not datasets:
         print("没有匹配的数据集")
         return
+
+    # --force 时自动归档旧缓存并清空
+    if args.force:
+        tag = args.tag or ""
+        archived = archive_cache(tag=tag)
+        if archived:
+            print(f"旧缓存已归档: {archived}")
+        removed = clear_cache()
+        if removed:
+            print(f"已清空 {removed} 个缓存文件")
 
     runner = BenchmarkRunner()
     ds_sem = asyncio.Semaphore(DATASET_CONCURRENCY)
@@ -75,7 +85,10 @@ async def _async_run(args: argparse.Namespace) -> None:
 def cmd_compare(args: argparse.Namespace) -> None:
     """对比 Pipeline 输出与参考 Excel。"""
     from .comparator import compare_dataset
-    from .report import print_comparison, print_summary, generate_markdown_report
+    from .report import (
+        print_comparison, print_summary, generate_markdown_report,
+        _print_page_class_distribution, _print_extra_by_class,
+    )
     from .runner import BenchmarkRunner
 
     data_root = Path(args.data_root) if args.data_root else None
@@ -85,6 +98,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
 
     runner = BenchmarkRunner()
     results = []
+    run_results = []
 
     for ds in datasets:
         load_dataset(ds)
@@ -95,13 +109,16 @@ def cmd_compare(args: argparse.Namespace) -> None:
 
         result = compare_dataset(ds, cached)
         results.append(result)
+        run_results.append(cached)
         print_comparison(result)
 
     if results:
         print_summary(results)
+        _print_page_class_distribution(run_results)
+        _print_extra_by_class(results)
 
         report_path = Path("data/benchmark_reports/report.md")
-        generate_markdown_report(results, report_path)
+        generate_markdown_report(results, report_path, run_results=run_results)
 
 
 def cmd_export(args: argparse.Namespace) -> None:
@@ -134,7 +151,10 @@ def cmd_full(args: argparse.Namespace) -> None:
 async def _async_full(args: argparse.Namespace) -> None:
     from .comparator import compare_dataset
     from .excel_exporter import export_dataset
-    from .report import print_comparison, print_summary, generate_markdown_report
+    from .report import (
+        print_comparison, print_summary, generate_markdown_report,
+        _print_page_class_distribution, _print_extra_by_class,
+    )
     from .runner import BenchmarkRunner, DATASET_CONCURRENCY
 
     data_root = Path(args.data_root) if args.data_root else None
@@ -146,8 +166,20 @@ async def _async_full(args: argparse.Namespace) -> None:
         print("没有匹配的数据集")
         return
 
+    # --force 时自动归档旧缓存并清空
+    if args.force:
+        from .runner import archive_cache, clear_cache
+        tag = args.tag if hasattr(args, 'tag') and args.tag else ""
+        archived = archive_cache(tag=tag)
+        if archived:
+            print(f"旧缓存已归档: {archived}")
+        removed = clear_cache()
+        if removed:
+            print(f"已清空 {removed} 个缓存文件")
+
     runner = BenchmarkRunner()
     results = []
+    run_results = []
     results_lock = asyncio.Lock()
     output_dir = Path(args.output or "data/benchmark_exports")
     ds_sem = asyncio.Semaphore(DATASET_CONCURRENCY)
@@ -166,6 +198,7 @@ async def _async_full(args: argparse.Namespace) -> None:
             result = compare_dataset(ds, run_result)
             async with results_lock:
                 results.append(result)
+                run_results.append(run_result)
             print_comparison(result)
 
             # 3. Export
@@ -177,11 +210,123 @@ async def _async_full(args: argparse.Namespace) -> None:
 
         if results:
             print_summary(results)
+            _print_page_class_distribution(run_results)
+            _print_extra_by_class(results)
             report_path = Path("data/benchmark_reports/report.md")
-            generate_markdown_report(results, report_path)
+            generate_markdown_report(results, report_path, run_results=run_results)
 
     finally:
         runner.shutdown()
+
+
+def cmd_history(args: argparse.Namespace) -> None:
+    """查看历史归档列表。"""
+    from .runner import list_history
+
+    dirs = list_history()
+    if not dirs:
+        print("暂无历史归档")
+        return
+
+    print(f"\n{'='*70}")
+    print(f"{'归档目录':<35} {'文件数':>6} {'大小(KB)':>10}")
+    print(f"{'-'*70}")
+    for d in dirs:
+        files = list(d.glob("*.json"))
+        size_kb = sum(f.stat().st_size for f in files) / 1024
+        print(f"{d.name:<35} {len(files):>6} {size_kb:>9.0f}")
+    print(f"{'='*70}\n")
+
+
+def cmd_compare_history(args: argparse.Namespace) -> None:
+    """对比当前缓存与历史归档的 P/R/F1 变化。"""
+    from .comparator import compare_dataset
+    from .runner import BenchmarkRunner, list_history, HISTORY_DIR
+
+    data_root = Path(args.data_root) if args.data_root else None
+    datasets = scan_datasets(data_root)
+    datasets = _filter_datasets(datasets, args.filter)
+    datasets = [ds for ds in datasets if ds.pdf_path and ds.excel_path]
+
+    # 确定历史目录
+    if args.archive:
+        hist_dir = HISTORY_DIR / args.archive
+    else:
+        dirs = list_history()
+        if not dirs:
+            print("暂无历史归档")
+            return
+        hist_dir = dirs[0]
+
+    if not hist_dir.exists():
+        print(f"归档不存在: {hist_dir}")
+        return
+
+    print(f"\n对比基准: {hist_dir.name}")
+
+    runner = BenchmarkRunner()
+
+    print(f"\n{'数据集':<25} {'旧P':>7} {'新P':>7} {'ΔP':>7} {'旧R':>7} {'新R':>7} {'ΔR':>7} {'旧F1':>7} {'新F1':>7} {'ΔF1':>7}")
+    print(f"{'-'*90}")
+
+    total_old_p = total_new_p = total_old_r = total_new_r = 0
+    count = 0
+
+    for ds in datasets:
+        load_dataset(ds)
+
+        # 当前结果
+        current = runner.load_cached(ds)
+        if not current:
+            continue
+
+        # 历史结果
+        safe_name = ds.name.replace("/", "_").replace(" ", "_")
+        hist_file = hist_dir / f"{safe_name}.json"
+        if not hist_file.exists():
+            continue
+
+        import json
+        old_data = json.loads(hist_file.read_text(encoding="utf-8"))
+
+        old_result = compare_dataset(ds, old_data)
+        new_result = compare_dataset(ds, current)
+
+        dp = new_result.precision - old_result.precision
+        dr = new_result.recall - old_result.recall
+        df1 = new_result.f1 - old_result.f1
+
+        # 颜色标记
+        dp_s = f"{dp:+.1%}"
+        dr_s = f"{dr:+.1%}"
+        df1_s = f"{df1:+.1%}"
+
+        print(
+            f"{ds.name[:25]:<25} {old_result.precision:>6.1%} {new_result.precision:>6.1%} {dp_s:>7} "
+            f"{old_result.recall:>6.1%} {new_result.recall:>6.1%} {dr_s:>7} "
+            f"{old_result.f1:>6.1%} {new_result.f1:>6.1%} {df1_s:>7}"
+        )
+
+        total_old_p += old_result.precision
+        total_new_p += new_result.precision
+        total_old_r += old_result.recall
+        total_new_r += new_result.recall
+        count += 1
+
+    if count:
+        print(f"{'-'*90}")
+        avg_old_p = total_old_p / count
+        avg_new_p = total_new_p / count
+        avg_old_r = total_old_r / count
+        avg_new_r = total_new_r / count
+        avg_old_f1 = 2*avg_old_p*avg_old_r/(avg_old_p+avg_old_r) if (avg_old_p+avg_old_r) else 0
+        avg_new_f1 = 2*avg_new_p*avg_new_r/(avg_new_p+avg_new_r) if (avg_new_p+avg_new_r) else 0
+        print(
+            f"{'平均':<25} {avg_old_p:>6.1%} {avg_new_p:>6.1%} {avg_new_p-avg_old_p:>+6.1%} "
+            f"{avg_old_r:>6.1%} {avg_new_r:>6.1%} {avg_new_r-avg_old_r:>+6.1%} "
+            f"{avg_old_f1:>6.1%} {avg_new_f1:>6.1%} {avg_new_f1-avg_old_f1:>+6.1%}"
+        )
+    print()
 
 
 def main():
@@ -203,7 +348,8 @@ def main():
     # run
     p_run = sub.add_parser("run", help="运行 Pipeline")
     p_run.add_argument("--filter", default=None, help="文件名模式")
-    p_run.add_argument("--force", action="store_true", help="强制重新运行（忽略缓存）")
+    p_run.add_argument("--force", action="store_true", help="强制重新运行（自动归档旧缓存并清空）")
+    p_run.add_argument("--tag", default="", help="归档标签 (如 'baseline', 'v2-scene-filter')")
 
     # compare
     p_cmp = sub.add_parser("compare", help="对比结果")
@@ -218,7 +364,16 @@ def main():
     p_full = sub.add_parser("full", help="全流程 (run + compare + export)")
     p_full.add_argument("--filter", default=None, help="文件名模式")
     p_full.add_argument("--force", action="store_true", help="强制重新运行")
+    p_full.add_argument("--tag", default="", help="归档标签")
     p_full.add_argument("--output", default=None, help="输出目录")
+
+    # history
+    p_hist = sub.add_parser("history", help="查看历史归档")
+
+    # compare-history
+    p_ch = sub.add_parser("compare-history", help="对比当前结果与历史归档")
+    p_ch.add_argument("archive", nargs="?", default=None, help="历史归档目录名 (默认最近一次)")
+    p_ch.add_argument("--filter", default=None, help="文件名模式")
 
     args = parser.parse_args()
 
@@ -228,6 +383,8 @@ def main():
         "compare": cmd_compare,
         "export": cmd_export,
         "full": cmd_full,
+        "history": cmd_history,
+        "compare-history": cmd_compare_history,
     }
     commands[args.command](args)
 

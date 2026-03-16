@@ -46,7 +46,9 @@ from pdf_sku.pipeline.extractor.sku_dedup import (
     run_dedup_chain, dedup_by_model, dedup_by_similarity,
     pre_filter, ocr_cross_validate,
 )
+from pdf_sku.pipeline.extractor.sku_scorer import score_and_filter
 from pdf_sku.pipeline.extractor.sku_reviewer import SKUReviewer
+from pdf_sku.pipeline.catalog_profiler import CatalogProfile
 from pdf_sku.pipeline.binder.binder import SKUImageBinder
 from pdf_sku.pipeline.exporter.exporter import SKUIdGenerator, SKUExporter
 from pdf_sku.pipeline.cross_page_merger import CrossPageMerger
@@ -161,6 +163,7 @@ class PageProcessor:
         file_hash: str = "",
         category: str | None = None,
         frozen_config_version: str | None = None,
+        catalog_profile: CatalogProfile | None = None,
     ) -> PageResult:
         """
         单页处理入口。
@@ -322,8 +325,32 @@ class PageProcessor:
             # ═══ Phase 6: SKU 提取 (策略路由) ═══
             if plan.slices and screenshots:
                 # 切片模式: 每片独立送 LLM，合并去重
-                skus = await self._extract_sliced(raw, plan, screenshots)
+                skus = await self._extract_sliced(raw, plan, screenshots,
+                                                     catalog_profile=catalog_profile)
                 extraction_method = "sliced_vision"
+
+                # 切片零结果回退: 回退到整页 single_stage 提取
+                if not skus and screenshot:
+                    logger.info("slice_zero_fallback", page=page_no,
+                                slices=len(plan.slices))
+                    skus = await self._single_stage.extract(
+                        raw, screenshot=screenshot,
+                        sku_count_hint=plan.expected_sku_range,
+                        scene_filter=plan.scene_filter,
+                        page_class=plan.page_class)
+                    extraction_method = "sliced_vision_fallback"
+
+                # 切片 + 整页均零结果，OCR 有内容 → OCR-guided 回退
+                if not skus and ocr_text_len > 30:
+                    logger.info("slice_ocr_fallback", page=page_no,
+                                ocr_chars=ocr_text_len)
+                    skus = await self._extract_skus(
+                        raw, page_type, screenshot, features,
+                        ocr_blocks, layout_regions, ocr_text_len,
+                        sku_count_hint=plan.expected_sku_range,
+                        scene_filter=plan.scene_filter, plan=plan)
+                    if skus:
+                        extraction_method = "ocr_guided"
             else:
                 # 整页模式: 原有三路策略
                 skus = await self._extract_skus(
@@ -354,6 +381,60 @@ class PageProcessor:
                     logger.info("rescue_pass_done",
                                 page=page_no, rescued=len(rescue_skus))
 
+            # ═══ Phase 6.35: MIXED_OTHER 切片回退 ═══
+            if (not skus
+                    and plan.page_class == "MIXED_OTHER"
+                    and effective_screenshot
+                    and fitz_meta.page_height > 0):
+                # 高 DPI 重渲 + 二等分 (减少切割产品风险)
+                slice_h = fitz_meta.page_height / 2
+                page_w = fitz_meta.page_width
+                slice_bboxes = [
+                    (0, i * slice_h, page_w, (i + 1) * slice_h)
+                    for i in range(2)
+                ]
+                slice_tasks = [
+                    loop.run_in_executor(
+                        None, render_slice, file_path, page_no, bbox, 300)
+                    for bbox in slice_bboxes
+                ]
+                slice_results = await asyncio.gather(
+                    *slice_tasks, return_exceptions=True)
+                for sr in slice_results:
+                    if isinstance(sr, Exception) or not sr:
+                        continue
+                    # 每片同时跑 Vision + OCR-guided 融合
+                    slice_skus = await self._extract_skus(
+                        raw, page_type, sr, features,
+                        ocr_blocks, layout_regions, ocr_text_len,
+                        sku_count_hint=(1, 10),
+                        scene_filter=plan.scene_filter, plan=plan)
+                    if slice_skus:
+                        skus.extend(slice_skus)
+                if skus:
+                    skus = dedup_by_model(skus)
+                    skus = dedup_by_similarity(skus)
+                    extraction_method = "mixed_other_sliced"
+                    logger.info("mixed_other_slice_rescue", page=page_no,
+                                found=len(skus))
+
+            # ═══ Phase 6.36: IMG_LABEL 零 SKU + OCR 回退 ═══
+            if (not skus
+                    and plan.page_class == IMG_LABEL
+                    and ocr_text_len > 50
+                    and effective_screenshot):
+                logger.info("img_label_ocr_fallback", page=page_no,
+                            ocr_chars=ocr_text_len)
+                skus = await self._extract_skus(
+                    raw, page_type, effective_screenshot, features,
+                    ocr_blocks, layout_regions, ocr_text_len,
+                    sku_count_hint=plan.expected_sku_range,
+                    scene_filter=plan.scene_filter, plan=plan)
+                if skus:
+                    extraction_method = "img_label_ocr_fallback"
+                    logger.info("img_label_ocr_fallback_done", page=page_no,
+                                found=len(skus))
+
             # ═══ Phase 6.4: 密集页补充提取 ═══
             if (page_type in ("B", "C") and ocr_text_len >= 500
                     and len(skus) < max(5, ocr_text_len // 200)
@@ -370,20 +451,22 @@ class PageProcessor:
                     logger.info("dense_page_retry_done", page=page_no,
                                 after=len(skus))
 
-            # ═══ Phase 6.5: 规则去重链 (含 OCR 交叉验证) ═══
+            # ═══ Phase 6.5: 综合打分 + 去重链 ═══
             if skus:
                 before = len(skus)
                 ocr_full_text = OcrEngine.blocks_to_text(ocr_blocks) if ocr_blocks else ""
 
                 # IMG_DENSE/IMG_LABEL + grid → 放宽去重（网格产品名称相似是正常的）
                 is_image_catalog = plan.page_class in (IMG_DENSE, IMG_LABEL) and fitz_meta.grid
-                if is_image_catalog:
-                    skus = pre_filter(skus)
-                    if ocr_full_text:
-                        skus = ocr_cross_validate(skus, ocr_full_text)
-                    skus = dedup_by_model(skus)
-                else:
-                    skus = run_dedup_chain(skus, ocr_text=ocr_full_text)
+
+                # 综合打分替代 pre_filter + ocr_cross_validate
+                skus = score_and_filter(skus, ocr_text=ocr_full_text,
+                                         catalog_profile=catalog_profile,
+                                         scene_filter=plan.scene_filter)
+                skus = dedup_by_model(skus)
+                if not is_image_catalog:
+                    skus = dedup_by_similarity(skus)
+
                 if len(skus) < before:
                     logger.info("dedup_chain_applied",
                                 page=page_no, before=before, after=len(skus))
@@ -394,17 +477,51 @@ class PageProcessor:
                     rescue_skus = await self._single_stage.extract_rescue(
                         raw, screenshot=effective_screenshot)
                     if rescue_skus:
-                        skus = run_dedup_chain(rescue_skus, ocr_text=ocr_full_text)
+                        skus = score_and_filter(rescue_skus, ocr_text=ocr_full_text,
+                                                 catalog_profile=catalog_profile,
+                                                 scene_filter=plan.scene_filter)
+                        skus = dedup_by_model(skus)
+                        if not is_image_catalog:
+                            skus = dedup_by_similarity(skus)
                         logger.info("post_filter_rescue_done",
                                     page=page_no, rescued=len(skus))
 
+            # ═══ Phase 6.55: Companion Rescue (配套产品补提取) ═══
+            # Companion SKU 经过 scorer 过滤后再加入
+            if (1 <= len(skus) <= 2
+                    and plan.page_class in (SINGLE_LARGE, SINGLE_TALL, IMG_LABEL,
+                                            "MULTI_SPARSE", IMG_DENSE)
+                    and effective_screenshot):
+                main_names = [s.attributes.get("product_name", "") for s in skus]
+                companion_skus = await self._single_stage.extract_companion(
+                    raw, screenshot=effective_screenshot, main_products=main_names)
+                if companion_skus:
+                    ocr_full_text_c = OcrEngine.blocks_to_text(ocr_blocks) if ocr_blocks else ""
+                    companion_skus = score_and_filter(
+                        companion_skus, ocr_text=ocr_full_text_c,
+                        catalog_profile=catalog_profile,
+                        scene_filter=plan.scene_filter)
+                    for cs in companion_skus:
+                        cs.extraction_method = "companion_rescue"
+                    skus.extend(companion_skus)
+                    logger.info("companion_rescue_done", page=page_no,
+                                found=len(companion_skus))
+
+            # ═══ Phase 6.58: 组合 SKU 合并 (reviewer 之前) ═══
+            if (catalog_profile and catalog_profile.is_combo_catalog
+                    and len(skus) >= 2):
+                skus = self._merge_combo_skus(skus, page_no)
+
             # ═══ Phase 6.6: SKUReviewer Pass 2 (B/C 类 + 有 SKU) ═══
-            # IMG_DENSE/IMG_LABEL+grid 是图片目录，无/少文字标注，Reviewer 会误判全部 discard → 跳过
+            # 仅 IMG_LABEL+grid 跳过（有文字标签，幻觉率低）
+            # IMG_DENSE 需要 Reviewer 过滤场景装饰物
             review_screenshot = screenshot or effective_screenshot
-            skip_review = plan.page_class in (IMG_DENSE, IMG_LABEL) and fitz_meta.grid
+            skip_review = plan.page_class == IMG_LABEL and fitz_meta.grid
             if page_type in ("B", "C") and skus and review_screenshot and not skip_review:
                 before_review = len(skus)
-                skus = await self._reviewer.review(skus, screenshot=review_screenshot)
+                skus = await self._reviewer.review(
+                    skus, screenshot=review_screenshot,
+                    scene_filter=plan.scene_filter)
                 if len(skus) < before_review:
                     logger.info("reviewer_applied",
                                 page=page_no, before=before_review, after=len(skus))
@@ -474,6 +591,7 @@ class PageProcessor:
         raw: ParsedPageIR,
         plan: PagePlan,
         screenshots: list[bytes],
+        catalog_profile: CatalogProfile | None = None,
     ) -> list[SKUResult]:
         """切片模式提取: 每片独立送 LLM，合并去重。"""
         tasks = []
@@ -489,7 +607,8 @@ class PageProcessor:
                 raw, screenshot=ss,
                 sku_count_hint=slice_range,
                 region_hint=hint,
-                scene_filter=plan.scene_filter))
+                scene_filter=plan.scene_filter,
+                page_class=plan.page_class))
 
         if not tasks:
             return []
@@ -503,8 +622,11 @@ class PageProcessor:
                 all_skus.extend(r)
 
         if all_skus:
-            # 跨切片去重 (重叠区域可能产生重复)
+            # 切片合并后: 综合打分 + 去重 (与整页模式对齐)
             before = len(all_skus)
+            all_skus = score_and_filter(all_skus, ocr_text="",
+                                          catalog_profile=catalog_profile,
+                                          scene_filter=plan.scene_filter)
             all_skus = dedup_by_model(all_skus)
             # IMG_DENSE/IMG_LABEL 页面产品名称高度相似，跳过 similarity 去重
             if plan.page_class not in (IMG_DENSE, IMG_LABEL):
@@ -542,7 +664,8 @@ class PageProcessor:
                 vision_skus = await self._single_stage.extract(
                     raw, screenshot=screenshot,
                     sku_count_hint=sku_count_hint,
-                    scene_filter=scene_filter)
+                    scene_filter=scene_filter,
+                    page_class=plan.page_class if plan else None)
                 if vision_skus:
                     table_skus.extend(vision_skus)
                     table_skus = dedup_by_model(table_skus)
@@ -563,7 +686,8 @@ class PageProcessor:
                 self._single_stage.extract(
                     raw, screenshot=screenshot,
                     sku_count_hint=sku_count_hint,
-                    scene_filter=scene_filter)))
+                    scene_filter=scene_filter,
+                    page_class=plan.page_class if plan else None)))
             task_labels.append("vision")
 
         if not tasks:
@@ -743,6 +867,48 @@ class PageProcessor:
                 img.data = buf.getvalue()
         except Exception as e:
             logger.warning("crop_composites_failed", error=str(e))
+
+    @staticmethod
+    def _merge_combo_skus(skus: list[SKUResult], page_no: int) -> list[SKUResult]:
+        """组合图册: 将同页多个 SKU 合并为一个组合 SKU。
+
+        选 confidence 最高的作为主产品，其他产品名称用 " + " 追加，
+        型号用 " / " 连接。
+        """
+        if len(skus) < 2:
+            return skus
+
+        # 按 confidence 降序
+        sorted_skus = sorted(skus, key=lambda s: s.confidence, reverse=True)
+        main = sorted_skus[0]
+        others = sorted_skus[1:]
+
+        # 合并产品名称
+        main_name = main.attributes.get("product_name", "")
+        other_names = [
+            s.attributes.get("product_name", "") for s in others
+            if s.attributes.get("product_name", "")
+        ]
+        if other_names:
+            combined_name = main_name + " + " + " + ".join(other_names)
+            main.attributes["product_name"] = combined_name
+
+        # 合并型号
+        main_model = main.attributes.get("model_number", "")
+        other_models = [
+            s.attributes.get("model_number", "") for s in others
+            if s.attributes.get("model_number", "")
+        ]
+        if other_models:
+            all_models = [main_model] + other_models if main_model else other_models
+            main.attributes["model_number"] = " / ".join(all_models)
+
+        main.extraction_method = "combo_merge"
+
+        logger.info("combo_merge", page=page_no,
+                     original=len(skus), merged_name=main.attributes.get("product_name", ""))
+
+        return [main]
 
     def clear_job_cache(self, job_id: str) -> None:
         self._xpage.clear_job(job_id)

@@ -28,6 +28,10 @@ REVIEW_PROMPT = """你是一个商品数据审核员。请对照 PDF 页面截�
 - 商品在截图中不存在（虚构/幻觉）
 - 实际是页面标题、分类标题、品牌介绍等非商品信息
 - 同一商品被重复提取（保留信息最完整的那条）
+- 实际是产品变体/规格描述（如"床垫尺寸"、"外径尺寸"、"常规款/宽屏款"），而非独立产品
+- 颜色/材质描述被误当作产品名称（如"高级灰"、"胡桃色"）
+- 品牌来源/参考文字（如"EDRA STANDARD BED"、"MINOTTI LAWRENCE BED"）— 这些是设计参考来源而非在售商品名称
+- 如果同一页面已有对应的中文产品名称（如"花瓣床"），英文品牌来源描述应丢弃
 
 应该保留 (keep) 的情况:
 - 页面上有文字标注名称/型号/价格的实际商品
@@ -52,6 +56,7 @@ class SKUReviewer:
         self,
         skus: list[SKUResult],
         screenshot: bytes | None = None,
+        scene_filter: bool = False,
     ) -> list[SKUResult]:
         """审核 SKU 列表，过滤幻觉并修正字段。"""
         if not skus or not self._llm or not screenshot:
@@ -71,6 +76,10 @@ class SKUReviewer:
 
         try:
             prompt = REVIEW_PROMPT.format(sku_json=json.dumps(sku_data, ensure_ascii=False, indent=2))
+            if scene_filter:
+                prompt += ("\n注意: 此页面为场景展示页。"
+                           "没有文字标注（名称/型号/价格）的物品应判定为 discard。"
+                           "仅保留有明确文字标签的商品。")
             resp = await self._llm._call_llm(
                 operation="sku_review",
                 prompt=prompt,
@@ -92,12 +101,15 @@ class SKUReviewer:
                                    original=len(skus),
                                    msg="Reviewer discarded all SKUs, keeping originals")
                     return skus
-                # 丢弃数 > 保留数 → 回退 (Reviewer 可能误判)
-                if discarded_count > len(reviewed):
+                # 场景页允许 Reviewer 丢弃更多（场景图册大多数是装饰品，应该丢弃）
+                # 非场景页: 丢弃数 > 保留数 → 回退
+                discard_ratio = 5 if scene_filter else 1
+                if discarded_count > len(reviewed) * discard_ratio:
                     logger.warning("sku_review_too_aggressive_fallback",
                                    original=len(skus), kept=len(reviewed),
                                    discarded=discarded_count,
-                                   msg="Reviewer discarded majority, keeping originals")
+                                   scene_filter=scene_filter,
+                                   msg="Reviewer discarded too many, keeping originals")
                     return skus
 
             return reviewed
@@ -125,12 +137,22 @@ class SKUReviewer:
         for i, sku in enumerate(skus):
             review = review_map.get(i)
             if review and review.get("action") == "discard":
-                discarded += 1
-                logger.debug("sku_discarded",
-                             index=i,
-                             name=sku.attributes.get("product_name", ""),
-                             reason=review.get("reason", ""))
-                continue
+                # Companion SKU 不因"重复"丢弃 — 它们是不同产品（如床头柜配套床）
+                reason = review.get("reason", "")
+                if (sku.extraction_method == "companion_rescue"
+                        and ("重复" in reason or "duplicate" in reason.lower()
+                             or "已有" in reason)):
+                    logger.info("companion_protected",
+                                index=i,
+                                name=sku.attributes.get("product_name", ""),
+                                reason=reason)
+                else:
+                    discarded += 1
+                    logger.debug("sku_discarded",
+                                 index=i,
+                                 name=sku.attributes.get("product_name", ""),
+                                 reason=reason)
+                    continue
 
             # 合并修正
             if review and review.get("corrected"):

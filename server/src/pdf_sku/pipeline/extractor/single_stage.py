@@ -34,6 +34,9 @@ SINGLE_STAGE_PROMPT = """从这个 PDF 页面中提取所有商品(SKU)信息。
 - 是否有小字体的型号/价格没有被提取？
 - 不要把营销文案、广告语、公司介绍、联系方式当作商品
 - 不要把表格列标题行、目录标题当作商品
+- 如果页面展示了一张床，检查床两侧是否有床头柜
+- 如果页面展示了沙发，检查旁边是否有边几/茶几
+- 配套家具（如床头柜、边几）是独立产品，必须单独提取
 
 仅返回 JSON 数组:
 [{{"product_name": "...", "model_number": "...", "price": "...", "specs": "...", "color": "...", "confidence": 0.8}}]"""
@@ -58,6 +61,24 @@ RESCUE_PROMPT = """这个 PDF 页面包含商品但之前提取不完整。请�
 [{{"product_name": "...", "model_number": "...", "price": "...", "specs": "...", "color": "...", "confidence": 0.7}}]"""
 
 
+COMPANION_PROMPT = """仔细观察这个 PDF 页面截图。页面上已经识别出以下主产品:
+{main_products}
+
+请检查页面中是否还有被遗漏的配套产品/小件家具，例如:
+- 床头柜（通常在床的两侧）
+- 边几/茶几（通常在沙发旁边）
+- 餐椅（通常在餐桌周围）
+- 脚凳/搁脚（通常在沙发前方）
+
+注意:
+- 只提取页面上实际可见的配套产品，不要虚构
+- 场景装饰物（灯、画、花瓶等）不算配套产品
+- 如果确实没有配套产品，返回空数组 []
+
+仅返回 JSON 数组:
+[{{"product_name": "...", "model_number": "...", "price": "...", "confidence": 0.6}}]"""
+
+
 class SingleStageExtractor:
     def __init__(self, llm_service=None):
         self._llm = llm_service
@@ -71,6 +92,7 @@ class SingleStageExtractor:
         sku_count_hint: tuple[int, int] | None = None,
         region_hint: str | None = None,
         scene_filter: bool = False,
+        page_class: str | None = None,
     ) -> list[SKUResult]:
         """单阶段提取: 一次 LLM 调用获取所有 SKU。
 
@@ -78,6 +100,7 @@ class SingleStageExtractor:
             sku_count_hint: 预估 SKU 数范围 (min, max)
             region_hint: 区域提示 (切片模式下标注第几片)
             scene_filter: 启用场景过滤 (大图覆盖页面时过滤场景展示图)
+            page_class: fitz 页面分类 (如 IMG_LABEL, IMG_DENSE 等)
         """
         if not self._llm:
             return self._rule_extract(raw)
@@ -99,10 +122,28 @@ class SingleStageExtractor:
             if region_hint:
                 prompt += f"\n\n## 区域上下文\n{region_hint}"
             if scene_filter:
-                prompt += ("\n\n## 场景过滤\n"
-                           "若图片为场景展示图（如样板间、展厅全景），"
-                           "只提取有明确标注（文字/价签/型号）的产品，"
-                           "忽略纯装饰背景中无标注的物品。")
+                prompt += ("\n\n## 场景过滤（严格执行）\n"
+                           "此页面可能包含样板间/展厅场景图。你必须严格区分「主营产品」和「场景装饰物」。\n\n"
+                           "### 只提取主营产品\n"
+                           "- 页面上有文字标注（名称/型号/价格）的产品\n"
+                           "- 目录的主营品类（如沙发、床、柜子等大件家具）\n\n"
+                           "### 必须忽略的场景装饰物（即使清晰可见也不要提取）\n"
+                           "吊灯、落地灯、台灯、壁灯、装饰画、挂画、"
+                           "绿植、盆栽、花瓶、地毯、地垫、抱枕、靠枕、窗帘、"
+                           "摆件、雕塑、烛台、相框、书本、杂志、花艺、干花、"
+                           "果盘、托盘、餐具、毛毯、枕头、床单\n\n"
+                           "### 判断标准\n"
+                           "- 没有文字标注 + 属于上述装饰物类别 → 不提取\n"
+                           "- 即使图片中能看到这些物品，如果没有产品标签/型号/价格，就是场景布置而非在售商品\n"
+                           "- 宁可少提取装饰物，也不要把场景布置当成商品")
+
+            if page_class == "IMG_LABEL":
+                prompt += ("\n\n## 产品标签页提取（重要）\n"
+                           "这是产品展示页，每页通常有 1-2 个主产品。\n"
+                           "优先读取页面上印刷的文字标签（产品名称、型号、规格、价格），"
+                           "这些文字通常出现在图片旁边、下方或上方。\n"
+                           "不要描述图片中家具的外观特征，而是找到并提取页面上印刷的文字信息。\n"
+                           "如果页面上有型号编号（如 XX-001、YY2023 等），务必提取到 model_number 字段。")
 
             resp = await self._llm._call_llm(
                 operation="extract_sku_single",
@@ -185,6 +226,52 @@ class SingleStageExtractor:
                 return results
         except Exception as e:
             logger.warning("rescue_extract_failed", error=str(e))
+        return []
+
+    async def extract_companion(
+        self,
+        raw: ParsedPageIR,
+        screenshot: bytes | None = None,
+        main_products: list[str] | None = None,
+    ) -> list[SKUResult]:
+        """配套产品专项提取。"""
+        if not self._llm or not screenshot or not main_products:
+            return []
+
+        try:
+            products_str = ", ".join(p for p in main_products if p)
+            prompt = COMPANION_PROMPT.format(main_products=products_str)
+            text_content = (raw.raw_text or "").strip()
+            if text_content:
+                if len(text_content) > 2000:
+                    text_content = text_content[:2000] + "..."
+                prompt += f"\n\n## 本页 OCR 文本\n{text_content}"
+
+            resp = await self._llm._call_llm(
+                operation="extract_sku_companion",
+                prompt=prompt,
+                images=[screenshot],
+            )
+
+            if not resp.text or not resp.text.strip():
+                return []
+
+            parsed = _parser.parse(resp.text, expected_type="array")
+            if parsed.success and isinstance(parsed.data, list):
+                results = []
+                for item in parsed.data:
+                    if isinstance(item, dict):
+                        attrs = {k: v for k, v in item.items()
+                                 if k not in ("confidence",)}
+                        results.append(SKUResult(
+                            attributes=attrs,
+                            validity="valid" if attrs.get("product_name") else "invalid",
+                            confidence=float(item.get("confidence", 0.5)),
+                            extraction_method="companion_rescue",
+                        ))
+                return results
+        except Exception as e:
+            logger.warning("companion_extract_failed", error=str(e))
         return []
 
     def _rule_extract(self, raw: ParsedPageIR) -> list[SKUResult]:

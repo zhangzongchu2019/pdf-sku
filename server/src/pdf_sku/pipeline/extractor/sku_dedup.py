@@ -39,6 +39,71 @@ _CN_DESC_MATERIALS = {"皮质", "布艺", "实木", "金属", "玻璃", "大理�
                        "不锈钢", "铝合金", "藤编", "编藤", "木质", "竹制", "陶瓷"}
 _CN_DESC_SHAPES = {"长方形", "圆形", "方形", "异形", "椭圆形", "三角形", "弧形", "L型"}
 
+# ── 场景装饰品黑名单 (无型号无价格 + 名称核心词命中 → 过滤) ──
+SCENE_PROPS: set[str] = {
+    "茶几", "边几", "边桌", "吊灯", "落地灯", "台灯", "壁灯", "地灯",
+    "装饰画", "挂画", "油画", "壁画", "绿植", "植物", "盆栽", "花瓶",
+    "地毯", "地垫", "抱枕", "靠枕", "靠垫", "窗帘", "窗纱",
+    "装饰摆件", "摆件", "雕塑", "烛台", "相框", "时钟", "数字时钟",
+    "书本", "书籍", "杂志", "手机", "遥控器", "音响", "智能音箱",
+    "花艺", "干花", "鲜花", "花束", "果盘", "托盘", "餐具",
+    "毛毯", "盖毯", "床单", "bed sheet", "bedsheet", "枕头",
+    # 建筑/固装元素
+    "窗户", "墙面", "墙面装饰板", "木地板", "地板", "floor", "flooring",
+    "天花板", "天花板装饰", "吊顶灯槽",
+    # 小家电/配件
+    "筒灯", "嵌入式筒灯", "嵌入式灯带", "闹钟", "被子", "毯子",
+    "充电器", "床头充电器", "小夜灯", "音箱",
+    "空调", "空气净化器", "纯色墙面", "艺术画", "相机",
+    "床头板",
+}
+
+# ── 场景软黑名单 (某些图册是正品，但场景渲染图中多为道具) ──
+# scene_filter=True 且无型号无价格时才过滤
+SCENE_SOFT_PROPS: set[str] = {
+    "床垫", "扶手椅", "脚凳", "架子", "茶具",
+    "床头靠背", "床头", "床尾凳",
+    "pendant light", "pillow", "床品", "bedding",
+}
+
+# 用于剥离产品名称中的颜色/材质修饰词，提取核心名词
+_STRIP_MODIFIERS_RE = re.compile(
+    r'(?:' + '|'.join(
+        list(_CN_DESC_COLORS) + list(_CN_DESC_MATERIALS) + list(_CN_DESC_SHAPES)
+    ) + r')',
+)
+
+
+def _strip_to_core(name: str) -> str:
+    """去掉颜色/材质/形状修饰词，返回核心名词。"""
+    core = _STRIP_MODIFIERS_RE.sub('', name).strip()
+    return core if core else name
+
+
+def _is_scene_prop(name: str) -> bool:
+    """检测产品名称核心词是否命中场景装饰品硬黑名单。"""
+    core = _strip_to_core(name)
+    if core in SCENE_PROPS:
+        return True
+    # 名称包含黑名单词且名称较短（避免误杀如"茶几柜"类合法产品名）
+    if len(name) <= 6:
+        for prop in SCENE_PROPS:
+            if prop in name:
+                return True
+    return False
+
+
+def _is_scene_soft_prop(name: str) -> bool:
+    """检测产品名称核心词是否命中场景软黑名单。"""
+    core = _strip_to_core(name)
+    if core in SCENE_SOFT_PROPS:
+        return True
+    if len(name) <= 6:
+        for prop in SCENE_SOFT_PROPS:
+            if prop in name:
+                return True
+    return False
+
 def _is_descriptive_chinese(name: str) -> bool:
     """检测是否是 LLM 生成的中文描述性名称 (如 '绿色皮质沙发')。
     特征: 颜色/材质/形状描述词 + 品类词，且无型号特征。
@@ -82,10 +147,11 @@ _PRICE_RE = re.compile(r'[\$¥€£￥]\s*[\d,.]+|[\d,.]+\s*元')
 _MODEL_RE = re.compile(r'[A-Za-z]{1,5}[-\s]?\d{3,}|[A-Z]{2,}\d+')
 
 
-def pre_filter(skus: list[SKUResult]) -> list[SKUResult]:
+def pre_filter(skus: list[SKUResult], *, scene_filter: bool = False) -> list[SKUResult]:
     """
     预过滤: 去空名 + 营销文案过滤。
     营销文案判定: 命中营销关键词 且 无型号 且 无价格。
+    scene_filter=True 时额外启用软黑名单过滤。
     """
     kept: list[SKUResult] = []
     removed = 0
@@ -106,7 +172,19 @@ def pre_filter(skus: list[SKUResult]) -> list[SKUResult]:
             kept.append(sku)
             continue
 
-        # 3) 错误标记检测: name 含 error/failed/timeout 等 → 过滤
+        # 3) 场景装饰品过滤: 无型号无价格 + 核心名词命中硬黑名单 → 过滤
+        if _is_scene_prop(name):
+            removed += 1
+            logger.debug("sku_scene_prop_filtered", name=name[:60])
+            continue
+
+        # 3b) 场景软黑名单: scene_filter=True 时，无型号无价格 + 命中 → 过滤
+        if scene_filter and _is_scene_soft_prop(name):
+            removed += 1
+            logger.debug("sku_scene_soft_prop_filtered", name=name[:60])
+            continue
+
+        # 4) 错误标记检测: name 含 error/failed/timeout 等 → 过滤
         name_lower = name.lower()
         if any(kw in name_lower for kw in ERROR_MARKER_KEYWORDS):
             removed += 1
@@ -147,6 +225,13 @@ def pre_filter(skus: list[SKUResult]) -> list[SKUResult]:
         if len(name) <= 1:
             removed += 1
             logger.debug("sku_short_name_filtered", name=name)
+            continue
+
+        # 8) 弱信号过滤: 无型号+无价格+短名称(≤3字)+低confidence → 图片描述
+        if len(name) <= 3 and sku.confidence < 0.7:
+            removed += 1
+            logger.debug("sku_weak_signal_filtered", name=name,
+                         confidence=sku.confidence)
             continue
 
         # 没命中关键词，保留
@@ -321,9 +406,9 @@ def ocr_cross_validate(
     return kept
 
 
-def run_dedup_chain(skus: list[SKUResult], ocr_text: str = "") -> list[SKUResult]:
+def run_dedup_chain(skus: list[SKUResult], ocr_text: str = "", *, scene_filter: bool = False) -> list[SKUResult]:
     """完整去重链: pre_filter → ocr_cross_validate → dedup_by_model → dedup_by_similarity。"""
-    skus = pre_filter(skus)
+    skus = pre_filter(skus, scene_filter=scene_filter)
     if ocr_text:
         skus = ocr_cross_validate(skus, ocr_text)
     skus = dedup_by_model(skus)

@@ -1,7 +1,9 @@
 """终端表格 + Markdown 报告生成。"""
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from pathlib import Path
+from typing import Any
 
 from .models import ComparisonResult
 
@@ -83,9 +85,67 @@ def print_summary(results: list[ComparisonResult]) -> None:
     print(f"{'='*90}\n")
 
 
+def _print_page_class_distribution(run_results: list[dict]) -> None:
+    """打印所有数据集的 fitz_page_class 分布。"""
+    class_counter: Counter = Counter()
+    class_sku_counter: Counter = Counter()
+    method_counter: Counter = Counter()
+
+    for run_result in run_results:
+        for page in run_result.get("pages", []):
+            cls = page.get("fitz_page_class") or page.get("page_type", "?")
+            sku_count = len(page.get("skus", []))
+            class_counter[cls] += 1
+            class_sku_counter[cls] += sku_count
+            method = page.get("extraction_method") or "none"
+            method_counter[method] += 1
+
+    total_pages = sum(class_counter.values())
+    total_skus = sum(class_sku_counter.values())
+
+    if not total_pages:
+        return
+
+    print(f"\n{'='*70}")
+    print("页面分类分布 (fitz_page_class)")
+    print(f"{'='*70}")
+    print(f"{'分类':<16} {'页数':>6} {'占比':>8} {'SKU数':>8} {'SKU/页':>8}")
+    print(f"{'-'*70}")
+    for cls, cnt in class_counter.most_common():
+        sku_cnt = class_sku_counter[cls]
+        avg = sku_cnt / cnt if cnt else 0
+        print(f"{cls:<16} {cnt:>6} {cnt/total_pages:>7.1%} {sku_cnt:>8} {avg:>7.1f}")
+    print(f"{'-'*70}")
+    print(f"{'总计':<16} {total_pages:>6} {'100%':>8} {total_skus:>8}")
+
+    print(f"\n{'提取方法':<20} {'页数':>6} {'占比':>8}")
+    print(f"{'-'*40}")
+    for m, cnt in method_counter.most_common():
+        print(f"{m:<20} {cnt:>6} {cnt/total_pages:>7.1%}")
+    print(f"{'='*70}\n")
+
+
+def _print_extra_by_class(results: list[ComparisonResult]) -> None:
+    """按 fitz_page_class 分组统计多余 SKU，定位 Precision 问题来源。"""
+    class_extra: Counter = Counter()
+    for r in results:
+        for s in r.extra_skus:
+            cls = s.get("_fitz_page_class") or "?"
+            class_extra[cls] += 1
+
+    if not class_extra:
+        return
+
+    total = sum(class_extra.values())
+    print(f"\n多余 SKU 按页面分类分布 (共 {total} 个 false positive):")
+    for cls, cnt in class_extra.most_common():
+        print(f"  {cls:<16} {cnt:>5} ({cnt/total:.1%})")
+
+
 def generate_markdown_report(
     results: list[ComparisonResult],
     output_path: Path,
+    run_results: list[dict] | None = None,
 ) -> None:
     """生成 Markdown 报告文件。"""
     lines = ["# Benchmark 对比报告\n"]
@@ -94,12 +154,56 @@ def generate_markdown_report(
     lines.append("## 汇总\n")
     lines.append("| 数据集 | 期望 | 实际 | 匹配 | Precision | Recall | F1 | 字段匹配率 |")
     lines.append("|--------|------|------|------|-----------|--------|-----|-----------|")
+    total_exp = total_act = total_match = 0
     for r in results:
+        total_exp += r.expected_count
+        total_act += r.actual_count
+        total_match += r.matched_count
         lines.append(
             f"| {r.dataset_name} | {r.expected_count} | {r.actual_count} | "
             f"{r.matched_count} | {r.precision:.1%} | {r.recall:.1%} | "
             f"{r.f1:.1%} | {r.field_exact_match_rate:.1%} |"
         )
+    if total_exp > 0:
+        macro_p = total_match / total_act if total_act else 0
+        macro_r = total_match / total_exp
+        macro_f1 = 2 * macro_p * macro_r / (macro_p + macro_r) if (macro_p + macro_r) else 0
+        lines.append(
+            f"| **总计** | **{total_exp}** | **{total_act}** | "
+            f"**{total_match}** | **{macro_p:.1%}** | **{macro_r:.1%}** | "
+            f"**{macro_f1:.1%}** | |"
+        )
+
+    # 页面分类分布
+    if run_results:
+        lines.append("\n## 页面分类分布\n")
+        class_counter: Counter = Counter()
+        class_sku_counter: Counter = Counter()
+        for rr in run_results:
+            for page in rr.get("pages", []):
+                cls = page.get("fitz_page_class") or page.get("page_type", "?")
+                class_counter[cls] += 1
+                class_sku_counter[cls] += len(page.get("skus", []))
+        lines.append("| 分类 | 页数 | 占比 | SKU数 | SKU/页 |")
+        lines.append("|------|------|------|-------|--------|")
+        tp = sum(class_counter.values())
+        for cls, cnt in class_counter.most_common():
+            sc = class_sku_counter[cls]
+            lines.append(f"| {cls} | {cnt} | {cnt/tp:.1%} | {sc} | {sc/cnt:.1f} |")
+
+    # 多余 SKU 按分类分布
+    class_extra: Counter = Counter()
+    for r in results:
+        for s in r.extra_skus:
+            cls = s.get("_fitz_page_class") or "?"
+            class_extra[cls] += 1
+    if class_extra:
+        total_extra = sum(class_extra.values())
+        lines.append("\n## 多余 SKU 来源分析\n")
+        lines.append("| 页面分类 | 多余数 | 占比 |")
+        lines.append("|----------|--------|------|")
+        for cls, cnt in class_extra.most_common():
+            lines.append(f"| {cls} | {cnt} | {cnt/total_extra:.1%} |")
 
     # 详细 diff
     lines.append("\n## 详细差异\n")
