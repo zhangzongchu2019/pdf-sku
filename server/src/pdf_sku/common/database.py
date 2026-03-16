@@ -10,6 +10,7 @@ def init_db(db_url, pool_size=10, max_overflow=20, echo=False):
     global engine, async_session_factory
     engine = create_async_engine(
         db_url, pool_size=pool_size, max_overflow=max_overflow, echo=echo,
+        pool_pre_ping=True, pool_recycle=300,
     )
     async_session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     return engine, async_session_factory

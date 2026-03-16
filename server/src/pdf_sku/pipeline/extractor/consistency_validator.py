@@ -99,22 +99,44 @@ class ConsistencyValidator:
     ) -> list[SKUResult]:
         """
         [C6] 强制 SKU validity: valid/invalid (无 partial)。
-        strict 模式: 至少两个核心属性 (name/model/size/price 中任意两个)
-        relaxed 模式 (纯图页 text_block_count <= 10): 任何属性非空即可
+
+        有效 SKU 的最低要求（任意模式）：
+        - 有 model_number（型号单独即可标识商品），OR
+        - product_name + 至少一个其他属性 (size/price/color/material/weight/description)
+
+        仅有 product_name、其他字段全空 → invalid（品牌名/营销语/标题不构成 SKU）。
+
+        strict 模式（有文字结构的页面）：至少两个核心属性 (name/model/size/price)。
+        relaxed 模式（纯图页 text_block_count <= 10）：model 单独 valid，
+            或 product_name + 至少一个其他属性 valid。
         """
+        import re as _re_val
+        _chinese_re_val = _re_val.compile(r'[\u4e00-\u9fff]')
+
         mode = (profile or {}).get("sku_validity_mode", "strict")
         is_image_only = text_block_count is not None and text_block_count <= 10
         for sku in skus:
             attrs = sku.attributes
+            has_name = bool(attrs.get("product_name"))
+            has_model = bool(attrs.get("model_number"))
+            has_size = bool(attrs.get("size"))
+            has_price = bool(attrs.get("price"))
+            has_other = bool(
+                attrs.get("color") or attrs.get("material") or
+                attrs.get("weight") or attrs.get("description")
+            )
+
             if mode == "strict" and not is_image_only:
-                has_name = bool(attrs.get("product_name"))
-                has_model = bool(attrs.get("model_number"))
-                has_size = bool(attrs.get("size"))
-                has_price = bool(attrs.get("price"))
                 # 至少两个核心属性: name/model/size/price 中任意两个
                 core_count = sum([has_name, has_model, has_size, has_price])
                 sku.validity = "valid" if core_count >= 2 else "invalid"
             else:
-                # relaxed: 任何属性非空即 valid
-                sku.validity = "valid" if any(attrs.values()) else "invalid"
+                # relaxed (纯图页): model 单独即 valid；否则 name + 至少一个其他属性
+                # 单独 product_name（品牌名/广告语/标题）不构成有效 SKU
+                if has_model:
+                    sku.validity = "valid"
+                elif has_name and (has_size or has_price or has_other):
+                    sku.validity = "valid"
+                else:
+                    sku.validity = "invalid"
         return skus

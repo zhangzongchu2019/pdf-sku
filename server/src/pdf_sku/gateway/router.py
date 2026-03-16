@@ -556,6 +556,80 @@ async def reprocess_single_page(
     }
 
 
+@router.post("/ops/jobs/{job_id}/reprocess-pages-without-subimages")
+async def reprocess_pages_without_subimages(job_id: uuid.UUID, db: DBSession, request: Request):
+    """批量重处理：对指定 job 中所有只有全页图（无 product_main/product_detail 子图）的页面重新运行 AI。"""
+    result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise JobNotFoundError(f"Job {job_id} not found")
+
+    # 找出所有没有子图的页面：
+    # 1. 有全页图（role=unknown）但没有 product_main/product_detail 的页面
+    # 2. PENDING 且完全没有图片的页面（batch task 被中断后遗留的状态）
+    subimg_pages_q = await db.execute(
+        select(Image.page_number).distinct()
+        .where(Image.job_id == job_id, Image.role.in_(["product_main", "product_detail"]))
+    )
+    subimg_pages = {row[0] for row in subimg_pages_q.fetchall()}
+
+    all_img_pages_q = await db.execute(
+        select(Image.page_number).distinct().where(Image.job_id == job_id)
+    )
+    has_any_image = {row[0] for row in all_img_pages_q.fetchall()}
+
+    # 有图但无子图的页面
+    has_img_no_subimg = has_any_image - subimg_pages
+
+    # PENDING 且没有任何图片的页面（之前 batch task 被 server reload 中断遗留）
+    all_pages_q = await db.execute(
+        select(Page.page_number).where(Page.job_id == job_id, Page.status == "PENDING")
+    )
+    pending_no_img = {row[0] for row in all_pages_q.fetchall()} - has_any_image
+
+    no_subimg_pages = sorted(has_img_no_subimg | pending_no_img)
+
+    # 清理这些页面的旧数据
+    for page_number in no_subimg_pages:
+        old_skus = (await db.execute(
+            select(SKU.sku_id).where(SKU.job_id == job_id, SKU.page_number == page_number)
+        )).scalars().all()
+        if old_skus:
+            await db.execute(delete(SKUImageBinding).where(
+                SKUImageBinding.job_id == job_id,
+                SKUImageBinding.sku_id.in_(old_skus),
+            ))
+        await db.execute(delete(SKU).where(SKU.job_id == job_id, SKU.page_number == page_number))
+        await db.execute(delete(Image).where(Image.job_id == job_id, Image.page_number == page_number))
+        await db.execute(
+            update(Page).where(Page.job_id == job_id, Page.page_number == page_number)
+            .values(status="PENDING", needs_review=False, sku_count=0)
+        )
+    await db.commit()
+
+    # 后台异步处理（并发=3，避免 Gemini rate limit）
+    orchestrator = request.app.state.orchestrator
+    file_path = orchestrator._resolve_file_path(job)
+
+    async def _process_all():
+        sem = asyncio.Semaphore(3)
+        async def _one(pg):
+            async with sem:
+                async with orchestrator._db_factory() as page_db:
+                    res = await orchestrator._process_single_page(page_db, job, pg, file_path)
+                    await orchestrator._on_page_done(page_db, job, pg, res)
+                    await page_db.commit()
+        await asyncio.gather(*[_one(pg) for pg in no_subimg_pages], return_exceptions=True)
+
+    asyncio.create_task(_process_all())
+
+    return {
+        "job_id": str(job_id),
+        "pages_queued": len(no_subimg_pages),
+        "pages": no_subimg_pages,
+    }
+
+
 @router.post("/ops/jobs/{job_id}/force-finalize")
 async def force_finalize_job(job_id: uuid.UUID, db: DBSession, request: Request):
     """

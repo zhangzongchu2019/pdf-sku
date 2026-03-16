@@ -61,14 +61,34 @@ async def call_ocr_on_image(
     }
 
     async with httpx.AsyncClient(timeout=_timeout) as client:
-        # 1. 提交任务
-        resp = await client.post(
-            settings.ocr_job_url,
-            headers=headers,
-            data=payload,
-            files={"file": (filename, image_bytes, content_type)},
-        )
-        resp.raise_for_status()
+        # 1. 提交任务（500 等服务端错误用指数退避重试，最多 3 次）
+        _submit_delays = [5, 15, 30]
+        resp = None
+        for _attempt, _delay in enumerate(_submit_delays, 1):
+            try:
+                resp = await client.post(
+                    settings.ocr_job_url,
+                    headers=headers,
+                    data=payload,
+                    files={"file": (filename, image_bytes, content_type)},
+                )
+                if resp.status_code < 500:
+                    break
+                logger.warning("ocr_submit_server_error",
+                               attempt=_attempt, status=resp.status_code,
+                               retry_in=_delay)
+            except (httpx.TimeoutException, httpx.ConnectError) as _e:
+                logger.warning("ocr_submit_network_error",
+                               attempt=_attempt, error=str(_e), retry_in=_delay)
+                resp = None
+            if _attempt < len(_submit_delays):
+                await asyncio.sleep(_delay)
+
+        if resp is None or resp.status_code >= 400:
+            status = resp.status_code if resp is not None else "no_response"
+            logger.warning("ocr_submit_failed_after_retries", status=status)
+            return None
+
         job_id = resp.json()["data"]["jobId"]
         logger.info("ocr_job_submitted", job_id=job_id)
 
