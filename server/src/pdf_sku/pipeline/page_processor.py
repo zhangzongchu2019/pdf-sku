@@ -507,11 +507,6 @@ class PageProcessor:
                     logger.info("companion_rescue_done", page=page_no,
                                 found=len(companion_skus))
 
-            # ═══ Phase 6.58: 组合 SKU 合并 (reviewer 之前) ═══
-            if (catalog_profile and catalog_profile.is_combo_catalog
-                    and len(skus) >= 2):
-                skus = self._merge_combo_skus(skus, page_no)
-
             # ═══ Phase 6.6: SKUReviewer Pass 2 (B/C 类 + 有 SKU) ═══
             # 仅 IMG_LABEL+grid 跳过（有文字标签，幻觉率低）
             # IMG_DENSE 需要 Reviewer 过滤场景装饰物

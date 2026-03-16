@@ -264,13 +264,14 @@ class BenchmarkRunner:
         # 按页码排序
         pages = [results[p] for p in sorted(results.keys())]
 
-        # ═══ 跨页去重 ═══
+        # ═══ 跨页去重 (组合图册跳过: 每页=独立产品组合) ═══
         all_skus_flat: list[tuple[int, int, dict]] = []  # (page_idx, sku_idx, sku_dict)
         for pi, page in enumerate(pages):
             for si, sku in enumerate(page.get("skus", [])):
                 all_skus_flat.append((pi, si, sku))
 
-        if len(all_skus_flat) > 1:
+        is_combo = catalog_profile and catalog_profile.is_combo_catalog
+        if len(all_skus_flat) > 1 and not is_combo:
             # 转换为 SKUResult 进行去重
             sku_results = [
                 SKUResult(
@@ -297,6 +298,29 @@ class BenchmarkRunner:
                         if (pi, si) not in remove_set
                     ]
                     page["sku_count"] = len(page["skus"])
+
+        # ═══ 组合图册: 颜色感知去重 (同型号+同颜色才合并) ═══
+        if is_combo and len(all_skus_flat) > 1:
+            seen: set[str] = set()
+            remove_set: set[tuple[int, int]] = set()
+            for pi, page in enumerate(pages):
+                new_skus = []
+                for si, sku in enumerate(page.get("skus", [])):
+                    attrs = sku.get("attributes", {})
+                    model = (attrs.get("model_number") or "").strip().upper()
+                    color = (attrs.get("color") or "").strip()
+                    key = f"{model}||{color}" if model else ""
+                    if key and key in seen:
+                        continue
+                    if key:
+                        seen.add(key)
+                    new_skus.append(sku)
+                page["skus"] = new_skus
+                page["sku_count"] = len(new_skus)
+            deduped_total = sum(len(p.get("skus", [])) for p in pages)
+            if deduped_total < len(all_skus_flat):
+                logger.info("combo_color_dedup_done",
+                            before=len(all_skus_flat), after=deduped_total)
 
         total_skus = sum(len(p.get("skus", [])) for p in pages)
 

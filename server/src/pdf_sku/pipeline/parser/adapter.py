@@ -58,7 +58,7 @@ class PDFExtractor:
             images = self._plumber_images(page, path, page_no)
             area = max(1.0, float(page.width) * float(page.height))
 
-        return ParsedPageIR(
+        result = ParsedPageIR(
             page_no=page_no,
             text_blocks=text_blocks,
             tables=tables,
@@ -68,6 +68,10 @@ class PDFExtractor:
             reading_order=list(range(len(text_blocks))),
             text_coverage=len(raw_text) / area,
         )
+
+        # 用 fitz 补充图片 binary data (pdfplumber 只有 bbox)
+        self._fill_image_data_fitz(result, path)
+        return result
 
     def _extract_pymupdf(self, path: str, page_no: int) -> ParsedPageIR:
         import fitz
@@ -100,7 +104,12 @@ class PDFExtractor:
                 xref = img_info[0]
                 try:
                     pix = fitz.Pixmap(doc, xref)
-                    img_data = pix.tobytes("png") if pix.n < 5 else b""
+                    # CMYK/其他色彩空间 → 转 RGB
+                    if pix.n > 3 and pix.alpha == 0:
+                        pix = fitz.Pixmap(fitz.csRGB, pix)
+                    elif pix.n > 4:
+                        pix = fitz.Pixmap(fitz.csRGB, pix)
+                    img_data = pix.tobytes("png")
                     short_edge = min(pix.width, pix.height)
                     img_hash = hashlib.md5(img_data[:1024]).hexdigest()[:12] if img_data else ""
                     images.append(ImageInfo(
@@ -131,7 +140,7 @@ class PDFExtractor:
             doc.close()
 
     def _extract_pymupdf_ocr(self, path: str, page_no: int) -> ParsedPageIR:
-        """最后兜底: 用 PyMuPDF 渲染后提取文字。"""
+        """最后兜底: 用 PyMuPDF 渲染后提取文字 + 图片。"""
         import fitz
         doc = fitz.open(path)
         try:
@@ -139,13 +148,89 @@ class PDFExtractor:
             raw_text = page.get_text("text") or ""
             rect = page.rect
             area = max(1.0, rect.width * rect.height)
+
+            # 提取图片
+            images: list[ImageInfo] = []
+            for i, img_info in enumerate(page.get_images(full=True)):
+                xref = img_info[0]
+                try:
+                    pix = fitz.Pixmap(doc, xref)
+                    if pix.n > 3 and pix.alpha == 0:
+                        pix = fitz.Pixmap(fitz.csRGB, pix)
+                    elif pix.n > 4:
+                        pix = fitz.Pixmap(fitz.csRGB, pix)
+                    img_data = pix.tobytes("png")
+                    short_edge = min(pix.width, pix.height)
+                    img_hash = hashlib.md5(img_data[:2048]).hexdigest()[:12] if img_data else ""
+                    images.append(ImageInfo(
+                        image_id=f"p{page_no}_img{i}",
+                        data=img_data,
+                        width=pix.width,
+                        height=pix.height,
+                        short_edge=short_edge,
+                        image_hash=img_hash,
+                        search_eligible=short_edge >= 200,
+                    ))
+                except Exception:
+                    pass
+
             return ParsedPageIR(
                 page_no=page_no,
                 text_blocks=[TextBlock(content=raw_text, bbox=(0, 0, rect.width, rect.height))],
+                images=images,
                 raw_text=raw_text,
                 metadata=PageMetadata(page_width=rect.width, page_height=rect.height),
                 text_coverage=len(raw_text) / area,
             )
+        finally:
+            doc.close()
+
+    @staticmethod
+    def _fill_image_data_fitz(result: ParsedPageIR, path: str) -> None:
+        """用 fitz 提取图片 binary data，按 bbox 匹配到 pdfplumber images。"""
+        import fitz
+
+        try:
+            doc = fitz.open(path)
+        except Exception:
+            return
+        try:
+            page = doc[result.page_no - 1]
+            fitz_images = page.get_images(full=True)
+            if not fitz_images:
+                return
+
+            # 提取 fitz 图片 data 列表
+            fitz_data: list[tuple[bytes, int, int]] = []  # (data, w, h)
+            for img_info in fitz_images:
+                xref = img_info[0]
+                try:
+                    pix = fitz.Pixmap(doc, xref)
+                    # CMYK/其他色彩空间 → 转 RGB
+                    if pix.n > 3 and pix.alpha == 0:
+                        pix = fitz.Pixmap(fitz.csRGB, pix)
+                    elif pix.n > 4:
+                        pix = fitz.Pixmap(fitz.csRGB, pix)
+                    img_bytes = pix.tobytes("png")
+                    fitz_data.append((img_bytes, pix.width, pix.height))
+                except Exception:
+                    fitz_data.append((b"", 0, 0))
+
+            # 按索引顺序匹配 (pdfplumber 和 fitz 图片顺序通常一致)
+            for i, img in enumerate(result.images):
+                if img.data:
+                    continue  # 已有数据
+                if i < len(fitz_data):
+                    data, w, h = fitz_data[i]
+                    if data:
+                        img.data = data
+                        if not img.width:
+                            img.width = w
+                        if not img.height:
+                            img.height = h
+                        img.image_hash = hashlib.md5(data[:2048]).hexdigest()[:12]
+        except Exception as e:
+            logger.debug("fill_image_data_fitz_failed", error=str(e))
         finally:
             doc.close()
 
