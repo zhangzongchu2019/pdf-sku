@@ -24,6 +24,20 @@ logger = structlog.get_logger()
 EVAL_BATCH_SIZE = 3
 
 
+def _safe_float(value: object, default: float = 0.5) -> float:
+    """Convert loosely-typed LLM score fields to float with a neutral fallback."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class LLMService:
     """
     LLM 统一调用服务。所有 LLM 调用都通过此入口。
@@ -102,13 +116,13 @@ class LLMService:
                 if isinstance(score_data, dict):
                     ps = PageScore(
                         page_no=page_no,
-                        overall=float(score_data.get("overall", 0.5)),
+                        overall=_safe_float(score_data.get("overall"), 0.5),
                         dimensions={
-                            "text_clarity": float(score_data.get("text_clarity", 0.5)),
-                            "image_quality": float(score_data.get("image_quality", 0.5)),
-                            "layout_structure": float(score_data.get("layout_structure", 0.5)),
-                            "table_regularity": float(score_data.get("table_regularity", 0.5)),
-                            "sku_density": float(score_data.get("sku_density", 0.5)),
+                            "text_clarity": _safe_float(score_data.get("text_clarity"), 0.5),
+                            "image_quality": _safe_float(score_data.get("image_quality"), 0.5),
+                            "layout_structure": _safe_float(score_data.get("layout_structure"), 0.5),
+                            "table_regularity": _safe_float(score_data.get("table_regularity"), 0.5),
+                            "sku_density": _safe_float(score_data.get("sku_density"), 0.5),
                         },
                         raw_response=str(score_data),
                     )
