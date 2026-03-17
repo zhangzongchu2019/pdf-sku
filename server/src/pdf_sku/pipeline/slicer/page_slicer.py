@@ -76,18 +76,32 @@ def _slice_single_large(meta: FitzPageMeta) -> list[tuple] | None:
     """SINGLE_LARGE: 将页面分为 2-4 块，每块不超过 MAX_SLICE_W x MAX_SLICE_H。
 
     利用图片 bbox 找安全切割线（不穿过图片）。
+    注意: 页面可能因嵌入高分辨率图片而被分类为 SINGLE_LARGE，
+    即使 PDF 页面尺寸 < MAX_SLICE_W/H，仍应切片以获得足够像素密度。
     """
     pw, ph = meta.page_width, meta.page_height
     if pw <= 0 or ph <= 0:
         return None
 
-    # 计算需要的行列数
-    cols = max(1, int(pw / MAX_SLICE_W + 0.5))
-    rows = max(1, int(ph / MAX_SLICE_H + 0.5))
+    # 考虑原生图片分辨率: 高分辨率嵌入图需要更多切片
+    eff_w, eff_h = pw, ph
+    if meta.image_native_sizes:
+        for nw, nh in meta.image_native_sizes:
+            eff_w = max(eff_w, nw)
+            eff_h = max(eff_h, nh)
 
-    # 只有 1x1 不需要切片
+    # 计算需要的行列数 (基于有效尺寸)
+    cols = max(1, int(eff_w / MAX_SLICE_W + 0.5))
+    rows = max(1, int(eff_h / MAX_SLICE_H + 0.5))
+
+    # 已被分类为 SINGLE_LARGE → 保证至少 2 片
+    # (分类可能基于 native_dim > 1500 而非 page pt)
     if rows <= 1 and cols <= 1:
-        return None
+        # 按长边切 2 片
+        if pw >= ph:
+            cols = 2
+        else:
+            rows = 2
 
     # 限制最大切片数
     cols = min(cols, 3)
@@ -110,12 +124,22 @@ def _slice_single_large(meta: FitzPageMeta) -> list[tuple] | None:
 
 
 def _slice_single_tall(meta: FitzPageMeta) -> list[tuple] | None:
-    """SINGLE_TALL: 纵向等分，每片高度 ~TALL_SLICE_H，片间重叠 TALL_OVERLAP。"""
-    pw, ph = meta.page_width, meta.page_height
-    if ph <= TALL_SLICE_H * 1.5:
-        return None  # 不够长，不切
+    """SINGLE_TALL: 纵向等分，每片高度 ~TALL_SLICE_H，片间重叠 TALL_OVERLAP。
 
-    n_slices = max(2, int(ph / TALL_SLICE_H + 0.5))
+    注意: 页面可能因嵌入高分辨率图片 (native_dim > 3000) 而被分类为 SINGLE_TALL，
+    即使 PDF 页面高度 < 1500pt，仍应至少切 2 片。
+    """
+    pw, ph = meta.page_width, meta.page_height
+    if ph <= 0:
+        return None
+
+    # 考虑原生图片分辨率
+    eff_h = ph
+    if meta.image_native_sizes:
+        for _nw, nh in meta.image_native_sizes:
+            eff_h = max(eff_h, nh)
+
+    n_slices = max(2, int(eff_h / TALL_SLICE_H + 0.5))
 
     # 收集禁切区间
     forbidden_y = _get_forbidden_intervals(meta.image_bboxes, axis="y")
@@ -151,11 +175,8 @@ def _slice_img_dense(meta: FitzPageMeta) -> list[tuple] | None:
 
         return slices if len(slices) > 1 else None
 
-    # 无网格: 按高度等分 (每片 ~1000pt)
-    if ph > TALL_SLICE_H * 1.5:
-        return _slice_single_tall(meta)
-
-    return None
+    # 无网格: 按高度等分 (至少 2 片)
+    return _slice_single_tall(meta)
 
 
 def _get_forbidden_intervals(

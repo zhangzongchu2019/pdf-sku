@@ -16,7 +16,9 @@ import structlog
 
 from pdf_sku.pipeline.ir import PageResult, SKUResult, ImageInfo, BindingResult
 from pdf_sku.pipeline.page_processor import PageProcessor
-from pdf_sku.pipeline.extractor.sku_dedup import cross_page_dedup
+from pdf_sku.pipeline.extractor.sku_dedup import (
+    cross_page_dedup, dedup_by_model_variant, dedup_material_variants,
+)
 from pdf_sku.pipeline.catalog_profiler import scan_catalog
 from pdf_sku.config.service import DEFAULT_PROFILE
 
@@ -284,6 +286,8 @@ class BenchmarkRunner:
                 for s in all_skus_flat
             ]
             deduped = cross_page_dedup(sku_results)
+            deduped = dedup_by_model_variant(deduped)
+            deduped = dedup_material_variants(deduped)
             # 找出保留的 SKU (通过 id 匹配)
             kept_ids = {id(s) for s in deduped}
             # 重建 pages 中的 skus

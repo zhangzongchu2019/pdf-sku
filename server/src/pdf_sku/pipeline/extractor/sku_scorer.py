@@ -176,6 +176,20 @@ def _score_name_quality(sku: SKUResult) -> float:
     if any(kw in name_lower for kw in ERROR_MARKER_KEYWORDS):
         return 0.0
 
+    # 纯 "组合X" 名称 (组合+字母/数字，无实际产品描述) → 不是产品
+    _COMBO_CODE_RE = re.compile(r'^组合\s*[A-Za-z0-9]{1,3}$')
+    if _COMBO_CODE_RE.match(name.strip()):
+        return 0.0
+
+    # "MODEL XXX" 文本 → 不是产品名
+    if name.strip().upper().startswith("MODEL"):
+        return 0.0
+
+    # 纯材质描述 (布艺款/皮艺款 单独出现无其他产品词) → 不是独立产品
+    _MATERIAL_ONLY_RE = re.compile(r'^(布艺款?|皮艺款?|皮艺|布艺)\s*$')
+    if _MATERIAL_ONLY_RE.match(name.strip()):
+        return 0.0
+
     # 尺寸/变体描述 (不是产品名称)
     if _DIMENSION_RE.search(name):
         return 0.0

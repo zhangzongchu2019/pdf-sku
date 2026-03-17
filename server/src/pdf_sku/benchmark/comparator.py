@@ -50,8 +50,11 @@ def _fuzzy_match(a: str, b: str, threshold: float = 0.6) -> bool:
 
 
 def _extract_model_prefix(name: str) -> str | None:
-    """从 product_name 提取型号前缀（如 SJ-2001、HY-103）。"""
-    m = re.search(r'[A-Za-z]{1,5}[-\s]?\d{2,10}', name)
+    """从 product_name 提取完整型号（如 SJ-2001、H-303-1A、BT-BD711-2）。"""
+    m = re.search(
+        r'[A-Za-z]{1,5}[-\s]?[A-Za-z]{0,3}\d{2,10}[A-Za-z]?(?:[-][A-Za-z0-9]{1,4})*',
+        name,
+    )
     return m.group(0).upper().replace(" ", "") if m else None
 
 
@@ -89,12 +92,40 @@ def extraction_method_stats(run_result: dict) -> dict[str, int]:
     return stats
 
 
+def _dedup_gt_by_model(expected: list[GroundTruthSKU]) -> list[GroundTruthSKU]:
+    """去重 GT: 同一 model_number 只保留首次出现的条目。
+
+    场景: 配件在多个套系中重复出现 (如 A13# 床头柜出现 9 次)，
+    Pipeline 正确去重后只提取 1 次 → 不应算 8 条 FN。
+
+    同时从 product_name 中提取型号 (如 "A13#床头柜" → A13#)，
+    处理 model_number 为空但 product_name 含型号的重复条目。
+    """
+    seen_models: set[str] = set()
+    deduped: list[GroundTruthSKU] = []
+    for gt in expected:
+        # 尝试从 model_number 字段获取型号
+        norm = _normalize_model(gt.model_number) if gt.model_number else ""
+        # 若 model_number 为空，从 product_name 提取型号
+        if not norm:
+            prefix = _extract_model_prefix(gt.product_name)
+            if prefix:
+                norm = _normalize_model(prefix)
+        if norm and norm in seen_models:
+            continue
+        if norm:
+            seen_models.add(norm)
+        deduped.append(gt)
+    return deduped
+
+
 def compare_dataset(
     ds: ReferenceDataset,
     run_result: dict,
 ) -> ComparisonResult:
     """对比单个数据集的 Pipeline 输出与参考 Excel。"""
-    expected = ds.skus
+    raw_expected = ds.skus
+    expected = _dedup_gt_by_model(raw_expected)
     actual_list = _extract_all_skus(run_result)
 
     result = ComparisonResult(

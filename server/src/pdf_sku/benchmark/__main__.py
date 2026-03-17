@@ -101,7 +101,11 @@ def cmd_compare(args: argparse.Namespace) -> None:
     run_results = []
 
     for ds in datasets:
-        load_dataset(ds)
+        try:
+            load_dataset(ds)
+        except Exception as e:
+            print(f"跳过 {ds.name}: Excel 加载失败 ({e})")
+            continue
         cached = runner.load_cached(ds)
         if not cached:
             print(f"跳过 {ds.name}: 无 Pipeline 运行结果 (先执行 run)")

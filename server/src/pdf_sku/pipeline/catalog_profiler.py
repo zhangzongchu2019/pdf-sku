@@ -61,6 +61,7 @@ class CatalogProfile:
     is_combo_catalog: bool = False                               # 是否为组合图册
     combo_keyword_ratio: float = 0.0                             # 组合关键词页占比
     multi_category_page_ratio: float = 0.0                       # 多品类共现页占比
+    is_pure_image_catalog: bool = False                          # 纯图产品目录（大部分页面无文字）
 
 
 def scan_catalog(pdf_path: str) -> CatalogProfile:
@@ -167,6 +168,12 @@ def scan_catalog(pdf_path: str) -> CatalogProfile:
                 and few_categories):
             profile.is_combo_catalog = True
 
+    # 纯图目录检测：大部分页面无文字 → 产品展示目录，不是场景图册
+    if profile.total_pages >= 3:
+        text_sparse_pages = profile.total_pages - content_pages
+        if text_sparse_pages / profile.total_pages > 0.60:
+            profile.is_pure_image_catalog = True
+
     logger.info("catalog_scan_done",
                 total_pages=profile.total_pages,
                 main_categories=sorted(profile.main_categories),
@@ -174,6 +181,7 @@ def scan_catalog(pdf_path: str) -> CatalogProfile:
                 model_co_occurred=sorted(profile.model_co_occurred),
                 is_combo=profile.is_combo_catalog,
                 combo_kw_ratio=profile.combo_keyword_ratio,
-                multi_cat_ratio=profile.multi_category_page_ratio)
+                multi_cat_ratio=profile.multi_category_page_ratio,
+                is_pure_image=profile.is_pure_image_catalog)
 
     return profile

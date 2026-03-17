@@ -44,7 +44,8 @@ from pdf_sku.pipeline.extractor.ocr_guided import OcrGuidedExtractor
 from pdf_sku.pipeline.extractor.consistency_validator import ConsistencyValidator
 from pdf_sku.pipeline.extractor.sku_dedup import (
     run_dedup_chain, dedup_by_model, dedup_by_similarity,
-    pre_filter, ocr_cross_validate,
+    dedup_by_model_variant, dedup_material_variants,
+    pre_filter, ocr_cross_validate, split_compound_models,
 )
 from pdf_sku.pipeline.extractor.sku_scorer import score_and_filter
 from pdf_sku.pipeline.extractor.sku_reviewer import SKUReviewer
@@ -185,6 +186,9 @@ class PageProcessor:
                 raw, fitz_meta = _extract_page_with_meta_sync(file_path, page_no)
 
             plan = self._fitz_classifier.classify(fitz_meta)
+            # 纯图产品目录：禁用场景过滤（产品无文字标注是正常的）
+            if catalog_profile and catalog_profile.is_pure_image_catalog:
+                plan.scene_filter = False
             logger.info("fitz_classify", page=page_no,
                         page_class=plan.page_class,
                         legacy=plan.legacy_type,
@@ -386,12 +390,13 @@ class PageProcessor:
                     and plan.page_class == "MIXED_OTHER"
                     and effective_screenshot
                     and fitz_meta.page_height > 0):
-                # 高 DPI 重渲 + 二等分 (减少切割产品风险)
-                slice_h = fitz_meta.page_height / 2
+                # 高 DPI 重渲 + 三等分 (比二等分更细粒度，有助识别小字型号)
+                n_slices = 3
+                slice_h = fitz_meta.page_height / n_slices
                 page_w = fitz_meta.page_width
                 slice_bboxes = [
                     (0, i * slice_h, page_w, (i + 1) * slice_h)
-                    for i in range(2)
+                    for i in range(n_slices)
                 ]
                 slice_tasks = [
                     loop.run_in_executor(
@@ -403,12 +408,12 @@ class PageProcessor:
                 for sr in slice_results:
                     if isinstance(sr, Exception) or not sr:
                         continue
-                    # 每片同时跑 Vision + OCR-guided 融合
-                    slice_skus = await self._extract_skus(
-                        raw, page_type, sr, features,
-                        ocr_blocks, layout_regions, ocr_text_len,
-                        sku_count_hint=(1, 10),
-                        scene_filter=plan.scene_filter, plan=plan)
+                    # 直接用 Vision 提取 (不走 OCR-guided, 因为 OCR 数据来自全页)
+                    slice_skus = await self._single_stage.extract(
+                        raw, screenshot=sr,
+                        sku_count_hint=(1, 5),
+                        scene_filter=plan.scene_filter,
+                        page_class=plan.page_class)
                     if slice_skus:
                         skus.extend(slice_skus)
                 if skus:
@@ -418,22 +423,36 @@ class PageProcessor:
                     logger.info("mixed_other_slice_rescue", page=page_no,
                                 found=len(skus))
 
-            # ═══ Phase 6.36: IMG_LABEL 零 SKU + OCR 回退 ═══
+            # ═══ Phase 6.36: IMG_LABEL 零 SKU 回退 ═══
             if (not skus
                     and plan.page_class == IMG_LABEL
-                    and ocr_text_len > 50
                     and effective_screenshot):
-                logger.info("img_label_ocr_fallback", page=page_no,
-                            ocr_chars=ocr_text_len)
-                skus = await self._extract_skus(
-                    raw, page_type, effective_screenshot, features,
-                    ocr_blocks, layout_regions, ocr_text_len,
-                    sku_count_hint=plan.expected_sku_range,
-                    scene_filter=plan.scene_filter, plan=plan)
+                # 先尝试 OCR 路径
+                if ocr_text_len > 50:
+                    logger.info("img_label_ocr_fallback", page=page_no,
+                                ocr_chars=ocr_text_len)
+                    skus = await self._extract_skus(
+                        raw, page_type, effective_screenshot, features,
+                        ocr_blocks, layout_regions, ocr_text_len,
+                        sku_count_hint=plan.expected_sku_range,
+                        scene_filter=plan.scene_filter, plan=plan)
+                    if skus:
+                        extraction_method = "img_label_ocr_fallback"
+
+                # 仍无结果 → 关闭 scene_filter 重试 vision
+                if not skus:
+                    logger.info("img_label_no_scene_retry", page=page_no)
+                    skus = await self._single_stage.extract(
+                        raw, screenshot=effective_screenshot,
+                        sku_count_hint=plan.expected_sku_range,
+                        scene_filter=False,
+                        page_class=plan.page_class)
+                    if skus:
+                        extraction_method = "img_label_no_scene_fallback"
+
                 if skus:
-                    extraction_method = "img_label_ocr_fallback"
-                    logger.info("img_label_ocr_fallback_done", page=page_no,
-                                found=len(skus))
+                    logger.info("img_label_fallback_done", page=page_no,
+                                method=extraction_method, found=len(skus))
 
             # ═══ Phase 6.4: 密集页补充提取 ═══
             if (page_type in ("B", "C") and ocr_text_len >= 500
@@ -463,7 +482,10 @@ class PageProcessor:
                 skus = score_and_filter(skus, ocr_text=ocr_full_text,
                                          catalog_profile=catalog_profile,
                                          scene_filter=plan.scene_filter)
+                skus = split_compound_models(skus)
                 skus = dedup_by_model(skus)
+                skus = dedup_by_model_variant(skus)
+                skus = dedup_material_variants(skus)
                 if not is_image_catalog:
                     skus = dedup_by_similarity(skus)
 
@@ -504,6 +526,7 @@ class PageProcessor:
                     for cs in companion_skus:
                         cs.extraction_method = "companion_rescue"
                     skus.extend(companion_skus)
+                    skus = dedup_by_model(skus)
                     logger.info("companion_rescue_done", page=page_no,
                                 found=len(companion_skus))
 
@@ -520,6 +543,31 @@ class PageProcessor:
                 if len(skus) < before_review:
                     logger.info("reviewer_applied",
                                 page=page_no, before=before_review, after=len(skus))
+
+            # ═══ Phase 6.7: IMG_DENSE 幻觉安全阀 ═══
+            # 如果页面 SKU 数远超预期，且大部分无型号+低 confidence → 幻觉爆炸
+            if (skus
+                    and plan.page_class == IMG_DENSE
+                    and len(skus) > plan.expected_sku_range[1] * 3):
+                no_model = sum(
+                    1 for s in skus
+                    if not (s.attributes.get("model_number") or "").strip()
+                )
+                low_conf = sum(1 for s in skus if s.confidence < 0.4)
+                if no_model > len(skus) * 0.7 and low_conf > len(skus) * 0.5:
+                    # 保留有型号的 + confidence >= 0.5 的
+                    before_halluc = len(skus)
+                    skus = [
+                        s for s in skus
+                        if (s.attributes.get("model_number") or "").strip()
+                        or s.confidence >= 0.5
+                    ]
+                    logger.warning("img_dense_hallucination_filter",
+                                   page=page_no,
+                                   before=before_halluc,
+                                   after=len(skus),
+                                   no_model_ratio=f"{no_model}/{before_halluc}",
+                                   low_conf_ratio=f"{low_conf}/{before_halluc}")
 
             # enforce validity
             profile_data = None
@@ -622,6 +670,7 @@ class PageProcessor:
             all_skus = score_and_filter(all_skus, ocr_text="",
                                           catalog_profile=catalog_profile,
                                           scene_filter=plan.scene_filter)
+            all_skus = split_compound_models(all_skus)
             all_skus = dedup_by_model(all_skus)
             # IMG_DENSE/IMG_LABEL 页面产品名称高度相似，跳过 similarity 去重
             if plan.page_class not in (IMG_DENSE, IMG_LABEL):

@@ -257,7 +257,9 @@ def dedup_by_model(skus: list[SKUResult]) -> list[SKUResult]:
         if not model:
             no_model.append(sku)
             continue
-        key = model.upper()
+        # 颜色感知: 同型号不同颜色视为不同 SKU
+        color = (sku.attributes.get("color") or "").strip()
+        key = f"{model.upper()}||{color.upper()}" if color else model.upper()
         existing = model_map.get(key)
         if existing is None or sku.confidence > existing.confidence:
             model_map[key] = sku
@@ -414,6 +416,142 @@ def run_dedup_chain(skus: list[SKUResult], ocr_text: str = "", *, scene_filter: 
     skus = dedup_by_model(skus)
     skus = dedup_by_similarity(skus)
     return skus
+
+
+_VARIANT_SUFFIX_RE = re.compile(
+    r'[-_]\s*(\d{1,2})\s*$'        # -1, -2, -3, -4
+    r'|[-_]\s*\d\.\d+\s*[Mm]?\s*$' # -1.8M, -1.5
+)
+
+
+def dedup_by_model_variant(skus: list[SKUResult]) -> list[SKUResult]:
+    """同 base model 的尺寸变体合并为 1 个 SKU。
+
+    BT-SF711-1, BT-SF711-2, BT-SF711-3 → 保留 BT-SF711-1
+    BT-BD718-1, BT-BD718-2 → 保留 BT-BD718-1
+    """
+    if len(skus) <= 1:
+        return skus
+
+    base_groups: dict[str, list[tuple[int, SKUResult]]] = {}
+    for i, sku in enumerate(skus):
+        model = (sku.attributes.get("model_number") or "").strip()
+        if not model:
+            continue
+        base = _VARIANT_SUFFIX_RE.sub('', model).strip()
+        if base != model:  # 有变体后缀
+            key = base.upper()
+            base_groups.setdefault(key, []).append((i, sku))
+
+    remove_indices: set[int] = set()
+    for base, group in base_groups.items():
+        if len(group) <= 1:
+            continue
+        # 保留 confidence 最高的
+        group.sort(key=lambda x: x[1].confidence, reverse=True)
+        keeper = group[0][1]
+        # 将所有变体的 model_number 合并到 keeper
+        all_models = [g[1].attributes.get("model_number", "") for g in group]
+        keeper.attributes["model_number"] = " / ".join(all_models)
+        for idx, _ in group[1:]:
+            remove_indices.add(idx)
+
+    if remove_indices:
+        logger.info("dedup_by_model_variant_done",
+                     total=len(skus), removed=len(remove_indices))
+
+    result = [s for i, s in enumerate(skus) if i not in remove_indices]
+    return result
+
+
+_MATERIAL_PREFIX_RE = re.compile(r'^(BU|NAV)[-\s]?(\d+.*)$', re.IGNORECASE)
+
+
+def dedup_material_variants(skus: list[SKUResult]) -> list[SKUResult]:
+    """布艺/皮艺型号对去重: BU332 + NAV332 → 保留 1 个。"""
+    if len(skus) <= 1:
+        return skus
+
+    num_groups: dict[str, list[tuple[int, SKUResult]]] = {}
+    for i, sku in enumerate(skus):
+        model = (sku.attributes.get("model_number") or "").strip()
+        m = _MATERIAL_PREFIX_RE.match(model)
+        if m:
+            num_part = m.group(2).upper()
+            num_groups.setdefault(num_part, []).append((i, sku))
+
+    remove_indices: set[int] = set()
+    for num, group in num_groups.items():
+        if len(group) <= 1:
+            continue
+        # 有 BU 和 NAV 同时存在 → 变体对
+        prefixes = set()
+        for _, sku in group:
+            m = _MATERIAL_PREFIX_RE.match(sku.attributes.get("model_number", ""))
+            if m:
+                prefixes.add(m.group(1).upper())
+        if len(prefixes) >= 2:
+            group.sort(key=lambda x: x[1].confidence, reverse=True)
+            for idx, _ in group[1:]:
+                remove_indices.add(idx)
+
+    if remove_indices:
+        logger.info("dedup_material_variants_done",
+                     total=len(skus), removed=len(remove_indices))
+
+    result = [s for i, s in enumerate(skus) if i not in remove_indices]
+    return result
+
+
+_COMPOUND_MODEL_PART_RE = re.compile(
+    r'[A-Za-z]{1,5}[-\s]?\d{2,}'   # FP-35, BT-SF711
+    r'|[A-Z]{2,}\d+'               # NAV332
+    r'|\d{3,}#'                     # 123#
+    r'|\d{2,}[-]\d+'               # 35-1
+)
+
+def split_compound_models(skus: list[SKUResult]) -> list[SKUResult]:
+    """model_number 含 3+ 个分隔符分割的型号时，拆分为多条 SKU。
+
+    规则:
+    - 仅当 / , ; 分隔的部分 ≥ 3 个且每个匹配型号格式时才拆分
+    - 2 个部分不拆（可能是 "型号A / 型号B" 的合法复合型号）
+    - 拆分后 confidence *= 0.9
+    """
+    if not skus:
+        return skus
+
+    result: list[SKUResult] = []
+    split_count = 0
+
+    for sku in skus:
+        model = (sku.attributes.get("model_number") or "").strip()
+        if not model:
+            result.append(sku)
+            continue
+
+        # 按 / , ; 分割
+        parts = re.split(r'\s*[/,;]\s*', model)
+        parts = [p.strip() for p in parts if p.strip()]
+
+        # 仅 3+ 个部分且每个都像型号才拆分
+        if len(parts) >= 3 and all(_COMPOUND_MODEL_PART_RE.search(p) for p in parts):
+            from copy import deepcopy
+            for p in parts:
+                new_sku = deepcopy(sku)
+                new_sku.attributes["model_number"] = p
+                new_sku.confidence = sku.confidence * 0.9
+                new_sku.extraction_method = "compound_split"
+                result.append(new_sku)
+            split_count += 1
+        else:
+            result.append(sku)
+
+    if split_count:
+        logger.info("split_compound_models_done",
+                     split_skus=split_count,
+                     before=len(skus), after=len(result))
+    return result
 
 
 def cross_page_dedup(all_skus: list[SKUResult]) -> list[SKUResult]:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -113,8 +114,71 @@ def parse_excel(excel_path: Path) -> list[GroundTruthSKU]:
     return skus
 
 
+def _stem_similarity(a: str, b: str) -> float:
+    """计算两个文件名 stem 的相似度。"""
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
+def _match_pdf_excel(
+    pdfs: list[Path], excels: list[Path],
+) -> list[tuple[Path, Path | None]]:
+    """按文件名 stem 相似度匹配 PDF 和 Excel。
+
+    策略:
+    1. 精确匹配: PDF stem == Excel stem
+    2. 模糊匹配: 相似度 > 0.6 的最佳配对
+    3. 未匹配的 PDF 以 excel_path=None 返回
+    """
+    if not pdfs:
+        return []
+
+    # 只有一个 PDF 和一个 Excel → 直接配对（兼容旧行为）
+    if len(pdfs) == 1:
+        return [(pdfs[0], excels[0] if excels else None)]
+
+    matched: list[tuple[Path, Path | None]] = []
+    used_excels: set[int] = set()
+
+    # Pass 1: 精确匹配 stem
+    for pdf in pdfs:
+        pdf_stem = pdf.stem
+        for ei, excel in enumerate(excels):
+            if ei in used_excels:
+                continue
+            if excel.stem == pdf_stem:
+                matched.append((pdf, excel))
+                used_excels.add(ei)
+                break
+        else:
+            matched.append((pdf, None))  # 暂时标记未匹配
+
+    # Pass 2: 对未匹配的 PDF 做模糊匹配
+    for i, (pdf, excel) in enumerate(matched):
+        if excel is not None:
+            continue
+        pdf_stem = pdf.stem
+        best_score = 0.0
+        best_idx = -1
+        for ei, ex in enumerate(excels):
+            if ei in used_excels:
+                continue
+            score = _stem_similarity(pdf_stem, ex.stem)
+            if score > best_score:
+                best_score = score
+                best_idx = ei
+        if best_idx >= 0 and best_score > 0.6:
+            matched[i] = (pdf, excels[best_idx])
+            used_excels.add(best_idx)
+
+    return matched
+
+
 def scan_datasets(data_root: Path | None = None) -> list[ReferenceDataset]:
-    """扫描参考数据目录，返回所有 PDF+Excel 配对。"""
+    """扫描参考数据目录，返回所有 PDF+Excel 配对。
+
+    每个文件夹内的多个 PDF 各自与同名 Excel 配对，
+    生成独立的 ReferenceDataset。
+    """
     root = data_root or DEFAULT_DATA_ROOT
     if not root.exists():
         return []
@@ -124,31 +188,38 @@ def scan_datasets(data_root: Path | None = None) -> list[ReferenceDataset]:
         if not folder.is_dir():
             continue
 
-        name, expected_count, minutes = _parse_folder_meta(folder.name)
+        folder_name, expected_count, minutes = _parse_folder_meta(folder.name)
 
         # 找 PDF 和 Excel
-        pdfs = list(folder.glob("*.pdf")) + list(folder.glob("*.PDF"))
-        excels = list(folder.glob("*.xlsx")) + list(folder.glob("*.XLSX"))
+        pdfs = sorted(
+            list(folder.glob("*.pdf")) + list(folder.glob("*.PDF")))
+        excels = sorted(
+            list(folder.glob("*.xlsx")) + list(folder.glob("*.XLSX")))
 
         # 排除临时文件
         excels = [e for e in excels if not e.name.startswith("~$")]
 
-        pdf_path = pdfs[0] if pdfs else None
-        excel_path = excels[0] if excels else None
-
-        # 排除没有 PDF 的目录
-        if not pdf_path:
+        if not pdfs:
             continue
 
-        ds = ReferenceDataset(
-            name=name,
-            folder=folder,
-            pdf_path=pdf_path,
-            excel_path=excel_path,
-            expected_sku_count=expected_count,
-            manual_minutes=minutes,
-        )
-        datasets.append(ds)
+        pairs = _match_pdf_excel(pdfs, excels)
+
+        for pdf_path, excel_path in pairs:
+            # 数据集名称: 单 PDF 用文件夹名，多 PDF 用 PDF stem
+            if len(pairs) == 1:
+                name = folder_name
+            else:
+                name = pdf_path.stem
+
+            ds = ReferenceDataset(
+                name=name,
+                folder=folder,
+                pdf_path=pdf_path,
+                excel_path=excel_path,
+                expected_sku_count=expected_count if len(pairs) == 1 else 0,
+                manual_minutes=minutes if len(pairs) == 1 else 0,
+            )
+            datasets.append(ds)
 
     return datasets
 
