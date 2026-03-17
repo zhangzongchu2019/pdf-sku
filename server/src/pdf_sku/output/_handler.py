@@ -22,12 +22,15 @@ _session_factory = None
 def init_output_handler(
     importer: IncrementalImporter,
     session_factory,
+    *,
+    subscribe_page_completed: bool = True,
 ) -> None:
     global _importer, _session_factory
     _importer = importer
     _session_factory = session_factory
 
-    event_bus.subscribe("PageCompleted", _on_page_completed)
+    if subscribe_page_completed:
+        event_bus.subscribe("PageCompleted", _on_page_completed)
     event_bus.subscribe("TaskCompleted", _on_task_completed)
     logger.info("output_handler_registered")
 
@@ -43,7 +46,7 @@ async def _on_page_completed(event: dict) -> None:
         return
 
     job_id = event.get("job_id", "")
-    page_number = event.get("page_number", 0)
+    page_number = event.get("page_number") or event.get("page_no", 0)
     status = event.get("status", "")
     skus_data = event.get("skus", [])
 

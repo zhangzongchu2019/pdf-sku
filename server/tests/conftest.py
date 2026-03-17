@@ -1,12 +1,16 @@
-"""全局 pytest fixtures — SQLite 内存库 (UUID/ARRAY/JSONB 适配)。"""
+"""全局 pytest fixtures — SQLite / Redis 测试支持。"""
 import asyncio
+import os
+from pathlib import Path
+import uuid
+
+import fitz
 import pytest
 import pytest_asyncio
-from unittest.mock import AsyncMock, MagicMock
-from sqlalchemy import types, event
-from sqlalchemy.sql.elements import TextClause
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-import uuid
+from sqlalchemy import create_engine, text, types
+from sqlalchemy.sql.elements import TextClause
+from unittest.mock import AsyncMock, MagicMock
 
 
 class SQLiteUUID(types.TypeDecorator):
@@ -63,12 +67,15 @@ def event_loop():
 
 
 @pytest_asyncio.fixture(scope="session")
-async def engine():
+async def engine(tmp_path_factory):
     _sqlite_compat()
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
     from pdf_sku.common.models import Base
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    db_path = tmp_path_factory.mktemp("sqlite") / "unit.sqlite3"
+    sync_engine = create_engine(f"sqlite:///{db_path}", echo=False)
+    Base.metadata.create_all(sync_engine)
+    sync_engine.dispose()
+
+    eng = create_async_engine(f"sqlite+aiosqlite:///{db_path}", echo=False)
     yield eng
     await eng.dispose()
 
@@ -85,6 +92,78 @@ async def db(engine) -> AsyncSession:
 @pytest_asyncio.fixture
 async def session_factory(engine):
     return async_sessionmaker(engine, expire_on_commit=False)
+
+
+@pytest.fixture
+def db_url() -> str:
+    return os.environ.get(
+        "TEST_DATABASE_URL",
+        "postgresql+asyncpg://pdfsku:pdfsku@localhost:5432/pdfsku",
+    )
+
+
+@pytest.fixture
+def db_schema() -> str:
+    return f"test_{uuid.uuid4().hex}"
+
+
+@pytest_asyncio.fixture
+async def init_db(db_url: str, db_schema: str):
+    from pdf_sku.common.models import Base
+
+    engine = create_async_engine(
+        db_url,
+        echo=False,
+        connect_args={"server_settings": {"search_path": db_schema}},
+    )
+    async with engine.begin() as conn:
+        await conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{db_schema}"'))
+        await conn.execute(text(f'SET search_path TO "{db_schema}"'))
+        await conn.run_sync(Base.metadata.create_all)
+
+    yield
+
+    async with engine.begin() as conn:
+        await conn.execute(text(f'DROP SCHEMA IF EXISTS "{db_schema}" CASCADE'))
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def redis_url():
+    yield "redis://fakeredis/0"
+
+
+@pytest_asyncio.fixture
+async def fake_redis():
+    from fakeredis.aioredis import FakeRedis
+
+    redis = FakeRedis(decode_responses=True)
+    try:
+        yield redis
+    finally:
+        await redis.flushall()
+        if hasattr(redis, "aclose"):
+            await redis.aclose()
+        else:
+            await redis.close()
+
+
+@pytest.fixture
+def sample_pdf(tmp_path: Path) -> Path:
+    doc = fitz.open()
+
+    page1 = doc.new_page(width=612, height=792)
+    page1.insert_text((50, 72), "Catalog 2026", fontsize=18)
+    page1.insert_text((50, 110), "Model: XZ-500 Premium Widget", fontsize=12)
+    page1.insert_text((50, 130), "Price: $29.99", fontsize=12)
+    page1.insert_text((50, 150), "Material: Stainless Steel", fontsize=12)
+
+    doc.new_page(width=612, height=792)
+
+    pdf_path = tmp_path / "sample.pdf"
+    doc.save(pdf_path)
+    doc.close()
+    return pdf_path
 
 
 @pytest.fixture

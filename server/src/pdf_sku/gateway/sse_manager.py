@@ -3,12 +3,15 @@ SSE 推送引擎。对齐: Gateway 详设 §4.3 + Data Dictionary §4.2
 
 核心设计:
 - 每个 Job 级别的 SSE 连接维护独立 asyncio.Queue (maxsize=100)
-- EventBus 订阅 → queue.put → SSE 输出
+- 支持双源订阅:
+    1. 进程内 EventBus（API 角色下的同进程事件）
+    2. Redis Pub/Sub（worker 角色跨进程事件，fix.md §8）
 - 心跳 30s / 背压溢出丢弃最旧事件
 - Job 终态自动关闭流
 """
 from __future__ import annotations
 import asyncio
+import json
 import time
 from collections import defaultdict
 from typing import AsyncGenerator
@@ -39,6 +42,8 @@ class SSEManager:
     def __init__(self) -> None:
         # job_id → list[asyncio.Queue]
         self._connections: dict[str, list[asyncio.Queue]] = defaultdict(list)
+        # Redis Pub/Sub 后台任务（可选）
+        self._redis_subscriber_task: asyncio.Task | None = None
         self._setup_subscriptions()
 
     def _setup_subscriptions(self) -> None:
@@ -48,6 +53,68 @@ class SSEManager:
             "HumanNeeded", "SLAEscalated", "JobDeleted",
         ]:
             event_bus.subscribe(evt, self._dispatch_event)
+
+    def start_redis_subscriber(self, redis) -> None:
+        """
+        启动 Redis Pub/Sub 订阅循环（用于接收 worker 跨进程事件）。
+
+        对齐: fix.md §8 — pdfsku:event:job:{job_id} 频道。
+        API 在 lifespan 中调用此方法启动后台任务。
+        """
+        if self._redis_subscriber_task and not self._redis_subscriber_task.done():
+            return  # 已在运行
+        self._redis_subscriber_task = asyncio.create_task(
+            self._redis_subscribe_loop(redis)
+        )
+        logger.info("sse_redis_subscriber_started")
+
+    async def _redis_subscribe_loop(self, redis) -> None:
+        """
+        订阅 pdfsku:event:job:* 模式，将 worker 发来的轻量事件路由到对应连接。
+        """
+        try:
+            pubsub = redis.pubsub()
+            await pubsub.psubscribe("pdfsku:event:job:*")
+            logger.info("sse_redis_psubscribed", pattern="pdfsku:event:job:*")
+
+            async for message in pubsub.listen():
+                if message["type"] not in ("pmessage", "message"):
+                    continue
+                try:
+                    data = json.loads(message.get("data", "{}"))
+                    job_id = data.get("job_id", "")
+                    if job_id:
+                        await self._dispatch_redis_event(data)
+                except Exception:
+                    logger.exception("sse_redis_parse_error")
+
+        except asyncio.CancelledError:
+            logger.info("sse_redis_subscriber_cancelled")
+        except Exception:
+            logger.exception("sse_redis_subscriber_error")
+
+    async def _dispatch_redis_event(self, data: dict) -> None:
+        """将 Redis 事件路由到对应 job SSE 队列（worker 跨进程事件）。"""
+        job_id = data.get("job_id", "")
+        if not job_id:
+            return
+        # 注入内部字段以兼容 _map_event_type
+        event_name = data.get("event", "")
+        _redis_event_map = {
+            "job_queued": "JobStatusChanged",
+            "job_started": "JobStatusChanged",
+            "job_stage_changed": "JobStatusChanged",
+            "page_started": "PageStatusChanged",
+            "page_completed": "PageStatusChanged",
+            "page_failed": "PageStatusChanged",
+            "job_completed": "JobStatusChanged",
+            "job_failed": "JobFailed",
+            "human_needed": "HumanNeeded",
+            "export_ready": "JobStatusChanged",
+        }
+        internal_type = _redis_event_map.get(event_name, "JobStatusChanged")
+        data["_event_type"] = internal_type
+        await self._dispatch_event(data)
 
     async def _dispatch_event(self, data: dict) -> None:
         """将事件路由到对应 job 的所有 SSE 连接队列。"""

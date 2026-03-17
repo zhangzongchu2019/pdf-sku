@@ -13,13 +13,14 @@
 from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
+from uuid import UUID
 
 from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from pdf_sku.common.models import PDFJob, StateTransition
 from pdf_sku.common.enums import JobInternalStatus
-from pdf_sku.gateway.event_bus import event_bus
+from pdf_sku.common.events import JobEvent, publish_job_event
 from pdf_sku.settings import settings
 import structlog
 
@@ -111,6 +112,7 @@ class OrphanScanner:
         """标记 Job 为 ORPHANED。"""
         old_status = job.status
         job.status = JobInternalStatus.ORPHANED.value
+        job.worker_id = None
         db.add(StateTransition(
             entity_type="job",
             entity_id=str(job.job_id),
@@ -118,11 +120,13 @@ class OrphanScanner:
             to_status=JobInternalStatus.ORPHANED.value,
             trigger="heartbeat_scan",
         ))
-        await event_bus.publish("JobOrphaned", {
-            "job_id": str(job.job_id),
-            "old_status": old_status,
-            "worker_id": job.worker_id,
-        })
+        await publish_job_event(
+            self._redis,
+            JobEvent.JOB_STAGE_CHANGED,
+            job_id=str(job.job_id),
+            status=JobInternalStatus.ORPHANED.value,
+            extra={"old_status": old_status},
+        )
 
     async def _auto_requeue(self, job_id: str, previous_alive: set[str]) -> None:
         """冷却后自动重提: 分配给新的存活 Worker。"""
@@ -135,22 +139,33 @@ class OrphanScanner:
             async with self._session_factory() as db:
                 async with db.begin():
                     result = await db.execute(
-                        select(PDFJob).where(PDFJob.job_id == job_id)
+                        select(PDFJob).where(PDFJob.job_id == UUID(job_id))
                     )
                     job = result.scalar_one_or_none()
                     if not job or job.status != JobInternalStatus.ORPHANED.value:
                         return
 
-                    # 选择负载最低的 Worker (简化: 随机选)
-                    new_worker = next(iter(current_alive))
                     old_status = job.status
+                    orphan_origin = await self._get_orphan_origin(db, job_id)
+
+                    from pdf_sku.common.idempotency import try_enqueue_lock
+                    from pdf_sku.common.queue import (
+                        STAGE_GROUPS,
+                        STAGE_STREAMS,
+                        ensure_stream_group,
+                        produce,
+                    )
 
                     # UPLOADED 阶段的孤儿：重新触发评估流程
                     # 其他阶段：恢复到 PROCESSING 继续处理
-                    orphan_origin = await self._get_orphan_origin(db, job_id)
-                    if orphan_origin == JobInternalStatus.UPLOADED.value:
+                    if orphan_origin in (
+                        JobInternalStatus.UPLOADED.value,
+                        JobInternalStatus.EVALUATING.value,
+                        JobInternalStatus.EVAL_FAILED.value,
+                        None,
+                    ):
                         job.status = JobInternalStatus.UPLOADED.value
-                        job.worker_id = new_worker
+                        job.worker_id = None
                         db.add(StateTransition(
                             entity_type="job",
                             entity_id=str(job.job_id),
@@ -158,38 +173,64 @@ class OrphanScanner:
                             to_status=JobInternalStatus.UPLOADED.value,
                             trigger="auto_requeue_eval",
                         ))
-                        # 更新 Redis 路由
-                        await self._redis.set(
-                            f"job_worker:{job.job_id}", new_worker, ex=86400 * 7
+                        await ensure_stream_group(
+                            self._redis, STAGE_STREAMS["evaluate"], STAGE_GROUPS["evaluate"]
                         )
-                        # 重新触发评估
-                        await event_bus.publish("JobCreated", {
-                            "job_id": str(job.job_id),
-                            "prescan": job.processing_trace.get("prescan", {}) if job.processing_trace else {},
-                        })
+                        if await try_enqueue_lock(self._redis, str(job.job_id), "evaluate", force=True):
+                            await produce(
+                                self._redis,
+                                "evaluate",
+                                str(job.job_id),
+                                attempt=1,
+                                trigger="orphan_requeue",
+                                payload={
+                                    "prescan": job.processing_trace.get("prescan", {})
+                                    if job.processing_trace else {},
+                                    "config_version": job.frozen_config_version or "default",
+                                },
+                            )
+                        await publish_job_event(
+                            self._redis,
+                            JobEvent.JOB_QUEUED,
+                            job_id=str(job.job_id),
+                            stage="evaluate",
+                            status=JobInternalStatus.UPLOADED.value,
+                        )
                         logger.info("orphan_requeued_to_eval",
-                                    job_id=job_id, new_worker=new_worker)
+                                    job_id=job_id, alive_workers=len(current_alive))
                     else:
-                        job.status = JobInternalStatus.PROCESSING.value
-                        job.worker_id = new_worker
+                        job.status = JobInternalStatus.EVALUATED.value
+                        job.worker_id = None
                         db.add(StateTransition(
                             entity_type="job",
                             entity_id=str(job.job_id),
                             from_status=old_status,
-                            to_status=JobInternalStatus.PROCESSING.value,
+                            to_status=JobInternalStatus.EVALUATED.value,
                             trigger="auto_requeue",
                         ))
-                        # 更新 Redis 路由
-                        await self._redis.set(
-                            f"job_worker:{job.job_id}", new_worker, ex=86400 * 7
+                        await ensure_stream_group(
+                            self._redis, STAGE_STREAMS["pipeline"], STAGE_GROUPS["pipeline"]
                         )
-                        await event_bus.publish("JobRequeued", {
-                            "job_id": str(job.job_id),
-                            "new_worker": new_worker,
-                            "checkpoint_page": job.checkpoint_page,
-                        })
+                        if await try_enqueue_lock(self._redis, str(job.job_id), "pipeline", force=True):
+                            await produce(
+                                self._redis,
+                                "pipeline",
+                                str(job.job_id),
+                                attempt=1,
+                                trigger="orphan_requeue",
+                                payload={
+                                    "route": job.route or "AI_ALL",
+                                },
+                            )
+                        await publish_job_event(
+                            self._redis,
+                            JobEvent.JOB_QUEUED,
+                            job_id=str(job.job_id),
+                            stage="pipeline",
+                            status=JobInternalStatus.EVALUATED.value,
+                        )
                         logger.info("orphan_requeued",
-                                    job_id=job_id, new_worker=new_worker)
+                                    job_id=job_id, alive_workers=len(current_alive))
 
         except Exception:
             logger.exception("auto_requeue_failed", job_id=job_id)
@@ -203,7 +244,7 @@ class OrphanScanner:
                 StateTransition.entity_id == job_id,
                 StateTransition.to_status == JobInternalStatus.ORPHANED.value,
             )
-            .order_by(StateTransition.transitioned_at.desc())
+            .order_by(StateTransition.timestamp.desc())
             .limit(1)
         )
         row = result.scalar_one_or_none()

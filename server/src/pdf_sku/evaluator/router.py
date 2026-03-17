@@ -25,7 +25,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from pdf_sku.common.models import PDFJob, Evaluation as EvalModel
 from pdf_sku.common.enums import JobInternalStatus
-from pdf_sku.gateway.event_bus import event_bus
 from pdf_sku.gateway.user_status import update_job_status
 from pdf_sku.evaluator.sampler import Sampler
 from pdf_sku.evaluator.scorer import Scorer, PageScore
@@ -323,14 +322,6 @@ class EvaluatorService:
         job.degrade_reason = degrade
         await update_job_status(db, str(job.job_id), new_status,
                                 trigger="evaluation_complete")
-
-        # 发事件
-        await event_bus.publish("EvaluationCompleted", {
-            "job_id": str(job.job_id),
-            "route": route,
-            "doc_confidence": eval_data.get("doc_confidence", 0.0),
-            "degrade_reason": degrade,
-        })
 
     @staticmethod
     def _resolve_file_path(job: PDFJob) -> Path:

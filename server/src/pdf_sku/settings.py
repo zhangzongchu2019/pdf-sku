@@ -13,6 +13,20 @@ class Settings(BaseSettings):
     worker_id: str = os.environ.get("WORKER_ID", f"worker-{socket.gethostname()}")
     log_level: str = "INFO"
 
+    # === Role ===
+    # 控制本进程角色: api | worker-eval | worker-pipeline | worker-output | scheduler
+    run_role: str = "api"
+
+    # === Worker Process Pool ===
+    eval_process_pool_size: int = 2
+    pipeline_process_pool_size: int = 4
+    pipeline_page_concurrency: int = 4
+
+    # === Queue ===
+    queue_claim_idle_ms: int = 60000
+    queue_max_retry: int = 3
+    queue_batch_size: int = 10
+
     # === Database ===
     database_url: str = "postgresql+asyncpg://pdfsku:pdfsku@localhost:5432/pdfsku"
     db_pool_size: int = 10

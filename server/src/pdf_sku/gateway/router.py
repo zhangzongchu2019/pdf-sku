@@ -317,6 +317,9 @@ async def cancel_job(job_id: uuid.UUID, db: DBSession):
 async def requeue_job(job_id: uuid.UUID, db: DBSession, redis: RedisClient):
     """手动重提 Job。"""
     from pdf_sku.gateway.user_status import update_job_status
+    from pdf_sku.common.events import JobEvent, publish_job_event
+    from pdf_sku.common.idempotency import try_enqueue_lock
+    from pdf_sku.common.queue import produce, ensure_stream_group, STAGE_GROUPS, STAGE_STREAMS
     result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
     job = result.scalar_one_or_none()
     if not job:
@@ -329,17 +332,29 @@ async def requeue_job(job_id: uuid.UUID, db: DBSession, redis: RedisClient):
     job = await update_job_status(
         db, str(job_id), JobInternalStatus.UPLOADED.value, trigger="manual_requeue"
     )
+    job.worker_id = None
     await db.commit()
 
-    # 重新触发评估流程
-    await event_bus.publish("JobCreated", {
-        "job_id": str(job_id),
-        "file_hash": job.file_hash,
-        "total_pages": job.total_pages,
-        "status": JobInternalStatus.UPLOADED.value,
-        "prescan": (job.processing_trace or {}).get("prescan", {}),
-        "config_version": job.frozen_config_version or "default",
-    })
+    await ensure_stream_group(redis, STAGE_STREAMS["evaluate"], STAGE_GROUPS["evaluate"])
+    if await try_enqueue_lock(redis, str(job_id), "evaluate", force=True):
+        await produce(
+            redis,
+            "evaluate",
+            str(job_id),
+            attempt=1,
+            trigger="manual_requeue",
+            payload={
+                "prescan": (job.processing_trace or {}).get("prescan", {}),
+                "config_version": job.frozen_config_version or "default",
+            },
+        )
+    await publish_job_event(
+        redis,
+        JobEvent.JOB_QUEUED,
+        job_id=str(job_id),
+        stage="evaluate",
+        status=JobInternalStatus.UPLOADED.value,
+    )
 
     return {"job_id": str(job_id), "status": job.status, "user_status": job.user_status}
 
@@ -391,7 +406,6 @@ async def _perform_job_deletion(job_id: uuid.UUID, db: AsyncSession, redis) -> N
 
     # 5. Redis 清理
     await redis.delete(
-        f"job_worker:{job_id}",
         f"orphan:requeue_count:{job_id}",
     )
 
@@ -404,6 +418,48 @@ async def _perform_job_deletion(job_id: uuid.UUID, db: AsyncSession, redis) -> N
     job_dir = Path(settings.job_data_dir) / str(job_id)
     if job_dir.exists():
         shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def _enqueue_pipeline_reprocess(
+    redis,
+    job: PDFJob,
+    *,
+    trigger: str,
+    pages: list[int] | None = None,
+    route: str | None = None,
+) -> None:
+    from pdf_sku.common.events import JobEvent, publish_job_event
+    from pdf_sku.common.idempotency import reset_stage_state, try_enqueue_lock
+    from pdf_sku.common.queue import produce, ensure_stream_group, STAGE_GROUPS, STAGE_STREAMS
+
+    await ensure_stream_group(redis, STAGE_STREAMS["pipeline"], STAGE_GROUPS["pipeline"])
+    await reset_stage_state(redis, str(job.job_id), "pipeline")
+    if await try_enqueue_lock(redis, str(job.job_id), "pipeline", force=True):
+        payload = {
+            "route": route or job.route or "AI_ALL",
+            "eval": {
+                "job_id": str(job.job_id),
+                "route": route or job.route or "AI_ALL",
+                "prescan": (job.processing_trace or {}).get("prescan", {}),
+            },
+        }
+        if pages:
+            payload["eval"]["pages"] = sorted(pages)
+        await produce(
+            redis,
+            "pipeline",
+            str(job.job_id),
+            attempt=1,
+            trigger=trigger,
+            payload=payload,
+        )
+    await publish_job_event(
+        redis,
+        JobEvent.JOB_QUEUED,
+        job_id=str(job.job_id),
+        stage="pipeline",
+        status=job.status,
+    )
 
 
 @router.delete("/jobs/{job_id}", status_code=200)
@@ -443,7 +499,7 @@ async def delete_job(
 
 
 @router.post("/ops/jobs/{job_id}/reprocess-ai")
-async def reprocess_job_ai(job_id: uuid.UUID, db: DBSession):
+async def reprocess_job_ai(job_id: uuid.UUID, db: DBSession, redis: RedisClient):
     """强制该 Job 全量走 AI 处理。"""
     result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
     job = result.scalar_one_or_none()
@@ -484,15 +540,16 @@ async def reprocess_job_ai(job_id: uuid.UUID, db: DBSession):
         .values(status="PENDING", needs_review=False, sku_count=0)
     )
 
+    job.status = JobInternalStatus.EVALUATED.value
+    job.user_status = compute_user_status(JobInternalStatus.EVALUATED).value
+    job.worker_id = None
     await db.commit()
-
-    eval_data = {
-        "job_id": str(job_id),
-        "route": "AI_ONLY",
-        "degrade_reason": None,
-        "prescan": {"blank_pages": []},
-    }
-    await event_bus.publish("EvaluationCompleted", eval_data)
+    await _enqueue_pipeline_reprocess(
+        redis,
+        job,
+        trigger="ops_reprocess_ai",
+        route="AI_ONLY",
+    )
 
     return {
         "job_id": str(job_id),
@@ -507,7 +564,7 @@ async def reprocess_single_page(
     job_id: uuid.UUID,
     page_number: int,
     db: DBSession,
-    request: Request,
+    redis: RedisClient,
 ):
     """单页重处理: 仅重跑指定页面的 AI 处理。"""
     result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
@@ -536,28 +593,26 @@ async def reprocess_single_page(
             Page.job_id == job_id, Page.page_number == page_number,
         ).values(status="PENDING", needs_review=False, sku_count=0)
     )
+    job.status = JobInternalStatus.EVALUATED.value
+    job.user_status = compute_user_status(JobInternalStatus.EVALUATED).value
+    job.worker_id = None
     await db.commit()
-
-    # 直接调用 orchestrator 单页处理
-    orchestrator = request.app.state.orchestrator
-    file_path = orchestrator._resolve_file_path(job)
-
-    async with orchestrator._db_factory() as page_db:
-        result = await orchestrator._process_single_page(
-            page_db, job, page_number, file_path)
-        await orchestrator._on_page_done(page_db, job, page_number, result)
-        await page_db.commit()
+    await _enqueue_pipeline_reprocess(
+        redis,
+        job,
+        trigger="ops_reprocess_page",
+        pages=[page_number],
+    )
 
     return {
         "job_id": str(job_id),
         "page_number": page_number,
-        "status": result.status,
-        "sku_count": len([s for s in result.skus if s.validity == "valid"]),
+        "queued": True,
     }
 
 
 @router.post("/ops/jobs/{job_id}/reprocess-pages-without-subimages")
-async def reprocess_pages_without_subimages(job_id: uuid.UUID, db: DBSession, request: Request):
+async def reprocess_pages_without_subimages(job_id: uuid.UUID, db: DBSession, redis: RedisClient):
     """批量重处理：对指定 job 中所有只有全页图（无 product_main/product_detail 子图）的页面重新运行 AI。"""
     result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
     job = result.scalar_one_or_none()
@@ -588,6 +643,12 @@ async def reprocess_pages_without_subimages(job_id: uuid.UUID, db: DBSession, re
     pending_no_img = {row[0] for row in all_pages_q.fetchall()} - has_any_image
 
     no_subimg_pages = sorted(has_img_no_subimg | pending_no_img)
+    if not no_subimg_pages:
+        return {
+            "job_id": str(job_id),
+            "pages_queued": 0,
+            "pages": [],
+        }
 
     # 清理这些页面的旧数据
     for page_number in no_subimg_pages:
@@ -605,23 +666,16 @@ async def reprocess_pages_without_subimages(job_id: uuid.UUID, db: DBSession, re
             update(Page).where(Page.job_id == job_id, Page.page_number == page_number)
             .values(status="PENDING", needs_review=False, sku_count=0)
         )
+    job.status = JobInternalStatus.EVALUATED.value
+    job.user_status = compute_user_status(JobInternalStatus.EVALUATED).value
+    job.worker_id = None
     await db.commit()
-
-    # 后台异步处理（并发=3，避免 Gemini rate limit）
-    orchestrator = request.app.state.orchestrator
-    file_path = orchestrator._resolve_file_path(job)
-
-    async def _process_all():
-        sem = asyncio.Semaphore(3)
-        async def _one(pg):
-            async with sem:
-                async with orchestrator._db_factory() as page_db:
-                    res = await orchestrator._process_single_page(page_db, job, pg, file_path)
-                    await orchestrator._on_page_done(page_db, job, pg, res)
-                    await page_db.commit()
-        await asyncio.gather(*[_one(pg) for pg in no_subimg_pages], return_exceptions=True)
-
-    asyncio.create_task(_process_all())
+    await _enqueue_pipeline_reprocess(
+        redis,
+        job,
+        trigger="ops_reprocess_pages_without_subimages",
+        pages=no_subimg_pages,
+    )
 
     return {
         "job_id": str(job_id),
@@ -631,7 +685,7 @@ async def reprocess_pages_without_subimages(job_id: uuid.UUID, db: DBSession, re
 
 
 @router.post("/ops/jobs/{job_id}/force-finalize")
-async def force_finalize_job(job_id: uuid.UUID, db: DBSession, request: Request):
+async def force_finalize_job(job_id: uuid.UUID, db: DBSession, redis: RedisClient):
     """
     对已完成所有页面但 Job 状态卡在 PROCESSING 的任务进行强制终态计算。
     不重新处理任何页面，仅根据当前页面状态更新 Job 状态。
@@ -641,20 +695,57 @@ async def force_finalize_job(job_id: uuid.UUID, db: DBSession, request: Request)
     if not job:
         raise JobNotFoundError(f"Job {job_id} not found")
 
-    orchestrator = request.app.state.orchestrator
-    async with orchestrator._db_factory() as final_db:
-        fresh = (await final_db.execute(
-            select(PDFJob).where(PDFJob.job_id == job_id)
-        )).scalar_one()
-        await orchestrator._finalize_job(final_db, fresh)
-        await final_db.commit()
-        new_status = fresh.status
-        new_user_status = fresh.user_status
+    status_counts = {
+        row.status: row.cnt
+        for row in (
+            await db.execute(
+                select(Page.status, func.count().label("cnt"))
+                .where(Page.job_id == job_id)
+                .group_by(Page.status)
+            )
+        ).all()
+    }
+    failed = status_counts.get(PageStatus.AI_FAILED.value, 0)
+    human = (
+        status_counts.get(PageStatus.HUMAN_QUEUED.value, 0)
+        + status_counts.get(PageStatus.HUMAN_PROCESSING.value, 0)
+    )
+    completed = (
+        status_counts.get(PageStatus.AI_COMPLETED.value, 0)
+        + status_counts.get(PageStatus.IMPORTED_CONFIRMED.value, 0)
+        + status_counts.get(PageStatus.IMPORTED_ASSUMED.value, 0)
+    )
+    blank = status_counts.get(PageStatus.BLANK.value, 0)
+    total_valid = sum(status_counts.values()) - blank
+
+    if failed > 0:
+        new_status = JobInternalStatus.PARTIAL_FAILED.value
+    elif human > 0:
+        new_status = JobInternalStatus.PROCESSING.value
+    elif completed >= total_valid and total_valid > 0:
+        new_status = JobInternalStatus.FULL_IMPORTED.value
+    else:
+        new_status = JobInternalStatus.PROCESSING.value
+
+    from pdf_sku.common.events import JobEvent, publish_job_event
+    from pdf_sku.gateway.user_status import refresh_job_page_stats, update_job_status
+
+    await refresh_job_page_stats(db, str(job_id))
+    fresh = await update_job_status(db, str(job_id), new_status, trigger="force_finalize")
+    await db.commit()
+    await publish_job_event(
+        redis,
+        JobEvent.JOB_COMPLETED if new_status == JobInternalStatus.FULL_IMPORTED.value
+        else JobEvent.JOB_FAILED if new_status == JobInternalStatus.PARTIAL_FAILED.value
+        else JobEvent.JOB_STAGE_CHANGED,
+        job_id=str(job_id),
+        status=new_status,
+    )
 
     return {
         "job_id": str(job_id),
-        "status": new_status,
-        "user_status": new_user_status,
+        "status": fresh.status,
+        "user_status": fresh.user_status,
     }
 
 

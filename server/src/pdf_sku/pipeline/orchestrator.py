@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from collections import defaultdict
 
+from pdf_sku.common.events import JobEvent, publish_job_event
 from pdf_sku.common.models import PDFJob, Page
 from pdf_sku.common.enums import JobInternalStatus, PageStatus
 from pdf_sku.gateway.event_bus import event_bus
@@ -280,17 +281,22 @@ class Orchestrator:
         page_processor: PageProcessor,
         db_session_factory=None,
         redis=None,
+        importer=None,
         **_kwargs,
     ) -> None:
         self._pp = page_processor
         self._db_factory = db_session_factory
         self._redis = redis
+        self._importer = importer
 
     async def process_job(
         self,
         db: AsyncSession,
         job: PDFJob,
         evaluation: dict,
+        *,
+        trace_id: str = "",
+        worker_id: str = "",
     ) -> None:
         """
         Job 处理入口。
@@ -304,6 +310,7 @@ class Orchestrator:
         job_uuid = job.job_id
         file_path = self._resolve_file_path(job)
         blank_pages = evaluation.get("prescan", {}).get("blank_pages", [])
+        requested_pages = evaluation.get("pages") or []
 
         logger.info("pipeline_start",
                      job_id=job_id,
@@ -314,29 +321,45 @@ class Orchestrator:
         route = evaluation.get("route")
         if route:
             job.route = route
+        if worker_id:
+            job.worker_id = worker_id
         await update_job_status(db, job_id, JobInternalStatus.PROCESSING.value,
                                 trigger="pipeline_start")
         await db.commit()
 
         try:
-            non_blank = [p for p in range(1, job.total_pages + 1)
-                         if p not in blank_pages]
+            if requested_pages:
+                non_blank = sorted(
+                    p for p in requested_pages
+                    if 1 <= p <= job.total_pages and p not in blank_pages
+                )
+            else:
+                non_blank = [p for p in range(1, job.total_pages + 1)
+                             if p not in blank_pages]
 
             if not non_blank:
                 logger.warning("all_pages_blank", job_id=job_id, total_pages=job.total_pages)
                 async with self._db_factory() as final_db:
+                    fresh = (
+                        await final_db.execute(select(PDFJob).where(PDFJob.job_id == job_uuid))
+                    ).scalar_one()
                     await update_job_status(final_db, job_id, "FULL_IMPORTED", trigger="all_blank")
+                    await self._publish_final_job_event(
+                        str(fresh.job_id),
+                        JobInternalStatus.FULL_IMPORTED.value,
+                        trace_id=trace_id,
+                    )
                     await final_db.commit()
                 return
 
-            await self._process_parallel(job, non_blank, file_path)
+            await self._process_parallel(job, non_blank, file_path, trace_id=trace_id)
 
             # 终态判定 — 用新 session
             async with self._db_factory() as final_db:
                 result = await final_db.execute(
                     select(PDFJob).where(PDFJob.job_id == job_uuid))
                 fresh_job = result.scalar_one()
-                await self._finalize_job(final_db, fresh_job)
+                await self._finalize_job(final_db, fresh_job, trace_id=trace_id)
                 await final_db.commit()
 
         except Exception as e:
@@ -346,6 +369,12 @@ class Orchestrator:
                     err_db, job_id, JobInternalStatus.PARTIAL_FAILED.value,
                     trigger="pipeline_error", error_message=str(e))
                 await err_db.commit()
+            await self._publish_final_job_event(
+                job_id,
+                JobInternalStatus.PARTIAL_FAILED.value,
+                trace_id=trace_id,
+                error=str(e),
+            )
 
         self._pp.clear_job_cache(job_id)
 
@@ -354,6 +383,8 @@ class Orchestrator:
         job: PDFJob,
         pages: list[int],
         file_path: str,
+        *,
+        trace_id: str = "",
     ) -> None:
         """并行处理所有页面（Semaphore 控制并发，根据页数动态调整）。"""
         concurrency = await get_concurrency_for_pages(len(pages), self._redis)
@@ -367,8 +398,8 @@ class Orchestrator:
             async with semaphore:
                 async with self._db_factory() as page_db:
                     result = await self._process_single_page(
-                        page_db, job, page_no, file_path)
-                    await self._on_page_done(page_db, job, page_no, result)
+                        page_db, job, page_no, file_path, trace_id=trace_id)
+                    await self._on_page_done(page_db, job, page_no, result, trace_id=trace_id)
                     await page_db.commit()
 
         results = await asyncio.gather(
@@ -387,6 +418,8 @@ class Orchestrator:
         job: PDFJob,
         page_no: int,
         file_path: str,
+        *,
+        trace_id: str = "",
     ) -> PageResult:
         """单页处理 + 异常降级。"""
         try:
@@ -395,6 +428,15 @@ class Orchestrator:
                 "page_no": page_no,
                 "status": "AI_PROCESSING",
             })
+            if self._redis:
+                await publish_job_event(
+                    self._redis,
+                    JobEvent.PAGE_STARTED,
+                    job_id=str(job.job_id),
+                    page_no=page_no,
+                    status=PageStatus.AI_PROCESSING.value,
+                    trace_id=trace_id,
+                )
 
             result = await self._pp.process_page(
                 job_id=str(job.job_id),
@@ -409,6 +451,16 @@ class Orchestrator:
         except Exception as e:
             logger.error("page_processing_error",
                          job_id=str(job.job_id), page_no=page_no, error=str(e))
+            if self._redis:
+                await publish_job_event(
+                    self._redis,
+                    JobEvent.PAGE_FAILED,
+                    job_id=str(job.job_id),
+                    page_no=page_no,
+                    status=PageStatus.AI_FAILED.value,
+                    error=str(e),
+                    trace_id=trace_id,
+                )
             return PageResult(
                 status="AI_FAILED",
                 error=str(e),
@@ -421,6 +473,8 @@ class Orchestrator:
         job: PDFJob,
         page_no: int,
         result: PageResult,
+        *,
+        trace_id: str = "",
     ) -> None:
         """
         每页完成: 落库 → 事件 → 人工任务(如需)。
@@ -469,6 +523,14 @@ class Orchestrator:
         if result.skus or result.images:
             await self._persist_skus(db, job.job_id, page_no, result)
 
+        if self._importer:
+            await self._importer.import_page_incremental(
+                db,
+                str(job.job_id),
+                page_no,
+                result,
+            )
+
         # 将处理时使用的截图缓存到磁盘，保证坐标系与 bbox 一致
         # （密集页面使用 216dpi 渲染，不落盘则 API 会以 150dpi 重新渲染导致 bbox 错位）
         if result.screenshot:
@@ -484,11 +546,33 @@ class Orchestrator:
         # 发布事件
         await event_bus.publish("PageCompleted", {
             "job_id": str(job.job_id),
+            "page_number": page_no,
             "page_no": page_no,
             "status": result.status,
             "sku_count": valid_sku_count,
             "needs_review": result.needs_review,
+            "skus": [
+                {
+                    "sku_id": sku.sku_id,
+                    "attributes": sku.attributes,
+                    "confidence": sku.confidence,
+                    "validity": sku.validity,
+                    "extraction_method": result.extraction_method,
+                }
+                for sku in result.skus
+            ],
         })
+        if self._redis:
+            await publish_job_event(
+                self._redis,
+                JobEvent.PAGE_COMPLETED,
+                job_id=str(job.job_id),
+                page_no=page_no,
+                status=new_status,
+                sku_count=valid_sku_count,
+                trace_id=trace_id,
+                extra={"needs_review": result.needs_review},
+            )
 
     async def _persist_skus(
         self,
@@ -590,6 +674,8 @@ class Orchestrator:
         self,
         db: AsyncSession,
         job: PDFJob,
+        *,
+        trace_id: str = "",
     ) -> None:
         """
         [C2] 终态判定 (以 page status 为准)。
@@ -628,6 +714,11 @@ class Orchestrator:
         await refresh_job_page_stats(db, str(job.job_id))
         await update_job_status(db, str(job.job_id), new_status,
                                 trigger="pipeline_finalize")
+        await self._publish_final_job_event(
+            str(job.job_id),
+            new_status,
+            trace_id=trace_id,
+        )
 
         logger.info("pipeline_finalized",
                      job_id=str(job.job_id),
@@ -639,3 +730,32 @@ class Orchestrator:
         import os
         base = os.environ.get("JOB_DATA_DIR", "/data/jobs")
         return str(Path(base) / str(job.job_id) / "source.pdf")
+
+    async def _publish_final_job_event(
+        self,
+        job_id: str,
+        status: str,
+        *,
+        trace_id: str = "",
+        error: str | None = None,
+    ) -> None:
+        if not self._redis:
+            return
+
+        if status == JobInternalStatus.FULL_IMPORTED.value:
+            event = JobEvent.JOB_COMPLETED
+        elif status == JobInternalStatus.PARTIAL_FAILED.value:
+            event = JobEvent.JOB_FAILED
+        elif status == JobInternalStatus.DEGRADED_HUMAN.value:
+            event = JobEvent.HUMAN_NEEDED
+        else:
+            event = JobEvent.JOB_STAGE_CHANGED
+
+        await publish_job_event(
+            self._redis,
+            event,
+            job_id=job_id,
+            status=status,
+            trace_id=trace_id,
+            error=error,
+        )

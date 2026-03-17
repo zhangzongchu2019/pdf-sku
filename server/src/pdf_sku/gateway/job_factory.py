@@ -21,7 +21,7 @@ from pdf_sku.common.models import PDFJob, Page, StateTransition
 from pdf_sku.gateway.file_validator import FileValidator
 from pdf_sku.gateway.pdf_security import PDFSecurityChecker
 from pdf_sku.gateway.prescanner import Prescanner, PrescanRuleConfig
-from pdf_sku.gateway.event_bus import event_bus
+from pdf_sku.common.events import JobEvent, publish_job_event
 from pdf_sku.settings import settings
 import structlog
 
@@ -124,7 +124,6 @@ class JobFactory:
             user_status=user_status.value,
             action_hint=action_hint,
             frozen_config_version=config_version,
-            worker_id=settings.worker_id,
             total_pages=validation.page_count or 0,
             blank_pages=prescan.blank_pages,
             processing_trace={
@@ -170,10 +169,6 @@ class JobFactory:
 
             # 提前提交以确保后续事件处理能读取到 Job
             await db.commit()
-
-            # Redis: Job → Worker 路由映射
-            await redis.set(f"job_worker:{job_id}", settings.worker_id, ex=86400 * 7)
-
             logger.info("job_created",
                         job_id=str(job_id), status=initial_status.value,
                         pages=job.total_pages, blank=len(prescan.blank_pages),
@@ -185,15 +180,40 @@ class JobFactory:
                 shutil.move(str(dest_path), str(upload_file_path))
             raise
 
-        # === Step 9: 发事件 ===
-        await event_bus.publish("JobCreated", {
-            "job_id": str(job_id),
-            "file_hash": file_hash,
-            "total_pages": job.total_pages,
-            "status": initial_status.value,
-            "prescan": prescan.raw_metrics,
-            "config_version": config_version,
-        })
+        # === Step 9: 发布轻量事件 + 投递 Redis Streams 队列 ===
+        try:
+            from pdf_sku.common.queue import produce, ensure_stream_group, STAGE_STREAMS, STAGE_GROUPS
+            from pdf_sku.common.idempotency import try_enqueue_lock
+            if initial_status == JobInternalStatus.UPLOADED:
+                await ensure_stream_group(redis, STAGE_STREAMS["evaluate"], STAGE_GROUPS["evaluate"])
+                if await try_enqueue_lock(redis, str(job_id), "evaluate"):
+                    await produce(
+                        redis, "evaluate", str(job_id),
+                        attempt=1,
+                        trigger="job_created",
+                        payload={
+                            "prescan": prescan.raw_metrics,
+                            "config_version": config_version,
+                        },
+                    )
+                await publish_job_event(
+                    redis,
+                    JobEvent.JOB_QUEUED,
+                    job_id=str(job_id),
+                    stage="evaluate",
+                    status=initial_status.value,
+                )
+            else:
+                await publish_job_event(
+                    redis,
+                    JobEvent.HUMAN_NEEDED,
+                    job_id=str(job_id),
+                    status=initial_status.value,
+                    extra={"reason": "all_blank"},
+                )
+        except Exception as _qe:
+            # 队列投递失败不阻断主流程，保留已创建的 job 供后续人工处理/重试。
+            logger.warning("queue_produce_failed", job_id=str(job_id), error=str(_qe))
 
         return job
 

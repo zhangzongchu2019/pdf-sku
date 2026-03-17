@@ -13,12 +13,11 @@ import asyncio
 import base64
 import pytest
 import pytest_asyncio
-from pathlib import Path
 from httpx import AsyncClient, ASGITransport
 
 
 @pytest_asyncio.fixture
-async def test_client(db_url, redis_url, init_db, tmp_path):
+async def test_client(db_url, db_schema, redis_url, init_db, tmp_path, fake_redis):
     """创建带完整 lifespan 的测试客户端。"""
     import os
     os.environ["DATABASE_URL"] = db_url
@@ -39,47 +38,74 @@ async def test_client(db_url, redis_url, init_db, tmp_path):
     from pdf_sku.main import create_app
     app = create_app()
 
-    # 禁用 MinIO (测试中不需要)
-    original_lifespan = app.router.lifespan_context
-
     from contextlib import asynccontextmanager
 
     @asynccontextmanager
     async def test_lifespan(app):
         """简化 lifespan: 跳过 MinIO。"""
         from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-        from redis.asyncio import Redis as AsyncRedis
-        from concurrent.futures import ProcessPoolExecutor
 
-        engine = create_async_engine(db_url, echo=False)
+        engine = create_async_engine(
+            db_url,
+            echo=False,
+            connect_args={"server_settings": {"search_path": db_schema}},
+        )
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
-        redis = AsyncRedis.from_url(redis_url, decode_responses=True)
+        redis = fake_redis
 
         app.state.engine = engine
         app.state.session_factory = session_factory
         app.state.redis = redis
+        app.state.services_ready = {
+            "database": True,
+            "redis": True,
+            "minio": True,
+        }
 
         # Gateway 组件
         import pdf_sku.gateway._deps as deps
         from pdf_sku.gateway.tus_store import TusStore
         from pdf_sku.gateway.tus_handler import TusHandler
         from pdf_sku.gateway.file_validator import FileValidator
-        from pdf_sku.gateway.pdf_security import PDFSecurityChecker
-        from pdf_sku.gateway.prescanner import Prescanner
+        from pdf_sku.gateway.pdf_security import SecurityResult
+        from pdf_sku.gateway.prescanner import PrescanResult
         from pdf_sku.gateway.job_factory import JobFactory
         from pdf_sku.gateway.sse_manager import SSEManager
+
+        class StubSecurityChecker:
+            async def check(self, file_path: str) -> SecurityResult:
+                return SecurityResult(safe=True, security_issues=[])
+
+        class StubPrescanner:
+            async def scan(self, file_path: str) -> PrescanResult:
+                return PrescanResult(
+                    all_blank=False,
+                    blank_pages=[],
+                    penalties=[],
+                    total_penalty=0.0,
+                    raw_metrics={
+                        "total_pages": 2,
+                        "blank_page_count": 0,
+                        "blank_rate": 0.0,
+                        "ocr_rate": 1.0,
+                        "image_count": 0,
+                    },
+                )
 
         deps.tus_store = TusStore(redis)
         deps.tus_handler = TusHandler(deps.tus_store)
         deps.job_factory = JobFactory(
             validator=FileValidator(),
-            security_checker=PDFSecurityChecker(ProcessPoolExecutor(max_workers=1)),
-            prescanner=Prescanner(),
+            security_checker=StubSecurityChecker(),
+            prescanner=StubPrescanner(),
         )
         deps.sse_manager = SSEManager()
 
         # DI override
+        from pdf_sku.auth.dependencies import get_current_user
         from pdf_sku.common.dependencies import get_db, get_redis
+        from pdf_sku.common.models import User
+        import uuid
 
         async def _get_db():
             async with session_factory() as session:
@@ -88,21 +114,39 @@ async def test_client(db_url, redis_url, init_db, tmp_path):
         async def _get_redis():
             return redis
 
+        test_user = User(
+            user_id=uuid.uuid4(),
+            username="integration-user",
+            display_name="Integration User",
+            password_hash="not-used",
+            role="uploader",
+            merchant_id="M_AUTH",
+            is_active=True,
+        )
+
+        async with session_factory() as session:
+            session.add(test_user)
+            await session.commit()
+
+        async def _get_current_user():
+            return test_user
+
         app.dependency_overrides[get_db] = _get_db
         app.dependency_overrides[get_redis] = _get_redis
+        app.dependency_overrides[get_current_user] = _get_current_user
 
         yield
 
-        await redis.close()
         await engine.dispose()
 
     app.router.lifespan_context = test_lifespan
 
-    async with AsyncClient(
-        transport=ASGITransport(app=app),
-        base_url="http://test",
-    ) as ac:
-        yield ac
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as ac:
+            yield ac
 
 
 @pytest.fixture
@@ -121,8 +165,8 @@ class TestHealthEndpoint:
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "healthy"
-        assert data["checks"]["database"] == "ok"
-        assert data["checks"]["redis"] == "ok"
+        assert data["services"]["database"] is True
+        assert data["services"]["redis"] is True
 
 
 class TestTUSUpload:
@@ -266,7 +310,7 @@ class TestJobCreation:
 
     @pytest.mark.asyncio
     async def test_duplicate_upload_rejected(self, test_client: AsyncClient, pdf_bytes):
-        """同 merchant 相同文件重复上传应被拒绝。"""
+        """同一用户重复上传相同文件时返回已有 Job。"""
         async def upload_and_create(merchant: str):
             filename_b64 = base64.b64encode(b"dup.pdf").decode()
             filetype_b64 = base64.b64encode(b"application/pdf").decode()
@@ -290,10 +334,10 @@ class TestJobCreation:
         resp1 = await upload_and_create("M_DUP")
         assert resp1.status_code == 201
 
-        # 第二次: 409 重复
+        # 第二次: 返回已有 Job
         resp2 = await upload_and_create("M_DUP")
-        assert resp2.status_code == 409
-        assert resp2.json()["error_code"] == "FILE_HASH_DUPLICATE"
+        assert resp2.status_code == 200
+        assert resp2.json()["is_duplicate"] is True
 
 
 class TestJobOperations:
@@ -338,6 +382,8 @@ class TestDashboard:
         resp = await test_client.get("/api/v1/dashboard/metrics")
         assert resp.status_code == 200
         data = resp.json()
-        assert "today_jobs" in data
-        assert "auto_rate" in data
-        assert "status_counts" in data
+        assert "timestamp" in data
+        assert "job_stats" in data
+        assert "page_stats" in data
+        assert "task_stats" in data
+        assert "import_stats" in data

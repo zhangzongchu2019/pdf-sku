@@ -43,11 +43,221 @@ def _configure_logging() -> None:
     )
 
 
+def _default_api_base_for_provider(provider_type: str, proxy_service: str | None) -> str:
+    if proxy_service == "openrouter":
+        return "https://openrouter.ai/api"
+    if provider_type == "gemini":
+        return "https://generativelanguage.googleapis.com/v1beta/openai"
+    if provider_type == "qwen":
+        return "https://dashscope.aliyuncs.com/compatible-mode"
+    return ""
+
+
+async def _bootstrap_worker_llm_clients(session_factory, redis) -> None:
+    """为 worker 进程补齐 Redis/DB 中已配置的 provider 客户端注册。"""
+    from pdf_sku.llm_adapter.account_service import get_account_api_key
+    from pdf_sku.llm_adapter.client.gemini import GeminiClient
+    from pdf_sku.llm_adapter.client.openai_compat import OpenAICompatClient
+    from pdf_sku.llm_adapter.client.qwen import QwenClient
+    from pdf_sku.llm_adapter.client.registry import get_client, register as register_client
+    from pdf_sku.llm_adapter.provider_config import get_provider_entries
+
+    entries = await get_provider_entries(redis)
+    if not entries:
+        logger.warning("worker_llm_provider_entries_empty")
+        return
+    if not settings.jwt_secret_key:
+        logger.warning("worker_llm_jwt_secret_missing")
+        return
+
+    first_by_provider: dict[str, object] = {}
+    async with session_factory() as db:
+        for entry in entries:
+            if not entry.enabled or not entry.account_name:
+                continue
+            try:
+                api_key, api_base = await get_account_api_key(
+                    db, entry.account_name, settings.jwt_secret_key
+                )
+            except Exception as exc:
+                logger.warning(
+                    "worker_llm_account_load_failed",
+                    name=entry.name,
+                    account_name=entry.account_name,
+                    error=str(exc),
+                )
+                continue
+
+            model = entry.model or settings.gemini_model
+            provider_name = entry.proxy_service or _extract_proxy_name(api_base or "") or entry.provider_type
+            if entry.provider_type == "gemini" and entry.access_mode == "direct" and not api_base:
+                client = GeminiClient(
+                    api_key=api_key,
+                    model=model,
+                    timeout=settings.llm_timeout_seconds,
+                )
+            elif entry.provider_type == "qwen" and entry.access_mode == "direct":
+                client = QwenClient(
+                    api_key=api_key,
+                    model=model,
+                    timeout=settings.llm_timeout_seconds,
+                )
+            else:
+                client = OpenAICompatClient(
+                    api_key=api_key,
+                    api_base=api_base or _default_api_base_for_provider(entry.provider_type, entry.proxy_service),
+                    model=model,
+                    provider_name=provider_name,
+                    timeout=settings.llm_timeout_seconds,
+                )
+
+            register_client(entry.name, client)
+            first_by_provider.setdefault(entry.provider_type, client)
+            logger.info(
+                "worker_llm_client_registered",
+                name=entry.name,
+                provider_type=entry.provider_type,
+                account_name=entry.account_name,
+            )
+
+    # 保留旧别名，兼容 lightweight eval 等直接写死的 client_name。
+    alias_map = {
+        "gemini": "gemini",
+        "qwen": "qwen",
+        "claude": "claude",
+    }
+    for provider_type, alias in alias_map.items():
+        client = first_by_provider.get(provider_type)
+        if client and get_client(alias) is None:
+            register_client(alias, client)
+            logger.info("worker_llm_alias_registered", alias=alias, provider_type=provider_type)
+
+
+async def _run_worker_role(role: str, session_factory, redis, process_pool) -> None:
+    """
+    独立 Worker 角色主循环 — 由 lifespan 在 worker-eval / worker-pipeline 角色下调用。
+
+    对齐: fix.md §4, §17 (阶段一)
+    """
+    log = structlog.get_logger()
+    log.info("worker_role_starting", role=role)
+
+    if role == "worker-eval":
+        from pdf_sku.worker.eval_worker import EvalWorker
+        from pdf_sku.evaluator.eval_cache import EvalCache
+        from pdf_sku.evaluator.router import EvaluatorService
+        from pdf_sku.config.service import ConfigProvider
+        from pdf_sku.llm_adapter.service import LLMService
+        from pdf_sku.llm_adapter.prompt.engine import PromptEngine
+        from pdf_sku.llm_adapter.parser.response_parser import ResponseParser
+        from pdf_sku.llm_adapter.resilience.circuit_breaker import CircuitBreaker
+        from pdf_sku.llm_adapter.resilience.budget_guard import BudgetGuard
+        from pdf_sku.llm_adapter.resilience.rate_limiter import RateLimiter
+        from pdf_sku.llm_adapter.client.openai_compat import OpenAICompatClient
+        from pdf_sku.llm_adapter.client.registry import register as register_client
+
+        # Worker 进程需要按 Redis provider entries 注册真实运行时 client。
+        await _bootstrap_worker_llm_clients(session_factory, redis)
+        if settings.gemini_api_key and not settings.default_llm_client:
+            client = OpenAICompatClient(
+                api_key=settings.gemini_api_key,
+                api_base=settings.gemini_api_base or "https://generativelanguage.googleapis.com",
+                model=settings.gemini_model,
+                provider_name="google",
+                timeout=settings.llm_timeout_seconds,
+            )
+            register_client("gemini", client)
+
+        llm_service = LLMService(
+            prompt_engine=PromptEngine(),
+            parser=ResponseParser(),
+            circuit_breaker=CircuitBreaker(),
+            budget_guard=BudgetGuard(redis) if settings.gemini_api_key else None,
+            rate_limiter=RateLimiter(redis) if settings.gemini_api_key else None,
+            default_client_name=settings.default_llm_client or "gemini",
+            redis=redis,
+        )
+
+        evaluator_service = EvaluatorService(
+            llm_service=llm_service,
+            cache=EvalCache(redis, session_factory),
+            config_provider=ConfigProvider(),
+            process_pool=process_pool,
+        )
+
+        worker = EvalWorker(session_factory, redis, process_pool)
+        worker.set_evaluator_service(evaluator_service)
+        await worker.run()
+
+    elif role == "worker-pipeline":
+        from pdf_sku.worker.pipeline_worker import PipelineWorker
+        from pdf_sku.pipeline.orchestrator import Orchestrator
+        from pdf_sku.pipeline.page_processor import PageProcessor
+        from pdf_sku.config.service import ConfigProvider
+        from pdf_sku.output.import_adapter import ImportAdapter
+        from pdf_sku.output.backpressure import BackpressureMonitor
+        from pdf_sku.output.importer import IncrementalImporter
+        from pdf_sku.llm_adapter.service import LLMService
+        from pdf_sku.llm_adapter.prompt.engine import PromptEngine
+        from pdf_sku.llm_adapter.parser.response_parser import ResponseParser
+        from pdf_sku.llm_adapter.resilience.circuit_breaker import CircuitBreaker
+        from pdf_sku.llm_adapter.resilience.budget_guard import BudgetGuard
+        from pdf_sku.llm_adapter.resilience.rate_limiter import RateLimiter
+        from pdf_sku.llm_adapter.client.openai_compat import OpenAICompatClient
+        from pdf_sku.llm_adapter.client.registry import register as register_client
+
+        await _bootstrap_worker_llm_clients(session_factory, redis)
+        if settings.gemini_api_key and not settings.default_llm_client:
+            client = OpenAICompatClient(
+                api_key=settings.gemini_api_key,
+                api_base=settings.gemini_api_base or "https://generativelanguage.googleapis.com",
+                model=settings.gemini_model,
+                provider_name="google",
+                timeout=settings.llm_timeout_seconds,
+            )
+            register_client("gemini", client)
+
+        llm_service = LLMService(
+            prompt_engine=PromptEngine(),
+            parser=ResponseParser(),
+            circuit_breaker=CircuitBreaker(),
+            budget_guard=BudgetGuard(redis) if settings.gemini_api_key else None,
+            rate_limiter=RateLimiter(redis) if settings.gemini_api_key else None,
+            default_client_name=settings.default_llm_client or "gemini",
+            redis=redis,
+        )
+
+        orchestrator = Orchestrator(
+            page_processor=PageProcessor(
+                llm_service=llm_service,
+                process_pool=process_pool,
+                config_provider=ConfigProvider(),
+            ),
+            db_session_factory=session_factory,
+            redis=redis,
+            importer=IncrementalImporter(
+                adapter=ImportAdapter(
+                    import_url=settings.downstream_import_url,
+                    check_url=settings.downstream_check_url,
+                ),
+                backpressure=BackpressureMonitor(),
+            ),
+        )
+
+        worker = PipelineWorker(session_factory, redis, process_pool)
+        worker.set_orchestrator(orchestrator)
+        await worker.run()
+
+    else:
+        log.warning("unknown_worker_role", role=role)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _configure_logging()
     log = structlog.get_logger()
-    log.info("startup_begin", env=settings.app_env, worker=settings.worker_id)
+    log.info("startup_begin", env=settings.app_env, worker=settings.worker_id,
+             run_role=settings.run_role)
 
     # Track service readiness
     app.state.services_ready = {
@@ -103,9 +313,50 @@ async def lifespan(app: FastAPI):
         log.error("minio_connection_failed", error=str(e))
         app.state.storage = None
 
-    process_pool = ProcessPoolExecutor(max_workers=2)
+    process_pool_size = (
+        settings.eval_process_pool_size
+        if settings.run_role == "worker-eval"
+        else settings.pipeline_process_pool_size
+        if settings.run_role == "worker-pipeline"
+        else 2  # API 角色保留最小池用于安全检查
+    )
+    process_pool = ProcessPoolExecutor(max_workers=process_pool_size)
     bg_tasks: list[asyncio.Task] = []
 
+    # ─── Worker 角色分支 (fix.md §17 阶段一) ───
+    # worker-eval / worker-pipeline 不启动 HTTP API，只运行消费循环
+    if settings.run_role in ("worker-eval", "worker-pipeline"):
+        if app.state.services_ready.get("database") and app.state.services_ready.get("redis"):
+            from pdf_sku.gateway.heartbeat import heartbeat_loop
+
+            bg_tasks.append(asyncio.create_task(heartbeat_loop(app.state.redis, app.state.session_factory)))
+            worker_task = asyncio.create_task(
+                _run_worker_role(
+                    settings.run_role,
+                    app.state.session_factory,
+                    app.state.redis,
+                    process_pool,
+                )
+            )
+            bg_tasks.append(worker_task)
+            log.info("worker_role_task_started", role=settings.run_role)
+        else:
+            log.error("worker_infra_not_ready", role=settings.run_role,
+                      services=app.state.services_ready)
+        yield
+        log.info("shutdown_begin", role=settings.run_role)
+        for task in bg_tasks:
+            task.cancel()
+        await asyncio.gather(*bg_tasks, return_exceptions=True)
+        process_pool.shutdown(wait=False)
+        if app.state.redis:
+            await app.state.redis.close()
+        if app.state.engine:
+            await app.state.engine.dispose()
+        log.info("shutdown_complete", role=settings.run_role)
+        return
+
+    # ─── 以下仅在 api / scheduler 角色执行 ───
     # ─── 4. Component assembly (only if DB + Redis ready) ───
     if app.state.services_ready["database"] and app.state.services_ready["redis"]:
         session_factory = app.state.session_factory
@@ -131,6 +382,7 @@ async def lifespan(app: FastAPI):
                 prescanner=Prescanner(),
             )
             deps.sse_manager = SSEManager()
+            deps.sse_manager.start_redis_subscriber(redis)
             deps.orphan_scanner = OrphanScanner(session_factory, redis)
             log.info("gateway_initialized")
 
@@ -555,42 +807,6 @@ async def lifespan(app: FastAPI):
             )
             deps.llm_service = llm_service
 
-            # Evaluator
-            from pdf_sku.evaluator.eval_cache import EvalCache
-            from pdf_sku.evaluator.router import EvaluatorService
-            from pdf_sku.config.service import ConfigProvider
-
-            evaluator_service = EvaluatorService(
-                llm_service=llm_service,
-                cache=EvalCache(redis, session_factory),
-                config_provider=ConfigProvider(),
-                process_pool=process_pool,
-            )
-
-            from pdf_sku.evaluator._handler import init_handler as init_eval_handler
-            init_eval_handler(evaluator_service, session_factory)
-            log.info("evaluator_initialized")
-
-            # Pipeline
-            from pdf_sku.pipeline.page_processor import PageProcessor
-            from pdf_sku.pipeline.orchestrator import Orchestrator
-
-            orchestrator = Orchestrator(
-                page_processor=PageProcessor(
-                    llm_service=llm_service,
-                    process_pool=process_pool,
-                    config_provider=ConfigProvider(),
-                ),
-                db_session_factory=session_factory,
-                redis=app.state.redis,
-            )
-
-            app.state.orchestrator = orchestrator
-
-            from pdf_sku.pipeline._handler import init_handler as init_pipeline_handler
-            init_pipeline_handler(orchestrator, session_factory)
-            log.info("pipeline_initialized")
-
             # Output
             from pdf_sku.output.import_adapter import ImportAdapter
             from pdf_sku.output.backpressure import BackpressureMonitor
@@ -606,7 +822,7 @@ async def lifespan(app: FastAPI):
             )
 
             from pdf_sku.output._handler import init_output_handler
-            init_output_handler(importer, session_factory)
+            init_output_handler(importer, session_factory, subscribe_page_completed=False)
             log.info("output_initialized")
 
             # Collaboration
@@ -644,10 +860,6 @@ async def lifespan(app: FastAPI):
             log.info("feedback_initialized")
 
             # Background tasks
-            from pdf_sku.gateway.heartbeat import heartbeat_loop
-
-            bg_tasks.append(asyncio.create_task(heartbeat_loop(redis, session_factory)))
-
             async def orphan_loop():
                 while True:
                     try:
@@ -657,54 +869,6 @@ async def lifespan(app: FastAPI):
                     await asyncio.sleep(60)
 
             bg_tasks.append(asyncio.create_task(orphan_loop()))
-
-            # 定时恢复: 每60秒扫描页面全部终态但 Job 仍卡在 PROCESSING 的任务并自动终态
-            async def _stuck_job_recovery_loop():
-                from sqlalchemy import select as _select
-                from pdf_sku.common.models import PDFJob as _PDFJob, Page as _Page
-                from pdf_sku.common.enums import PageStatus as _PageStatus
-
-                _terminal = {
-                    _PageStatus.AI_COMPLETED.value,
-                    _PageStatus.HUMAN_COMPLETED.value,
-                    _PageStatus.IMPORTED_CONFIRMED.value,
-                    _PageStatus.IMPORTED_ASSUMED.value,
-                    _PageStatus.BLANK.value,
-                    _PageStatus.AI_FAILED.value,
-                    _PageStatus.IMPORT_FAILED.value,
-                    _PageStatus.DEAD_LETTER.value,
-                    _PageStatus.SKIPPED.value,
-                }
-
-                while True:
-                    try:
-                        async with session_factory() as rdb:
-                            jobs = (await rdb.execute(
-                                _select(_PDFJob).where(
-                                    _PDFJob.status.in_(["PROCESSING", "PARTIAL_FAILED"])
-                                )
-                            )).scalars().all()
-
-                            for stuck_job in jobs:
-                                pages = (await rdb.execute(
-                                    _select(_Page.status).where(_Page.job_id == stuck_job.job_id)
-                                )).scalars().all()
-                                if pages and all(s in _terminal for s in pages):
-                                    log.info("recovering_stuck_job", job_id=str(stuck_job.job_id))
-                                    async with session_factory() as fin_db:
-                                        fresh = (await fin_db.execute(
-                                            _select(_PDFJob).where(_PDFJob.job_id == stuck_job.job_id)
-                                        )).scalar_one()
-                                        await orchestrator._finalize_job(fin_db, fresh)
-                                        await fin_db.commit()
-                                    log.info("stuck_job_recovered",
-                                             job_id=str(stuck_job.job_id),
-                                             new_status=fresh.status)
-                    except Exception as _e:
-                        log.warning("stuck_job_recovery_failed", error=str(_e))
-                    await asyncio.sleep(60)
-
-            bg_tasks.append(asyncio.create_task(_stuck_job_recovery_loop()))
             await scheduled_runner.start()
             log.info("background_tasks_started", count=len(bg_tasks))
 
@@ -768,12 +932,15 @@ def _extract_proxy_name(url: str) -> str:
 
 def create_app() -> FastAPI:
     _configure_logging()
+    is_worker_role = settings.run_role in ("worker-eval", "worker-pipeline")
 
     app = FastAPI(
         title=settings.app_title,
         version=_get_version(),
         lifespan=lifespan,
-        docs_url="/docs" if settings.app_env == "development" else None,
+        docs_url="/docs" if settings.app_env == "development" and not is_worker_role else None,
+        redoc_url=None if is_worker_role else "/redoc",
+        openapi_url=None if is_worker_role else "/openapi.json",
     )
 
     # CORS
@@ -799,6 +966,9 @@ def create_app() -> FastAPI:
             status_code=200 if all_ok else 503,
             content={"status": "healthy" if all_ok else "degraded", "services": services},
         )
+
+    if is_worker_role:
+        return app
 
     # ─── Routers ───
     from pdf_sku.auth.router import router as auth_router

@@ -57,6 +57,10 @@ class CrossPageMerger:
         """
         prev_page = current_page - 1
 
+        # 当前页没有表格时不可能构成续表，直接短路。
+        if not raw.tables:
+            return None
+
         # 快速路径: 内存缓存命中
         async with self._get_lock(job_id):
             cached = self._page_cache.get(job_id, {}).get(prev_page)
@@ -78,8 +82,6 @@ class CrossPageMerger:
                             table_count=len(on_demand.tables))
 
         if not cached or not cached.tables:
-            return None
-        if not raw.tables:
             return None
 
         prev_table = cached.tables[-1]  # 前页最后一个表格
