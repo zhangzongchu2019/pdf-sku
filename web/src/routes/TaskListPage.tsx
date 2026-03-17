@@ -8,10 +8,17 @@ import StatusBadge from "../components/common/StatusBadge";
 import Pagination from "../components/common/Pagination";
 import Loading from "../components/common/Loading";
 import EmptyState from "../components/common/EmptyState";
-import { formatDate } from "../utils/format";
+import { formatDate, statusLabel } from "../utils/format";
 import type { HumanTask } from "../types/models";
 
-const STATUSES = ["", "CREATED", "LOCKED", "COMPLETED", "SKIPPED", "ESCALATED"];
+const STATUSES = [
+  { value: "", label: "全部" },
+  { value: "CREATED", label: statusLabel("CREATED") },
+  { value: "PROCESSING", label: statusLabel("PROCESSING") },
+  { value: "COMPLETED", label: statusLabel("COMPLETED") },
+  { value: "SKIPPED", label: statusLabel("SKIPPED") },
+  { value: "ESCALATED", label: statusLabel("ESCALATED") },
+];
 
 export default function TaskListPage() {
   const navigate = useNavigate();
@@ -132,9 +139,9 @@ export default function TaskListPage() {
         </label>
         <span className="text-muted">当前显示 {tasks.length} 条</span>
         {STATUSES.map((s) => (
-          <button key={s} className={`btn btn-filter ${filter === s ? "active" : ""}`}
-                  onClick={() => { setFilter(s); setPage(1); }}>
-            {s || "全部"}
+          <button key={s.value} className={`btn btn-filter ${filter === s.value ? "active" : ""}`}
+                  onClick={() => { setFilter(s.value); setPage(1); }}>
+            {s.label}
           </button>
         ))}
       </div>

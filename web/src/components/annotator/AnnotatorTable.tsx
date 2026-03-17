@@ -1,6 +1,7 @@
 /**
  * 标注员表格
  */
+import { statusLabel } from "../../utils/format";
 
 export interface AnnotatorRow {
   annotator_id: string;
@@ -146,7 +147,7 @@ function StatusDot({ status }: { status: string }) {
           backgroundColor: color,
         }}
       />
-      <span style={{ color, fontSize: 11 }}>{status}</span>
+      <span style={{ color, fontSize: 11 }}>{statusLabel(status)}</span>
     </span>
   );
 }

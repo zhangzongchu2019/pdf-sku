@@ -2,6 +2,7 @@
  * 评测报告列表
  */
 import type { EvalReportSummary } from "../../types/models";
+import { statusLabel } from "../../utils/format";
 
 interface EvalReportTableProps {
   reports: EvalReportSummary[];
@@ -148,7 +149,7 @@ function StatusBadge({ status }: { status: string }) {
         color,
       }}
     >
-      {status}
+      {statusLabel(status)}
     </span>
   );
 }

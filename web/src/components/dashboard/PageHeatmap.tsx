@@ -5,6 +5,7 @@
  */
 import { useRef, useEffect, useState, useCallback } from "react";
 import { STATUS_COLORS } from "../../utils/designTokens";
+import { statusLabel } from "../../utils/format";
 
 export interface PageHeatmapCell {
   page_no: number;
@@ -156,7 +157,7 @@ export function PageHeatmap({ pages, onPageClick }: PageHeatmapProps) {
                 display: "inline-block",
               }}
             />
-            <span style={{ fontSize: 10, color: "#64748B" }}>{status}</span>
+            <span style={{ fontSize: 10, color: "#64748B" }}>{statusLabel(status)}</span>
           </div>
         ))}
       </div>

@@ -1,9 +1,9 @@
 export enum JobStatus {
-  PROCESSING = "PROCESSING",
-  COMPLETED = "COMPLETED",
-  PARTIAL = "PARTIAL",
-  FAILED = "FAILED",
-  CANCELLED = "CANCELLED",
+  PROCESSING = "processing",
+  PARTIAL_SUCCESS = "partial_success",
+  COMPLETED = "completed",
+  NEEDS_MANUAL = "needs_manual",
+  FAILED = "failed",
 }
 
 export enum PageStatus {
@@ -20,11 +20,10 @@ export enum PageStatus {
 
 export enum TaskStatus {
   CREATED = "CREATED",
-  LOCKED = "LOCKED",
+  PROCESSING = "PROCESSING",
   COMPLETED = "COMPLETED",
   SKIPPED = "SKIPPED",
   ESCALATED = "ESCALATED",
-  TIMEOUT = "TIMEOUT",
 }
 
 export enum PageType { A = "A", B = "B", C = "C", D = "D", PV = "PV" }

@@ -1,6 +1,7 @@
 /**
  * 页面状态表格 — Job 详情中按页面展示状态列表
  */
+import { statusLabel } from "../../utils/format";
 
 export interface PageStatusRow {
   page_no: number;
@@ -112,7 +113,7 @@ function StatusDot({ status }: { status: string }) {
           display: "inline-block",
         }}
       />
-      <span style={{ color, fontSize: 11 }}>{status}</span>
+      <span style={{ color, fontSize: 11 }}>{statusLabel(status)}</span>
     </span>
   );
 }

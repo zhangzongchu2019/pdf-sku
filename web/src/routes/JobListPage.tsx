@@ -6,9 +6,16 @@ import StatusBadge from "../components/common/StatusBadge";
 import Pagination from "../components/common/Pagination";
 import Loading from "../components/common/Loading";
 import EmptyState from "../components/common/EmptyState";
-import { formatDate } from "../utils/format";
+import { formatDate, statusLabel } from "../utils/format";
 
-const STATUSES = ["", "PROCESSING", "COMPLETED", "PARTIAL", "FAILED", "CANCELLED"];
+const STATUSES = [
+  { value: "", label: "全部" },
+  { value: "processing", label: statusLabel("processing") },
+  { value: "completed", label: statusLabel("completed") },
+  { value: "partial_success", label: statusLabel("partial_success") },
+  { value: "needs_manual", label: statusLabel("needs_manual") },
+  { value: "failed", label: statusLabel("failed") },
+];
 
 export default function JobListPage() {
   const { jobs, total, loading, fetchJobs, cancelJob, deleteJob } = useJobStore();
@@ -44,9 +51,9 @@ export default function JobListPage() {
 
       <div className="filter-bar">
         {STATUSES.map((s) => (
-          <button key={s} className={`btn btn-filter ${filter === s ? "active" : ""}`}
-                  onClick={() => { setFilter(s); setPage(1); }}>
-            {s || "全部"}
+          <button key={s.value} className={`btn btn-filter ${filter === s.value ? "active" : ""}`}
+                  onClick={() => { setFilter(s.value); setPage(1); }}>
+            {s.label}
           </button>
         ))}
       </div>
@@ -79,10 +86,10 @@ export default function JobListPage() {
                   <td>{job.total_skus}</td>
                   <td>{formatDate(job.created_at)}</td>
                   <td>
-                    {job.user_status === "PROCESSING" && (
+                    {job.user_status === "processing" && (
                       <button className="btn btn-text btn-sm" onClick={() => cancelJob(job.job_id)}>取消</button>
                     )}
-                    {job.user_status === "FAILED" && (
+                    {job.user_status === "failed" && (
                       <button className="btn btn-text btn-sm" onClick={() => useJobStore.getState().retryJob(job.job_id)}>重试</button>
                     )}
                     <button

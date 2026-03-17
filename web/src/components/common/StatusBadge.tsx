@@ -1,4 +1,4 @@
-import { statusColor } from "../../utils/format";
+import { statusColor, statusLabel } from "../../utils/format";
 
 export default function StatusBadge({ status }: { status: string }) {
   return (
@@ -7,7 +7,7 @@ export default function StatusBadge({ status }: { status: string }) {
       color: statusColor(status),
       border: `1px solid ${statusColor(status)}40`,
     }}>
-      {status}
+      {statusLabel(status)}
     </span>
   );
 }

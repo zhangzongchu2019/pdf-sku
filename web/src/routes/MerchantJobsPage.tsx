@@ -7,6 +7,7 @@ import { opsApi } from "../api/ops";
 import { jobsApi } from "../api/jobs";
 import Pagination from "../components/common/Pagination";
 import type { MerchantStats, Job } from "../types/models";
+import { statusLabel } from "../utils/format";
 
 const STATUS_COLORS: Record<string, string> = {
   processing: "#3B82F6",
@@ -151,7 +152,7 @@ export default function MerchantJobsPage() {
                         backgroundColor: (STATUS_COLORS[j.user_status] ?? "#94A3B8") + "18",
                       }}
                     >
-                      {j.user_status}
+                      {statusLabel(j.user_status)}
                     </span>
                   </td>
                   <td style={{ padding: "8px", color: "#94A3B8" }}>{j.total_pages}</td>
