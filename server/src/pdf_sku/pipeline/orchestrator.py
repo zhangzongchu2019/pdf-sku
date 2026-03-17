@@ -28,11 +28,14 @@ from pdf_sku.gateway.event_bus import event_bus
 from pdf_sku.gateway.user_status import update_job_status, refresh_job_page_stats
 from pdf_sku.pipeline.ir import PageResult, BindingResult
 from pdf_sku.pipeline.page_processor import PageProcessor
+from pdf_sku.settings import settings
 import structlog
 
 logger = structlog.get_logger()
 
-PIPELINE_CONCURRENCY_FALLBACK = int(os.environ.get("PIPELINE_CONCURRENCY", "5"))
+PIPELINE_CONCURRENCY_FALLBACK = int(
+    os.environ.get("PIPELINE_CONCURRENCY", str(settings.pipeline_page_concurrency))
+)
 
 _SIZE_KEYS = ["size", "尺寸", "规格", "specification", "spec"]
 
@@ -326,6 +329,15 @@ class Orchestrator:
         await update_job_status(db, job_id, JobInternalStatus.PROCESSING.value,
                                 trigger="pipeline_start")
         await db.commit()
+        if self._redis:
+            await publish_job_event(
+                self._redis,
+                JobEvent.JOB_STARTED,
+                job_id=job_id,
+                stage="pipeline",
+                status=JobInternalStatus.PROCESSING.value,
+                trace_id=trace_id,
+            )
 
         try:
             if requested_pages:
@@ -344,12 +356,12 @@ class Orchestrator:
                         await final_db.execute(select(PDFJob).where(PDFJob.job_id == job_uuid))
                     ).scalar_one()
                     await update_job_status(final_db, job_id, "FULL_IMPORTED", trigger="all_blank")
+                    await final_db.commit()
                     await self._publish_final_job_event(
                         str(fresh.job_id),
                         JobInternalStatus.FULL_IMPORTED.value,
                         trace_id=trace_id,
                     )
-                    await final_db.commit()
                 return
 
             await self._process_parallel(job, non_blank, file_path, trace_id=trace_id)
@@ -359,8 +371,10 @@ class Orchestrator:
                 result = await final_db.execute(
                     select(PDFJob).where(PDFJob.job_id == job_uuid))
                 fresh_job = result.scalar_one()
-                await self._finalize_job(final_db, fresh_job, trace_id=trace_id)
+                final_event = await self._finalize_job(final_db, fresh_job, trace_id=trace_id)
                 await final_db.commit()
+                if final_event:
+                    await self._publish_final_job_event(**final_event)
 
         except Exception as e:
             logger.exception("pipeline_failed", job_id=job_id)
@@ -397,10 +411,16 @@ class Orchestrator:
         async def process_one(page_no: int):
             async with semaphore:
                 async with self._db_factory() as page_db:
+                    start_event = await self._mark_page_processing(page_db, job, page_no)
+                    await page_db.commit()
+                    await self._publish_page_started(start_event, trace_id=trace_id)
+
                     result = await self._process_single_page(
                         page_db, job, page_no, file_path, trace_id=trace_id)
-                    await self._on_page_done(page_db, job, page_no, result, trace_id=trace_id)
+                    page_event = await self._on_page_done(
+                        page_db, job, page_no, result, trace_id=trace_id)
                     await page_db.commit()
+                    await self._publish_page_event(page_event, trace_id=trace_id)
 
         results = await asyncio.gather(
             *[process_one(p) for p in pages],
@@ -411,6 +431,36 @@ class Orchestrator:
             if isinstance(r, Exception):
                 logger.error("page_parallel_failed",
                              page_no=pages[i], error=str(r))
+
+    async def _mark_page_processing(
+        self,
+        db: AsyncSession,
+        job: PDFJob,
+        page_no: int,
+    ) -> dict:
+        await db.execute(
+            update(Page).where(
+                Page.job_id == job.job_id,
+                Page.page_number == page_no,
+            ).values(status=PageStatus.AI_PROCESSING.value)
+        )
+        return {
+            "job_id": str(job.job_id),
+            "page_no": page_no,
+            "status": PageStatus.AI_PROCESSING.value,
+        }
+
+    async def _publish_page_started(self, page_event: dict, *, trace_id: str = "") -> None:
+        await event_bus.publish("PageStarted", page_event)
+        if self._redis:
+            await publish_job_event(
+                self._redis,
+                JobEvent.PAGE_STARTED,
+                job_id=page_event["job_id"],
+                page_no=page_event["page_no"],
+                status=page_event["status"],
+                trace_id=trace_id,
+            )
 
     async def _process_single_page(
         self,
@@ -423,21 +473,6 @@ class Orchestrator:
     ) -> PageResult:
         """单页处理 + 异常降级。"""
         try:
-            await event_bus.publish("PageStatusChanged", {
-                "job_id": str(job.job_id),
-                "page_no": page_no,
-                "status": "AI_PROCESSING",
-            })
-            if self._redis:
-                await publish_job_event(
-                    self._redis,
-                    JobEvent.PAGE_STARTED,
-                    job_id=str(job.job_id),
-                    page_no=page_no,
-                    status=PageStatus.AI_PROCESSING.value,
-                    trace_id=trace_id,
-                )
-
             result = await self._pp.process_page(
                 job_id=str(job.job_id),
                 file_path=file_path,
@@ -451,16 +486,6 @@ class Orchestrator:
         except Exception as e:
             logger.error("page_processing_error",
                          job_id=str(job.job_id), page_no=page_no, error=str(e))
-            if self._redis:
-                await publish_job_event(
-                    self._redis,
-                    JobEvent.PAGE_FAILED,
-                    job_id=str(job.job_id),
-                    page_no=page_no,
-                    status=PageStatus.AI_FAILED.value,
-                    error=str(e),
-                    trace_id=trace_id,
-                )
             return PageResult(
                 status="AI_FAILED",
                 error=str(e),
@@ -475,7 +500,7 @@ class Orchestrator:
         result: PageResult,
         *,
         trace_id: str = "",
-    ) -> None:
+    ) -> dict:
         """
         每页完成: 落库 → 事件 → 人工任务(如需)。
         [C5] 导入成功后才保存 Checkpoint
@@ -544,13 +569,18 @@ class Orchestrator:
         await refresh_job_page_stats(db, str(job.job_id))
 
         # 发布事件
-        await event_bus.publish("PageCompleted", {
+        event_name = "PageFailed" if new_status == PageStatus.AI_FAILED.value else "PageCompleted"
+        redis_event = JobEvent.PAGE_FAILED if new_status == PageStatus.AI_FAILED.value else JobEvent.PAGE_COMPLETED
+        return {
+            "event_name": event_name,
+            "redis_event": redis_event,
             "job_id": str(job.job_id),
             "page_number": page_no,
             "page_no": page_no,
             "status": result.status,
             "sku_count": valid_sku_count,
             "needs_review": result.needs_review,
+            "error": result.error,
             "skus": [
                 {
                     "sku_id": sku.sku_id,
@@ -561,17 +591,27 @@ class Orchestrator:
                 }
                 for sku in result.skus
             ],
-        })
+            "new_status": new_status,
+        }
+
+    async def _publish_page_event(self, page_event: dict, *, trace_id: str = "") -> None:
+        event_name = page_event["event_name"]
+        event_payload = {k: v for k, v in page_event.items() if k not in {"event_name", "redis_event", "new_status"}}
+        await event_bus.publish(event_name, event_payload)
+
         if self._redis:
             await publish_job_event(
                 self._redis,
-                JobEvent.PAGE_COMPLETED,
-                job_id=str(job.job_id),
-                page_no=page_no,
-                status=new_status,
-                sku_count=valid_sku_count,
+                page_event["redis_event"],
+                job_id=page_event["job_id"],
+                page_no=page_event["page_no"],
+                status=page_event["new_status"],
+                sku_count=page_event["sku_count"],
                 trace_id=trace_id,
-                extra={"needs_review": result.needs_review},
+                extra={
+                    "needs_review": page_event["needs_review"],
+                    "error": page_event["error"],
+                },
             )
 
     async def _persist_skus(
@@ -676,7 +716,7 @@ class Orchestrator:
         job: PDFJob,
         *,
         trace_id: str = "",
-    ) -> None:
+    ) -> dict | None:
         """
         [C2] 终态判定 (以 page status 为准)。
         """
@@ -714,16 +754,22 @@ class Orchestrator:
         await refresh_job_page_stats(db, str(job.job_id))
         await update_job_status(db, str(job.job_id), new_status,
                                 trigger="pipeline_finalize")
-        await self._publish_final_job_event(
-            str(job.job_id),
-            new_status,
-            trace_id=trace_id,
-        )
 
         logger.info("pipeline_finalized",
                      job_id=str(job.job_id),
                      final_status=new_status,
                      completed=completed, failed=failed, human=human)
+        return {
+            "job_id": str(job.job_id),
+            "status": new_status,
+            "total_skus": job.total_skus or 0,
+            "total_images": job.total_images or 0,
+            "duration_sec": max(
+                0.0,
+                (datetime.now(timezone.utc) - job.created_at).total_seconds(),
+            ) if getattr(job, "created_at", None) else 0.0,
+            "trace_id": trace_id,
+        }
 
     @staticmethod
     def _resolve_file_path(job: PDFJob) -> str:
@@ -736,6 +782,9 @@ class Orchestrator:
         job_id: str,
         status: str,
         *,
+        total_skus: int = 0,
+        total_images: int = 0,
+        duration_sec: float = 0.0,
         trace_id: str = "",
         error: str | None = None,
     ) -> None:
@@ -758,4 +807,9 @@ class Orchestrator:
             status=status,
             trace_id=trace_id,
             error=error,
+            extra={
+                "total_skus": total_skus,
+                "total_images": total_images,
+                "duration_sec": duration_sec,
+            } if event == JobEvent.JOB_COMPLETED else None,
         )

@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef, useCallback } from "react";
+import { Fragment, useEffect, useState, useRef, useCallback } from "react";
 import { useParams, Link } from "react-router-dom";
 import { useJobStore } from "../stores/jobStore";
 import { useSSEStore } from "../stores/sseStore";
@@ -13,7 +13,7 @@ import { EvaluationCard } from "../components/dashboard/EvaluationCard";
 import { PrescanCard } from "../components/dashboard/PrescanCard";
 import { SKUList } from "../components/dashboard/SKUList";
 import { TimelineDrawer } from "../components/dashboard/TimelineDrawer";
-import { formatDate, formatPercent } from "../utils/format";
+import { formatDate, formatPercent, statusLabel } from "../utils/format";
 import type { PageHeatmapCell } from "../components/dashboard/PageHeatmap";
 
 // ── 实时活动面板 ──
@@ -25,10 +25,25 @@ interface ActivityEntry {
   level: "info" | "success" | "warning" | "error";
 }
 
+const formatPageEvent = (d: any) => {
+  const pageNo = d.page_no ?? "?";
+  const status = d.status ?? "";
+  if (status === "AI_PROCESSING") return `第 ${pageNo} 页开始处理`;
+  if (["AI_COMPLETED", "HUMAN_COMPLETED", "IMPORTED_CONFIRMED", "IMPORTED_ASSUMED", "BLANK", "SKIPPED"].includes(status)) {
+    return `第 ${pageNo} 页处理完成${d.sku_count ? `，${d.sku_count} 个 SKU` : ""}`;
+  }
+  if (status === "AI_FAILED" || status === "IMPORT_FAILED" || status === "DEAD_LETTER") {
+    return `第 ${pageNo} 页处理失败${d.error ? `：${d.error}` : ""}`;
+  }
+  return `第 ${pageNo} 页状态更新为 ${statusLabel(status || "PENDING")}`;
+};
+
 const EVENT_CONFIG: Record<string, { label: string; level: ActivityEntry["level"]; format: (d: any) => string }> = {
-  page_completed:     { label: "页面完成", level: "success", format: (d) => `第 ${d.page_no} 页处理完成${d.sku_count ? `，${d.sku_count} 个 SKU` : ""}` },
+  page_started:       { label: "页面开始", level: "info",    format: formatPageEvent },
+  page_completed:     { label: "页面更新", level: "success", format: formatPageEvent },
+  page_failed:        { label: "页面失败", level: "error",   format: formatPageEvent },
   pages_batch_update: { label: "批量更新", level: "info",    format: (d) => `${d.completed ?? "?"} 页已完成` },
-  job_completed:      { label: "Job 完成", level: "success", format: (d) => `处理完成，共 ${d.total_skus} 个 SKU` },
+  job_completed:      { label: "Job 完成", level: "success", format: (d) => `处理完成，共 ${d.total_skus ?? 0} 个 SKU` },
   job_failed:         { label: "Job 失败", level: "error",   format: (d) => d.error_message || "处理失败" },
   human_needed:       { label: "需人工",   level: "warning", format: (d) => `${d.task_count} 个任务需要人工标注` },
   sla_escalated:      { label: "SLA 升级", level: "warning", format: (d) => `任务 SLA 升级至 ${d.sla_level}` },
@@ -939,6 +954,7 @@ export default function JobDetailPage() {
   const [reprocessing, setReprocessing] = useState(false);
   const [reprocessingPage, setReprocessingPage] = useState<number | null>(null);
   const actIdRef = useRef(0);
+  const pageRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const addActivity = useCallback((event: string, data: any) => {
     // 心跳事件不记录，避免刷屏
@@ -962,14 +978,31 @@ export default function JobDetailPage() {
 
     const unsub = onEvent((e) => {
       addActivity(e.event, e.data);
-      if (!e.data.job_id || e.data.job_id === jobId) {
-        fetchJob(jobId);
-        fetchPages(jobId);
+      if (e.data.job_id && e.data.job_id !== jobId) return;
+
+      if (["page_started", "page_completed", "page_failed"].includes(e.event)) {
+        if (pageRefreshTimerRef.current) clearTimeout(pageRefreshTimerRef.current);
+        pageRefreshTimerRef.current = setTimeout(() => {
+          fetchPages(jobId);
+          if (expandedPage === e.data.page_no) {
+            jobsApi.getPageDetail(jobId, e.data.page_no).then(setPageDetail).catch(() => {});
+          }
+        }, 250);
       }
+
+      const shouldRefetchJob = ["job_completed", "job_failed", "human_needed", "pages_batch_update"].includes(e.event);
+      const shouldRefetchPages = ["job_completed", "job_failed", "pages_batch_update"].includes(e.event);
+
+      if (shouldRefetchJob) fetchJob(jobId);
+      if (shouldRefetchPages) fetchPages(jobId);
     });
 
-    return () => { disconnect(); unsub(); };
-  }, [jobId]);
+    return () => {
+      disconnect();
+      unsub();
+      if (pageRefreshTimerRef.current) clearTimeout(pageRefreshTimerRef.current);
+    };
+  }, [jobId, expandedPage]);
 
   useEffect(() => {
     if (jobId && selectedPage !== null) {
@@ -1301,7 +1334,7 @@ export default function JobDetailPage() {
           </thead>
           <tbody>
             {pages.map((p) => (
-              <>
+              <Fragment key={p.id}>
                 <tr key={p.id} className={selectedPage === p.page_number ? "selected" : ""}
                     onClick={() => toggleExpand(p.page_number)}
                     style={{ cursor: "pointer" }}>
@@ -1386,7 +1419,7 @@ export default function JobDetailPage() {
                     </td>
                   </tr>
                 )}
-              </>
+              </Fragment>
             ))}
           </tbody>
         </table>

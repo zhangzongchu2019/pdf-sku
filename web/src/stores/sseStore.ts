@@ -5,7 +5,7 @@ import { useJobStore } from "./jobStore";
 import { useNotificationStore } from "./notificationStore";
 import type { Job } from "../types/models";
 import type {
-  SSEPageCompleted,
+  SSEPageEvent,
   SSEJobCompleted,
   SSEJobFailed,
   SSEHumanNeeded,
@@ -60,16 +60,32 @@ export const useSSEStore = create<SSEState>()(
         handlers.forEach((h) => h({ event, data }));
       };
 
-      // [V1.1 B1] 9 event types
+      // SSE page/job lifecycle events
       es.addEventListener("heartbeat", () => {
         set((s) => { s.lastHeartbeat = Date.now(); });
       });
 
+      es.addEventListener("page_started", (e: MessageEvent) => {
+        try {
+          const data: SSEPageEvent = JSON.parse(e.data);
+          useJobStore.getState().updatePageStatus(data.page_no, data.status ?? "AI_PROCESSING");
+          dispatch("page_started", data);
+        } catch { /* ignore */ }
+      });
+
       es.addEventListener("page_completed", (e: MessageEvent) => {
         try {
-          const data: SSEPageCompleted = JSON.parse(e.data);
+          const data: SSEPageEvent = JSON.parse(e.data);
           useJobStore.getState().updatePageStatus(data.page_no, data.status ?? "AI_COMPLETED");
           dispatch("page_completed", data);
+        } catch { /* ignore */ }
+      });
+
+      es.addEventListener("page_failed", (e: MessageEvent) => {
+        try {
+          const data: SSEPageEvent = JSON.parse(e.data);
+          useJobStore.getState().updatePageStatus(data.page_no, data.status ?? "AI_FAILED");
+          dispatch("page_failed", data);
         } catch { /* ignore */ }
       });
 
@@ -86,7 +102,7 @@ export const useSSEStore = create<SSEState>()(
           useJobStore.getState().updateJobFromSSE(data.job_id, { status: data.status as Job["status"] });
           useNotificationStore.getState().add({
             level: "info",
-            message: `Job 处理完成，共 ${data.total_skus} 个 SKU`,
+            message: `Job 处理完成，共 ${data.total_skus ?? 0} 个 SKU`,
             jobId: data.job_id,
           });
           dispatch("job_completed", data);

@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     eval_process_pool_size: int = 2
     pipeline_process_pool_size: int = 4
     pipeline_page_concurrency: int = 4
+    eval_job_concurrency: int = 1
+    pipeline_job_concurrency: int = 1
 
     # === Queue ===
     queue_claim_idle_ms: int = 60000

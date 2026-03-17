@@ -7,8 +7,8 @@ describe('Enum completeness', () => {
     expect(values).toHaveLength(5);
   });
 
-  it('SSEEventType has 9 events', () => {
-    const events = ['heartbeat','page_completed','pages_batch_update','job_completed','job_failed','human_needed','sla_escalated','sla_auto_resolve','sla_auto_accepted'];
-    expect(events).toHaveLength(9);
+  it('SSEEventType has 12 events', () => {
+    const events = ['heartbeat','page_started','page_completed','page_failed','pages_batch_update','job_completed','job_failed','human_needed','sla_escalated','sla_auto_resolve','sla_auto_accepted','job_deleted'];
+    expect(events).toHaveLength(12);
   });
 });

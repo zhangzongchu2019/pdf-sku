@@ -41,6 +41,23 @@ logger = structlog.get_logger()
 _render_pool: ProcessPoolExecutor | None = None
 
 
+def _render_page(file_path: str, page_no: int, dpi: int = 150) -> bytes:
+    """在子进程中渲染单页 PDF 为 PNG。"""
+    import fitz
+
+    doc = fitz.open(file_path)
+    try:
+        if 1 <= page_no <= doc.page_count:
+            zoom = dpi / 72
+            mat = fitz.Matrix(zoom, zoom)
+            page = doc[page_no - 1]
+            pix = page.get_pixmap(matrix=mat)
+            return pix.tobytes("png")
+        return b""
+    finally:
+        doc.close()
+
+
 def _render_pages_batch(file_path: str, pages: list[int], dpi: int = 150) -> list[bytes]:
     """在子进程中渲染 PDF 页面为 PNG 截图。"""
     import fitz
@@ -173,8 +190,12 @@ class EvaluatorService:
         file_path = self._resolve_file_path(job)
         loop = asyncio.get_event_loop()
         if self._pool:
-            screenshots = await loop.run_in_executor(
-                self._pool, _render_pages_batch, str(file_path), sample_pages)
+            screenshots = await asyncio.gather(
+                *[
+                    loop.run_in_executor(self._pool, _render_page, str(file_path), page_no)
+                    for page_no in sample_pages
+                ]
+            )
         else:
             screenshots = _render_pages_batch(str(file_path), sample_pages)
 

@@ -89,6 +89,7 @@ class EvalWorker:
         logger.info("eval_worker_started", consumer=self._consumer_name)
 
         reclaim_counter = 0
+        message_concurrency = max(1, min(settings.eval_job_concurrency, settings.queue_batch_size))
         while self._running:
             try:
                 # 每 10 轮扫描一次 pending
@@ -108,8 +109,18 @@ class EvalWorker:
                     batch_size=settings.queue_batch_size,
                     block_ms=5000,
                 )
-                for msg_id, fields in messages:
-                    await self._handle(msg_id, fields)
+                if not messages:
+                    continue
+
+                semaphore = asyncio.Semaphore(message_concurrency)
+
+                async def handle_one(msg_id: str, fields: dict) -> None:
+                    async with semaphore:
+                        await self._handle(msg_id, fields)
+
+                await asyncio.gather(
+                    *(handle_one(msg_id, fields) for msg_id, fields in messages)
+                )
 
             except asyncio.CancelledError:
                 logger.info("eval_worker_cancelled")

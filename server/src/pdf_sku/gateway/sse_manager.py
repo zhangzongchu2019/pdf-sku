@@ -49,6 +49,7 @@ class SSEManager:
     def _setup_subscriptions(self) -> None:
         """订阅 EventBus 事件 → 分发到对应 Job 的 SSE 队列。"""
         for evt in [
+            "PageStarted", "PageCompleted", "PageFailed",
             "PageStatusChanged", "JobStatusChanged", "JobFailed",
             "HumanNeeded", "SLAEscalated", "JobDeleted",
         ]:
@@ -104,9 +105,9 @@ class SSEManager:
             "job_queued": "JobStatusChanged",
             "job_started": "JobStatusChanged",
             "job_stage_changed": "JobStatusChanged",
-            "page_started": "PageStatusChanged",
-            "page_completed": "PageStatusChanged",
-            "page_failed": "PageStatusChanged",
+            "page_started": "PageStarted",
+            "page_completed": "PageCompleted",
+            "page_failed": "PageFailed",
             "job_completed": "JobStatusChanged",
             "job_failed": "JobFailed",
             "human_needed": "HumanNeeded",
@@ -165,11 +166,6 @@ class SSEManager:
                     if status == "DELETED":
                         break
                     if status in TERMINAL_STATUSES:
-                        yield self._make_sse(
-                            SSEEventType.JOB_COMPLETED if status == JobInternalStatus.FULL_IMPORTED.value
-                            else SSEEventType.JOB_FAILED,
-                            data,
-                        )
                         break
 
                 except asyncio.TimeoutError:
@@ -192,9 +188,32 @@ class SSEManager:
     def _map_event_type(self, data: dict) -> str:
         """将 EventBus 事件名映射到 SSE event type。"""
         evt = data.get("_event_type", "")
+        if evt == "PageStatusChanged":
+            status = data.get("status", "")
+            if status == JobInternalStatus.PROCESSING.value or status == "AI_PROCESSING":
+                return SSEEventType.PAGE_STARTED
+            if status == "AI_FAILED":
+                return SSEEventType.PAGE_FAILED
+            return SSEEventType.PAGE_COMPLETED
+        if evt == "JobStatusChanged":
+            status = data.get("status", "")
+            if status in {
+                JobInternalStatus.FULL_IMPORTED.value,
+                JobInternalStatus.PARTIAL_IMPORTED.value,
+            }:
+                return SSEEventType.JOB_COMPLETED
+            if status in {
+                JobInternalStatus.PARTIAL_FAILED.value,
+                JobInternalStatus.EVAL_FAILED.value,
+                JobInternalStatus.CANCELLED.value,
+                JobInternalStatus.REJECTED.value,
+            }:
+                return SSEEventType.JOB_FAILED
+            return SSEEventType.HEARTBEAT
         mapping = {
-            "PageStatusChanged": SSEEventType.PAGE_COMPLETED,
-            "JobStatusChanged": SSEEventType.JOB_COMPLETED,
+            "PageStarted": SSEEventType.PAGE_STARTED,
+            "PageCompleted": SSEEventType.PAGE_COMPLETED,
+            "PageFailed": SSEEventType.PAGE_FAILED,
             "JobFailed": SSEEventType.JOB_FAILED,
             "HumanNeeded": SSEEventType.HUMAN_NEEDED,
             "SLAEscalated": SSEEventType.SLA_ESCALATED,

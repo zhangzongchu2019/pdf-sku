@@ -2,20 +2,24 @@
 
 export type SSEEventType =
   | "heartbeat"
+  | "page_started"
   | "page_completed"
+  | "page_failed"
   | "pages_batch_update"
   | "job_completed"
   | "job_failed"
   | "human_needed"
   | "sla_escalated"
   | "sla_auto_resolve"
-  | "sla_auto_accepted";
+  | "sla_auto_accepted"
+  | "job_deleted";
 
-export interface SSEPageCompleted {
+export interface SSEPageEvent {
   page_no: number;
   status: string;
   confidence: number | null;
   sku_count: number;
+  error?: string;
 }
 
 export interface SSEPagesBatchUpdate {

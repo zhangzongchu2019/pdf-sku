@@ -165,7 +165,8 @@ class ErrorSeverity(StrEnum):
 
 # §2.9 SSE 事件
 class SSEEventType(StrEnum):
-    HEARTBEAT = "heartbeat"; PAGE_COMPLETED = "page_completed"
+    HEARTBEAT = "heartbeat"; PAGE_STARTED = "page_started"
+    PAGE_COMPLETED = "page_completed"; PAGE_FAILED = "page_failed"
     PAGES_BATCH_UPDATE = "pages_batch_update"; JOB_COMPLETED = "job_completed"
     JOB_FAILED = "job_failed"; HUMAN_NEEDED = "human_needed"
     SLA_ESCALATED = "sla_escalated"; SLA_AUTO_RESOLVE = "sla_auto_resolve"

@@ -86,6 +86,7 @@ class PipelineWorker:
         logger.info("pipeline_worker_started", consumer=self._consumer_name)
 
         reclaim_counter = 0
+        message_concurrency = max(1, min(settings.pipeline_job_concurrency, settings.queue_batch_size))
         while self._running:
             try:
                 reclaim_counter += 1
@@ -104,8 +105,18 @@ class PipelineWorker:
                     batch_size=settings.queue_batch_size,
                     block_ms=5000,
                 )
-                for msg_id, fields in messages:
-                    await self._handle(msg_id, fields)
+                if not messages:
+                    continue
+
+                semaphore = asyncio.Semaphore(message_concurrency)
+
+                async def handle_one(msg_id: str, fields: dict) -> None:
+                    async with semaphore:
+                        await self._handle(msg_id, fields)
+
+                await asyncio.gather(
+                    *(handle_one(msg_id, fields) for msg_id, fields in messages)
+                )
 
             except asyncio.CancelledError:
                 logger.info("pipeline_worker_cancelled")
@@ -151,14 +162,6 @@ class PipelineWorker:
                             status=job.status if job else "NOT_FOUND")
                 await ack(self._redis, "pipeline", msg_id)
                 return
-
-            # 发布 job_started 事件
-            await publish_job_event(
-                self._redis, JobEvent.JOB_STARTED,
-                job_id=job_id, stage="pipeline",
-                status=JobInternalStatus.PROCESSING.value,
-                trace_id=trace_id,
-            )
 
             # 执行 pipeline（包含超时保护）
             await _claim_job_for_pipeline(self._session_factory, job_id, settings.worker_id)

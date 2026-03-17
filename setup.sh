@@ -158,8 +158,10 @@ setup_frontend() {
 start_dev_services() {
     info "启动后端服务..."
     cd "$SERVER_DIR"
-    PYTHONPATH="$SERVER_DIR/src" "$VENV/bin/python" -m uvicorn "pdf_sku.main:create_app" --factory \
+    PYTHONPATH="$SERVER_DIR/src" RUN_ROLE=api "$VENV/bin/python" -m uvicorn "pdf_sku.main:create_app" --factory \
         --host 0.0.0.0 --port 8000 --reload --reload-dir src &
+    PYTHONPATH="$SERVER_DIR/src" RUN_ROLE=worker-eval EVAL_PROCESS_POOL_SIZE=4 python -m uvicorn pdf_sku.main:create_app --factory --port 8001 &
+    PYTHONPATH="$SERVER_DIR/src" RUN_ROLE=worker-pipeline PIPELINE_PROCESS_POOL_SIZE=8 python -m uvicorn pdf_sku.main:create_app --factory --port 8002 &
     local SERVER_PID=$!
 
     info "启动前端开发服务器..."

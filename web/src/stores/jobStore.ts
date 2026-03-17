@@ -53,6 +53,14 @@ interface JobState {
   updatePageStatus: (pageNo: number, status: string) => void;
 }
 
+const PAGE_EVENT_ORDER: Record<string, number> = {
+  AI_PROCESSING: 1,
+  AI_COMPLETED: 2,
+  AI_FAILED: 2,
+  SKIPPED: 2,
+  BLANK: 2,
+};
+
 export const useJobStore = create<JobState>()(
   immer((set, _get) => ({
     jobs: [],
@@ -182,7 +190,19 @@ export const useJobStore = create<JobState>()(
 
     updatePageStatus: (pageNo, status) => set((s) => {
       const page = s.pages.find((p) => p.page_number === pageNo);
-      if (page) page.status = status as any;
+      if (!page) return;
+
+      const currentOrder = PAGE_EVENT_ORDER[page.status];
+      const nextOrder = PAGE_EVENT_ORDER[status];
+      if (
+        currentOrder !== undefined &&
+        nextOrder !== undefined &&
+        nextOrder < currentOrder
+      ) {
+        return;
+      }
+
+      page.status = status as any;
     }),
   })),
 );
