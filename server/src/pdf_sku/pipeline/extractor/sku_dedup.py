@@ -440,6 +440,10 @@ def dedup_by_model_variant(skus: list[SKUResult]) -> list[SKUResult]:
             continue
         base = _VARIANT_SUFFIX_RE.sub('', model).strip()
         if base != model:  # 有变体后缀
+            # base 本身必须含数字才算合法 base model
+            # (避免 FP-21, FP-22 → base="FP" 被误合并)
+            if not re.search(r'\d', base):
+                continue
             key = base.upper()
             base_groups.setdefault(key, []).append((i, sku))
 

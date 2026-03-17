@@ -164,7 +164,7 @@ def compare_dataset(
                 matched_actual.add(ai)
                 break
 
-    # Pass 1: model_number 匹配 (规范化: 去尾缀 #/*)
+    # Pass 1: model_number 精确匹配 (规范化: 去尾缀 #/*)
     for ei, exp in enumerate(expected):
         if ei in matched_expected or not exp.model_number:
             continue
@@ -175,6 +175,35 @@ def compare_dataset(
             act_model = str(act.get("model_number", ""))
             if _normalize_model(act_model) == exp_model_n:
                 result.matches.append(_make_match(exp, act, "model_number"))
+                matched_expected.add(ei)
+                matched_actual.add(ai)
+                break
+
+    # Pass 1.5: model_number 前缀匹配 (FP-11 匹配 FP-11B)
+    for ei, exp in enumerate(expected):
+        if ei in matched_expected or not exp.model_number:
+            continue
+        exp_model_n = _normalize_model(exp.model_number)
+        if not exp_model_n:
+            continue
+        for ai, act in enumerate(actual_list):
+            if ai in matched_actual:
+                continue
+            act_model_n = _normalize_model(str(act.get("model_number", "")))
+            if not act_model_n:
+                continue
+            # 一方是另一方的前缀 + 尾部仅 1-2 个字母 (变体后缀)
+            if (act_model_n.startswith(exp_model_n)
+                    and len(act_model_n) - len(exp_model_n) <= 2
+                    and act_model_n[len(exp_model_n):].isalpha()):
+                result.matches.append(_make_match(exp, act, "model_suffix"))
+                matched_expected.add(ei)
+                matched_actual.add(ai)
+                break
+            if (exp_model_n.startswith(act_model_n)
+                    and len(exp_model_n) - len(act_model_n) <= 2
+                    and exp_model_n[len(act_model_n):].isalpha()):
+                result.matches.append(_make_match(exp, act, "model_suffix"))
                 matched_expected.add(ei)
                 matched_actual.add(ai)
                 break

@@ -155,23 +155,28 @@ def _slice_single_tall(meta: FitzPageMeta) -> list[tuple] | None:
 
 
 def _slice_img_dense(meta: FitzPageMeta) -> list[tuple] | None:
-    """IMG_DENSE: 按网格行分组，每片包含 2-3 行。若无网格则按高度等分。"""
+    """IMG_DENSE: 按网格切片。网格列 ≥ 4 时 2D 切割，否则仅按行切。"""
     pw, ph = meta.page_width, meta.page_height
 
     if meta.grid and meta.grid[0] >= 2:
-        rows = meta.grid[0]
-        # 每行一片（密集页需要足够分辨率识别每个产品）
-        n_slices = rows
+        rows, cols = meta.grid
 
-        if n_slices <= 1:
+        if rows <= 1:
             return None
 
         row_height = ph / rows
+        # 列数 ≥ 4 时横向也切，确保每片不超过 ~3 列产品
+        col_groups = max(1, (cols + 2) // 3) if cols >= 4 else 1
+        col_width = pw / col_groups
+
         slices = []
-        for i in range(n_slices):
-            y0 = max(0, i * row_height - TALL_OVERLAP) if i > 0 else 0
-            y1 = min(ph, (i + 1) * row_height + TALL_OVERLAP) if i < n_slices - 1 else ph
-            slices.append((0, y0, pw, y1))
+        for r in range(rows):
+            y0 = max(0, r * row_height - TALL_OVERLAP) if r > 0 else 0
+            y1 = min(ph, (r + 1) * row_height + TALL_OVERLAP) if r < rows - 1 else ph
+            for c in range(col_groups):
+                x0 = c * col_width if c > 0 else 0
+                x1 = min(pw, (c + 1) * col_width) if c < col_groups - 1 else pw
+                slices.append((x0, y0, x1, y1))
 
         return slices if len(slices) > 1 else None
 

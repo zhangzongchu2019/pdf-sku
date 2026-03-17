@@ -14,7 +14,7 @@ DEFAULT_DATA_ROOT = Path("/home/zzc/Documents/pdf整理")
 
 # 通过表头名称定位列（不依赖固定列号）
 HEADER_MAP = {
-    "product_name": ["*商品名称/描述", "商品名称/描述", "商品名称", "产品名称", "名称"],
+    "product_name": ["*商品名称/描述", "商品名称/描述", "商品名称", "产品名称", "品名", "商品描述"],
     "price": ["售价", "*售价", "单价"],
     "model_number": ["货号", "型号"],
     "tag": ["标签"],
@@ -28,10 +28,24 @@ ALT_HEADER_KEYWORDS = ["商品名称", "产品名称", "货号", "型号", "售�
 
 
 def _find_columns(header_row: list[str | None]) -> dict[str, int]:
-    """从表头行找到各字段的列索引 (0-based)。"""
+    """从表头行找到各字段的列索引 (0-based)。
+
+    匹配策略: 优先完全匹配，再退化到子串包含匹配。
+    避免 "名称" 误中 "分组名称" 等列。
+    """
     col_map: dict[str, int] = {}
     for field_name, possible_headers in HEADER_MAP.items():
+        # Pass 1: 完全匹配 (cell_val.strip() == header)
         for col_idx, cell_val in enumerate(header_row):
+            if cell_val and str(cell_val).strip() in possible_headers:
+                col_map[field_name] = col_idx
+                break
+        if field_name in col_map:
+            continue
+        # Pass 2: 子串包含匹配 (排除已分配的列)
+        for col_idx, cell_val in enumerate(header_row):
+            if col_idx in col_map.values():
+                continue
             if cell_val and any(h in str(cell_val) for h in possible_headers):
                 col_map[field_name] = col_idx
                 break
