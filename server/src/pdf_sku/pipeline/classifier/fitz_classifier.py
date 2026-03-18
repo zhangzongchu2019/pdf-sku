@@ -249,9 +249,12 @@ class FitzClassifier:
         if m.text_len == 0 and m.image_count == 0:
             return BLANK
 
-        # 2. TABLE
+        # 2. TABLE (排除产品卡片：单行"表格" + 大图覆盖 → 实为 IMG_LABEL)
         if m.table_count > 0 and m.table_area_ratio > 0.30:
-            return TABLE
+            if m.table_row_count <= 2 and m.image_count > 0 and m.img_coverage > 0.50:
+                pass  # 不返回 TABLE，继续往下判断更合适的类型
+            else:
+                return TABLE
 
         # 3. SINGLE_* (单图为主页面)
         if m.image_count == 1 and m.text_len < 50:
@@ -323,7 +326,16 @@ class FitzClassifier:
             plan.expected_sku_range = (0, 0)
 
         elif pc in (SINGLE_STD, SINGLE_LARGE, SINGLE_TALL):
-            plan.expected_sku_range = (1, 10)
+            if pc == SINGLE_TALL:
+                # 长页面 SKU 密度按有效高度估算
+                eff_h = m.page_height
+                if m.image_native_sizes:
+                    for _nw, nh in m.image_native_sizes:
+                        eff_h = max(eff_h, nh)
+                estimated = max(10, int(eff_h / 150))
+                plan.expected_sku_range = (5, estimated)
+            else:
+                plan.expected_sku_range = (1, 10)
 
         elif pc == MULTI_SPARSE:
             plan.expected_sku_range = (

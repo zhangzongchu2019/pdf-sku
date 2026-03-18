@@ -358,11 +358,12 @@ def score_and_filter(
         s_llm = min(1.0, max(0.0, sku.confidence))
 
         # 硬过滤: name_quality=0 表示确定不是产品 (尺寸描述/变体规格/无型号床垫等)
-        # 组合图册中通用家具名词（如"床"）是合法产品名，跳过硬过滤
+        # 组合图册/纯图目录中通用家具名词（如"床""沙发"）是合法产品名，跳过硬过滤
         is_combo = catalog_profile and catalog_profile.is_combo_catalog
-        combo_exempt = (is_combo
-                        and name.strip().lower() in _GENERIC_FURNITURE_NAMES)
-        if s_name == 0.0 and not combo_exempt:
+        is_pure_img = catalog_profile and catalog_profile.is_pure_image_catalog
+        generic_exempt = ((is_combo or is_pure_img)
+                          and name.strip().lower() in _GENERIC_FURNITURE_NAMES)
+        if s_name == 0.0 and not generic_exempt:
             removed += 1
             logger.debug("sku_name_quality_hard_filtered", name=name[:60])
             continue

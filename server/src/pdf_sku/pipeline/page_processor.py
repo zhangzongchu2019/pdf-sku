@@ -107,6 +107,41 @@ def _extract_page_with_meta_sync(
     return raw, meta
 
 
+import re as _re
+
+# 从 PDF 矢量文本提取型号的正则（匹配 "型号#" 和 "型号(" 格式）
+_TEXT_MODEL_HASH_RE = _re.compile(r'^(.{1,20})#', _re.MULTILINE)
+_TEXT_MODEL_PAREN_RE = _re.compile(r'^([A-Za-z]+\d+(?:[-]\d+)?)\s*[\(（]', _re.MULTILINE)
+
+
+def _extract_models_from_text(raw_text: str, page_no: int) -> list[SKUResult]:
+    """从 PDF 矢量文本中用正则提取型号，生成 SKUResult。
+
+    适用于产品卡片页面（每页 1-N 个产品，型号以 "xxx#" 格式标注）。
+    """
+    models_hash = [m.strip() for m in _TEXT_MODEL_HASH_RE.findall(raw_text) if m.strip()]
+    models_paren = [m.strip() for m in _TEXT_MODEL_PAREN_RE.findall(raw_text)
+                    if m.strip() and m.strip() not in models_hash]
+    all_models = models_hash + models_paren
+
+    if not all_models:
+        return []
+
+    results = []
+    for model in all_models:
+        sku = SKUResult(
+            sku_id="",
+            attributes={
+                "product_name": model,
+                "model_number": model,
+            },
+            confidence=0.45,
+            extraction_method="text_rule_fallback",
+        )
+        results.append(sku)
+    return results
+
+
 def _render_page_sync(
     file_path: str, page_no: int, dpi: int = 200, max_long_edge: int = 2048
 ) -> bytes:
@@ -530,6 +565,56 @@ class PageProcessor:
                     logger.info("companion_rescue_done", page=page_no,
                                 found=len(companion_skus))
 
+            # ═══ Phase 6.58: 文本规则提取（回退 + 补充）═══
+            # 从 PDF 矢量文本提取型号，补充 LLM 遗漏的 SKU
+            if raw.raw_text:
+                text_skus = _extract_models_from_text(raw.raw_text, page_no)
+                if text_skus:
+                    if not skus:
+                        # 零 SKU → 直接用文本规则结果
+                        skus = text_skus
+                        extraction_method = "text_rule_fallback"
+                        logger.info("text_rule_final_fallback", page=page_no,
+                                    found=len(text_skus))
+                    elif len(text_skus) > len(skus) * 1.5:
+                        # LLM 提取远少于文本规则 → 合并补充
+                        existing_models = {
+                            (s.attributes.get("model_number") or "").upper()
+                            for s in skus if s.attributes.get("model_number")
+                        }
+                        added = 0
+                        for ts in text_skus:
+                            tm = (ts.attributes.get("model_number") or "").upper()
+                            if tm and tm not in existing_models:
+                                skus.append(ts)
+                                existing_models.add(tm)
+                                added += 1
+                        if added:
+                            logger.info("text_rule_supplement", page=page_no,
+                                        added=added, total=len(skus))
+
+                # 纯图目录 + SINGLE_* + 零 SKU → 用页面首行文字作产品名
+                if (not skus
+                        and catalog_profile
+                        and catalog_profile.is_pure_image_catalog
+                        and plan.page_class in ("SINGLE_STD", "SINGLE_LARGE",
+                                                "SINGLE_TALL")):
+                    page_text = raw.raw_text.strip()
+                    first_line = page_text.split('\n')[0].strip() if page_text else ""
+                    if 1 <= len(first_line) <= 20:
+                        skus = [SKUResult(
+                            sku_id="",
+                            attributes={
+                                "product_name": first_line,
+                                "model_number": "",
+                            },
+                            confidence=0.35,
+                            extraction_method="pure_image_text_fallback",
+                        )]
+                        extraction_method = "pure_image_text_fallback"
+                        logger.info("pure_image_text_fallback", page=page_no,
+                                    name=first_line)
+
             # ═══ Phase 6.6: SKUReviewer Pass 2 (B/C 类 + 有 SKU) ═══
             # 仅 IMG_LABEL+grid 跳过（有文字标签，幻觉率低）
             # IMG_DENSE 需要 Reviewer 过滤场景装饰物
@@ -637,32 +722,72 @@ class PageProcessor:
         catalog_profile: CatalogProfile | None = None,
     ) -> list[SKUResult]:
         """切片模式提取: 每片独立送 LLM，合并去重。"""
+        lo, hi = plan.expected_sku_range
+        n = len(plan.slices)
+        slice_lo = max(2, lo // n)
+        slice_hi = max(5, (hi + n - 1) // n)
+        # SINGLE_TALL 纯图页面：提高每片上限，鼓励 LLM 更彻底搜索
+        if plan.page_class == SINGLE_TALL and slice_hi < 10:
+            slice_hi = 10
+        slice_range = (slice_lo, slice_hi)
+
         tasks = []
+        slice_indices = []  # 记录每个 task 对应的切片索引
         for i, (ss, bbox) in enumerate(zip(screenshots, plan.slices)):
             if not ss:
                 continue
             hint = f"这是页面的第{i+1}/{len(plan.slices)}个区域 (共{len(plan.slices)}片)"
-            # 每片的预估 SKU 数 = 总预估 / 片数
-            lo, hi = plan.expected_sku_range
-            n = len(plan.slices)
-            slice_range = (max(1, lo // n), max(1, (hi + n - 1) // n))
             tasks.append(self._single_stage.extract(
                 raw, screenshot=ss,
                 sku_count_hint=slice_range,
                 region_hint=hint,
                 scene_filter=plan.scene_filter,
                 page_class=plan.page_class))
+            slice_indices.append(i)
 
         if not tasks:
             return []
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
         all_skus: list[SKUResult] = []
-        for r in results:
+        retry_indices = []  # 零 SKU 的切片需要重试
+        for idx, r in zip(slice_indices, results):
             if isinstance(r, Exception):
                 logger.warning("slice_extract_failed", error=str(r))
+                retry_indices.append(idx)
             elif isinstance(r, list):
-                all_skus.extend(r)
+                if r:
+                    all_skus.extend(r)
+                elif slice_lo >= 2:
+                    # 预期每片有 ≥2 SKU 但返回 0 → 重试
+                    retry_indices.append(idx)
+
+        # 重试零 SKU 切片（每页产品密度高时，空切片通常是 LLM 遗漏）
+        if retry_indices and len(retry_indices) <= len(plan.slices) // 2:
+            retry_tasks = []
+            for idx in retry_indices:
+                ss = screenshots[idx]
+                if not ss:
+                    continue
+                hint = (f"这是页面的第{idx+1}/{len(plan.slices)}个区域。"
+                        f"请仔细查看，列出所有可见的产品/SKU。")
+                retry_tasks.append(self._single_stage.extract(
+                    raw, screenshot=ss,
+                    sku_count_hint=slice_range,
+                    region_hint=hint,
+                    scene_filter=False,
+                    page_class=plan.page_class))
+            if retry_tasks:
+                retry_results = await asyncio.gather(
+                    *retry_tasks, return_exceptions=True)
+                retry_found = 0
+                for r in retry_results:
+                    if isinstance(r, list) and r:
+                        all_skus.extend(r)
+                        retry_found += len(r)
+                if retry_found:
+                    logger.info("slice_retry_rescued", retried=len(retry_indices),
+                                rescued=retry_found)
 
         if all_skus:
             # 切片合并后: 综合打分 + 去重 (与整页模式对齐)
@@ -672,8 +797,8 @@ class PageProcessor:
                                           scene_filter=plan.scene_filter)
             all_skus = split_compound_models(all_skus)
             all_skus = dedup_by_model(all_skus)
-            # IMG_DENSE/IMG_LABEL 页面产品名称高度相似，跳过 similarity 去重
-            if plan.page_class not in (IMG_DENSE, IMG_LABEL):
+            # 密集产品页面名称高度相似，跳过 similarity 去重
+            if plan.page_class not in (IMG_DENSE, IMG_LABEL, SINGLE_TALL):
                 all_skus = dedup_by_similarity(all_skus, threshold=0.98)
             if len(all_skus) < before:
                 logger.info("slice_dedup", before=before, after=len(all_skus))

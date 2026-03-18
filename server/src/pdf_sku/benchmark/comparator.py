@@ -139,30 +139,70 @@ def compare_dataset(
     matched_actual: set[int] = set()
 
     # Pass 0: 从 product_name 提取型号前缀匹配
+    # 先收集所有候选 (score 排序) 再贪心匹配，避免短前缀误匹配
+    _pass0_candidates: list[tuple[float, int, int]] = []  # (score, ei, ai)
     for ei, exp in enumerate(expected):
         if ei in matched_expected:
             continue
         exp_prefix = _extract_model_prefix(exp.product_name)
         if not exp_prefix:
             continue
+        exp_norm_prefix = _normalize_model(exp_prefix)
+        exp_name_n = _normalize(exp.product_name)
         for ai, act in enumerate(actual_list):
             if ai in matched_actual:
                 continue
-            # 先尝试用 actual 的 model_number
             act_model = str(act.get("model_number", ""))
-            if act_model and _normalize_model(act_model) == _normalize_model(exp_prefix):
-                result.matches.append(_make_match(exp, act, "model_prefix"))
-                matched_expected.add(ei)
-                matched_actual.add(ai)
-                break
-            # 再尝试从 actual 的 product_name 提取
             act_name = str(act.get("product_name", ""))
-            act_prefix = _extract_model_prefix(act_name)
-            if act_prefix and _normalize_model(exp_prefix) == _normalize_model(act_prefix):
-                result.matches.append(_make_match(exp, act, "model_prefix"))
-                matched_expected.add(ei)
-                matched_actual.add(ai)
-                break
+            act_name_n = _normalize(act_name)
+            matched_prefix = False
+            if act_model and _normalize_model(act_model) == exp_norm_prefix:
+                matched_prefix = True
+            if not matched_prefix:
+                act_prefix = _extract_model_prefix(act_name)
+                if act_prefix and exp_norm_prefix == _normalize_model(act_prefix):
+                    matched_prefix = True
+            if matched_prefix:
+                # 计算 product_name 亲和度作为排序依据
+                name_score = SequenceMatcher(None, exp_name_n, act_name_n).ratio()
+                _pass0_candidates.append((name_score, ei, ai))
+    # 按 name_score 降序贪心匹配
+    _pass0_candidates.sort(key=lambda x: -x[0])
+    for _score, ei, ai in _pass0_candidates:
+        if ei in matched_expected or ai in matched_actual:
+            continue
+        result.matches.append(_make_match(expected[ei], actual_list[ai], "model_prefix"))
+        matched_expected.add(ei)
+        matched_actual.add(ai)
+
+    # Pass 0.5: GT model_number 为空时，用 product_name 直接匹配 Pipeline model_number
+    # 处理纯数字型号（如 "2202"）和中文混合型号（如 "巴塞罗那2217"）
+    # 收集候选后按亲和度排序，避免错误的先到先得
+    _pass05_candidates: list[tuple[float, int, int]] = []
+    for ei, exp in enumerate(expected):
+        if ei in matched_expected:
+            continue
+        if exp.model_number:
+            continue
+        exp_name = _normalize(exp.product_name)
+        if not exp_name or len(exp_name) > 20:
+            continue
+        for ai, act in enumerate(actual_list):
+            if ai in matched_actual:
+                continue
+            act_model = _normalize(str(act.get("model_number", "")))
+            act_name_n = _normalize(str(act.get("product_name", "")))
+            if act_model and (act_model == exp_name
+                              or (len(act_model) >= 3 and act_model in exp_name)):
+                name_score = SequenceMatcher(None, exp_name, act_name_n).ratio()
+                _pass05_candidates.append((name_score, ei, ai))
+    _pass05_candidates.sort(key=lambda x: -x[0])
+    for _score, ei, ai in _pass05_candidates:
+        if ei in matched_expected or ai in matched_actual:
+            continue
+        result.matches.append(_make_match(expected[ei], actual_list[ai], "name_as_model"))
+        matched_expected.add(ei)
+        matched_actual.add(ai)
 
     # Pass 1: model_number 精确匹配 (规范化: 去尾缀 #/*)
     for ei, exp in enumerate(expected):

@@ -21,8 +21,8 @@ MAX_SLICE_W = 1200.0
 MAX_SLICE_H = 1200.0
 
 # 纵向切片: 每片高度
-TALL_SLICE_H = 1000.0
-TALL_OVERLAP = 50.0  # 切片间重叠 (pt)
+TALL_SLICE_H = 900.0
+TALL_OVERLAP = 80.0  # 切片间重叠 (pt)
 
 
 def plan_slices(meta: FitzPageMeta, plan: PagePlan) -> list[tuple] | None:
@@ -160,13 +160,20 @@ def _slice_img_dense(meta: FitzPageMeta) -> list[tuple] | None:
 
     if meta.grid and meta.grid[0] >= 2:
         rows = meta.grid[0]
-        # 每行一片（密集页需要足够分辨率识别每个产品）
-        n_slices = rows
+        cols = meta.grid[1] if len(meta.grid) > 1 else 1
+
+        # 每行产品多 (cols>=3) 时每行切两片，确保每片不超过 ~4 个产品
+        if cols >= 3:
+            n_slices = rows * 2
+        else:
+            n_slices = rows
+
+        n_slices = min(n_slices, 12)  # 上限
 
         if n_slices <= 1:
             return None
 
-        row_height = ph / rows
+        row_height = ph / n_slices
         slices = []
         for i in range(n_slices):
             y0 = max(0, i * row_height - TALL_OVERLAP) if i > 0 else 0
