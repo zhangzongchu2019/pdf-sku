@@ -43,7 +43,7 @@ def plan_slices(meta: FitzPageMeta, plan: PagePlan) -> list[tuple] | None:
     return None
 
 
-MAX_LONG_EDGE = 2000  # 发送给 LLM 的图片最长边限制
+MAX_LONG_EDGE = 3000  # 发送给 LLM 的图片最长边限制
 
 
 def render_slice(

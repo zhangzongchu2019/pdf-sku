@@ -143,7 +143,7 @@ def _extract_models_from_text(raw_text: str, page_no: int) -> list[SKUResult]:
 
 
 def _render_page_sync(
-    file_path: str, page_no: int, dpi: int = 200, max_long_edge: int = 2000
+    file_path: str, page_no: int, dpi: int = 200, max_long_edge: int = 3000
 ) -> bytes:
     """在进程池中渲染截图，长边不超过 max_long_edge，JPEG 输出。"""
     import fitz
