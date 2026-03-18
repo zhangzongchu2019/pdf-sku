@@ -143,9 +143,9 @@ def _extract_models_from_text(raw_text: str, page_no: int) -> list[SKUResult]:
 
 
 def _render_page_sync(
-    file_path: str, page_no: int, dpi: int = 200, max_long_edge: int = 2048
+    file_path: str, page_no: int, dpi: int = 200, max_long_edge: int = 2000
 ) -> bytes:
-    """在进程池中渲染截图，长边不超过 max_long_edge。"""
+    """在进程池中渲染截图，长边不超过 max_long_edge，JPEG 输出。"""
     import fitz
     doc = fitz.open(file_path)
     try:
@@ -159,9 +159,19 @@ def _render_page_sync(
             zoom = zoom * max_long_edge / long_edge
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, alpha=False)
-        return pix.tobytes("png")
+        return _pixmap_to_jpeg(pix)
     finally:
         doc.close()
+
+
+def _pixmap_to_jpeg(pix, quality: int = 80) -> bytes:
+    """将 fitz.Pixmap 转为 JPEG bytes，比 PNG 小 5-10 倍。"""
+    from PIL import Image
+    import io
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
 
 
 

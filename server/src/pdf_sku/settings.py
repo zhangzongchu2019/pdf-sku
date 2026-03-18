@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     apiyi_api_base: str = "https://api.apiyi.com"
     apiyi_model: str = "gemini-2.5-flash"
     nebula_api_key: str = ""
-    nebula_api_base: str = "https://llm.ai-nebula.com/v1"
+    nebula_api_base: str = "https://llm.ai-nebula.com"
     nebula_model: str = "gemini-2.5-flash-nothinking"
     default_llm_client: str = ""
     llm_daily_budget_usd: float = 50.0

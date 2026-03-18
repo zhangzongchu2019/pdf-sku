@@ -111,16 +111,15 @@ def create_llm_service(redis=None):
     if settings.qwen_api_key:
         fallback_chain.append("qwen")
 
-    # 加权轮询: 按优先级设置并发权重
-    # OpenRouter #1/#2: 权重 4 (高优先), Nebula: 权重 2, Apiyi: 权重 2
+    # 加权轮询: OpenRouter×2, Nebula×1, APIYI×1
     provider_weights: dict[str, int] = {}
     for name in openrouter_names:
         if name in ("openrouter", "openrouter_1"):
-            provider_weights[name] = 4
+            provider_weights[name] = 2
         elif "nebula" in name:
-            provider_weights[name] = 2
+            provider_weights[name] = 1
         elif "apiyi" in name:
-            provider_weights[name] = 2
+            provider_weights[name] = 1
         else:
             provider_weights[name] = 1
 

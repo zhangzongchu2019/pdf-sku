@@ -43,6 +43,9 @@ def plan_slices(meta: FitzPageMeta, plan: PagePlan) -> list[tuple] | None:
     return None
 
 
+MAX_LONG_EDGE = 2000  # 发送给 LLM 的图片最长边限制
+
+
 def render_slice(
     file_path: str,
     page_no: int,
@@ -58,16 +61,29 @@ def render_slice(
         dpi: 渲染 DPI
 
     Returns:
-        PNG 图片字节
+        JPEG 图片字节 (长边不超过 MAX_LONG_EDGE)
     """
+    from PIL import Image
+    import io
+
     doc = fitz.open(file_path)
     try:
         page = doc[page_no - 1]
         zoom = dpi / 72.0
-        mat = fitz.Matrix(zoom, zoom)
         clip = fitz.Rect(*clip_bbox)
+        # 计算渲染后尺寸，超出限制则降低缩放
+        w = clip.width * zoom
+        h = clip.height * zoom
+        long_edge = max(w, h)
+        if long_edge > MAX_LONG_EDGE:
+            zoom = zoom * MAX_LONG_EDGE / long_edge
+        mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
-        return pix.tobytes("png")
+        # PNG → JPEG 压缩 (体积缩小 5-10 倍)
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=80)
+        return buf.getvalue()
     finally:
         doc.close()
 
