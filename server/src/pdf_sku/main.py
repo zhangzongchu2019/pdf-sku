@@ -68,11 +68,23 @@ def create_llm_service(redis=None):
             ))
             openrouter_names.append(name)
 
-    # Apiyi (OpenAI 兼容中转) — 命名为 openrouter_apiyi* 以加入 openrouter 轮询池
+    # Nebula (OpenAI 兼容中转) — 命名为 openrouter_nebula 以加入轮询池
+    if settings.nebula_api_key:
+        from pdf_sku.llm_adapter.client.openrouter import OpenRouterClient as _ORC_N
+        name = "openrouter_nebula"
+        register_client(name, _ORC_N(
+            api_key=settings.nebula_api_key,
+            model=settings.nebula_model,
+            timeout=settings.llm_timeout_seconds,
+            api_base=settings.nebula_api_base,
+        ))
+        openrouter_names.append(name)
+
+    # Apiyi (OpenAI 兼容中转) — 命名为 openrouter_apiyi 以加入轮询池
     if settings.apiyi_api_key:
-        from pdf_sku.llm_adapter.client.openrouter import OpenRouterClient as _ORC
-        name = f"openrouter_apiyi"
-        register_client(name, _ORC(
+        from pdf_sku.llm_adapter.client.openrouter import OpenRouterClient as _ORC_A
+        name = "openrouter_apiyi"
+        register_client(name, _ORC_A(
             api_key=settings.apiyi_api_key,
             model=settings.apiyi_model,
             timeout=settings.llm_timeout_seconds,
@@ -99,6 +111,24 @@ def create_llm_service(redis=None):
     if settings.qwen_api_key:
         fallback_chain.append("qwen")
 
+    # 加权轮询: 按优先级设置并发权重
+    # OpenRouter #1/#2: 权重 4 (高优先), Nebula: 权重 2, Apiyi: 权重 2
+    provider_weights: dict[str, int] = {}
+    for name in openrouter_names:
+        if name in ("openrouter", "openrouter_1"):
+            provider_weights[name] = 4
+        elif "nebula" in name:
+            provider_weights[name] = 2
+        elif "apiyi" in name:
+            provider_weights[name] = 2
+        else:
+            provider_weights[name] = 1
+
+    logger.info("llm_providers_configured",
+                default=default_client,
+                pool=[f"{n}(w={provider_weights.get(n, 1)})" for n in openrouter_names],
+                fallback=fallback_chain)
+
     return LLMService(
         prompt_engine=PromptEngine(),
         parser=ResponseParser(),
@@ -107,6 +137,7 @@ def create_llm_service(redis=None):
         rate_limiter=RateLimiter(redis) if redis and settings.gemini_api_key else None,
         default_client_name=default_client,
         fallback_chain=fallback_chain,
+        provider_weights=provider_weights,
     )
 
 

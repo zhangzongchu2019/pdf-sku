@@ -2,6 +2,10 @@
 LLM 统一服务入口。对齐: LLM Adapter 详设 §5.2
 
 调用链: check_budget → check_rate → check_circuit → render_prompt → client.complete → parse → record
+
+支持:
+- 加权轮询: 每个 provider 按并发权重重复出现在 robin pool 中
+- 连续超时自动跳过: 连续 N 次超时后自动禁用 provider (下次重启恢复)
 """
 from __future__ import annotations
 import asyncio
@@ -25,6 +29,8 @@ MAX_RETRIES = 2
 EVAL_BATCH_SIZE = 5
 # 全局 LLM 并发上限，防止 API 429。通过环境变量 LLM_MAX_CONCURRENCY 可调。
 LLM_MAX_CONCURRENCY = int(os.environ.get("LLM_MAX_CONCURRENCY", "12"))
+# 连续超时阈值: 连续 N 次超时后自动禁用 provider
+CONSECUTIVE_TIMEOUT_LIMIT = int(os.environ.get("LLM_TIMEOUT_SKIP_THRESHOLD", "10"))
 
 
 class LLMService:
@@ -43,6 +49,7 @@ class LLMService:
         rate_limiter: RateLimiter | None = None,
         default_client_name: str = "gemini",
         fallback_chain: list[str] | None = None,
+        provider_weights: dict[str, int] | None = None,
     ) -> None:
         self._prompt = prompt_engine
         self._parser = parser
@@ -52,11 +59,23 @@ class LLMService:
         self._default_client = default_client_name
         self._fallback_chain = fallback_chain or []
         self._llm_semaphore = asyncio.Semaphore(LLM_MAX_CONCURRENCY)
-        # 多 key 轮询: 从 fallback_chain 中找出同类 provider (如 openrouter_0, openrouter_1)
-        self._robin_pool = [
+
+        # 加权轮询: 按并发权重重复 provider 名称
+        # provider_weights: {"openrouter": 4, "openrouter_1": 4, "openrouter_nebula": 2, ...}
+        weights = provider_weights or {}
+        pool_entries: list[str] = []
+        pool_members = [
             n for n in self._fallback_chain if n.startswith(default_client_name)
         ] or [default_client_name]
+        for name in pool_members:
+            w = weights.get(name, 1)
+            pool_entries.extend([name] * w)
+        self._robin_pool = pool_entries if pool_entries else [default_client_name]
         self._robin_iter = itertools.cycle(self._robin_pool)
+
+        # 连续超时计数器 (per provider)
+        self._consecutive_timeouts: dict[str, int] = {}
+        self._disabled_providers: set[str] = set()
 
     @property
     def current_model_name(self) -> str:
@@ -64,6 +83,23 @@ class LLMService:
             return get_client(self._default_client).model_id
         except KeyError:
             return self._default_client
+
+    def _is_provider_disabled(self, name: str) -> bool:
+        return name in self._disabled_providers
+
+    def _record_timeout(self, name: str) -> None:
+        """记录超时，连续达到阈值时自动禁用。"""
+        self._consecutive_timeouts[name] = self._consecutive_timeouts.get(name, 0) + 1
+        count = self._consecutive_timeouts[name]
+        if count >= CONSECUTIVE_TIMEOUT_LIMIT:
+            self._disabled_providers.add(name)
+            logger.warning("provider_auto_disabled",
+                           provider=name, consecutive_timeouts=count)
+
+    def _record_success(self, name: str) -> None:
+        """成功后重置超时计数。"""
+        if name in self._consecutive_timeouts:
+            self._consecutive_timeouts[name] = 0
 
     async def evaluate_document(
         self,
@@ -183,17 +219,26 @@ class LLMService:
         timeout: float = 60.0,
     ) -> LLMResponse:
         """实际 LLM 调用（已在 Semaphore 内）。"""
-        # 轮询选择 primary: 当未指定 client 时，从同类 provider 池中 round-robin
+        # 轮询选择 primary: 跳过已禁用的 provider
         if client_name:
             primary = client_name
         elif len(self._robin_pool) > 1:
-            primary = next(self._robin_iter)
+            # 最多尝试 pool 长度次，跳过已禁用的
+            for _ in range(len(self._robin_pool)):
+                candidate = next(self._robin_iter)
+                if not self._is_provider_disabled(candidate):
+                    primary = candidate
+                    break
+            else:
+                # 全部禁用 → 用第一个（强制重试）
+                primary = self._robin_pool[0]
         else:
             primary = self._default_client
-        # 构建尝试顺序: primary → fallback chain 中的其他 provider
+
+        # 构建尝试顺序: primary → fallback chain 中的其他 provider (跳过已禁用的)
         providers = [primary]
         for fb in self._fallback_chain:
-            if fb != primary and fb not in providers:
+            if fb != primary and fb not in providers and not self._is_provider_disabled(fb):
                 providers.append(fb)
 
         last_error = None
@@ -228,6 +273,7 @@ class LLMService:
 
                     # 成功
                     self._circuit.record_success()
+                    self._record_success(provider_name)
 
                     # 记录消耗
                     input_tokens = resp.usage.get("input_tokens", 0)
@@ -250,6 +296,11 @@ class LLMService:
                 except Exception as e:
                     self._circuit.record_failure()
                     last_error = e
+                    # 检测超时类异常
+                    is_timeout = _is_timeout_error(e)
+                    if is_timeout:
+                        self._record_timeout(provider_name)
+
                     if attempt < MAX_RETRIES:
                         logger.warning("llm_call_retry",
                                         attempt=attempt + 1, error=repr(e),
@@ -276,3 +327,14 @@ class LLMService:
         }
         rates = pricing.get(provider, {"input": 0.10, "output": 0.30})
         return (input_tokens * rates["input"] + output_tokens * rates["output"]) / 1_000_000
+
+
+def _is_timeout_error(e: Exception) -> bool:
+    """判断异常是否为超时/连接错误。"""
+    import httpx
+    if isinstance(e, (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout,
+                       httpx.ConnectError, asyncio.TimeoutError, TimeoutError,
+                       ConnectionError)):
+        return True
+    err_str = str(e).lower()
+    return any(k in err_str for k in ("timeout", "timed out", "connection"))
