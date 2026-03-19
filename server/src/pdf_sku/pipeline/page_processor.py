@@ -113,6 +113,18 @@ import re as _re
 _TEXT_MODEL_HASH_RE = _re.compile(r'^(.{1,20})#', _re.MULTILINE)
 _TEXT_MODEL_PAREN_RE = _re.compile(r'^([A-Za-z]+\d+(?:[-]\d+)?)\s*[\(（]', _re.MULTILINE)
 
+# 纯图目录: 页面级 OCR 产品信号检测
+_PRODUCT_SIGNAL_MODEL_RE = _re.compile(r'[A-Za-z]{1,5}[-\s]?\d{3,}|[A-Z]{2,}\d+|\d{3,}#')
+_PRODUCT_SIGNAL_PRICE_RE = _re.compile(r'[¥￥$€£]\s*[\d,.]+|\d{3,}(?:\.\d{2})?\s*元')
+
+
+def _has_product_signal(ocr_text: str) -> bool:
+    """检测 OCR 文本中是否包含产品信号（型号/价格模式）。"""
+    if not ocr_text or len(ocr_text.strip()) < 15:
+        return False
+    return bool(_PRODUCT_SIGNAL_MODEL_RE.search(ocr_text)
+                or _PRODUCT_SIGNAL_PRICE_RE.search(ocr_text))
+
 
 def _extract_models_from_text(raw_text: str, page_no: int) -> list[SKUResult]:
     """从 PDF 矢量文本中用正则提取型号，生成 SKUResult。
@@ -343,6 +355,17 @@ class PageProcessor:
             if ocr_blocks:
                 logger.info("ocr_result", page=page_no,
                             blocks=len(ocr_blocks), text_len=ocr_text_len)
+
+            # 纯图目录: 无 OCR 产品信号的页面 → 恢复 scene_filter
+            _page_has_product_signal = True
+            if catalog_profile and catalog_profile.is_pure_image_catalog:
+                _ocr_page_text = OcrEngine.blocks_to_text(ocr_blocks) if ocr_blocks else ""
+                _page_has_product_signal = _has_product_signal(_ocr_page_text)
+                if not _page_has_product_signal:
+                    plan.scene_filter = True
+                    logger.info("pure_img_scene_filter_restored", page=page_no,
+                                ocr_len=len(_ocr_page_text))
+
             if layout_regions:
                 logger.info("layout_result", page=page_no,
                             regions=len(layout_regions),
@@ -374,8 +397,10 @@ class PageProcessor:
             # ═══ Phase 6: SKU 提取 (策略路由) ═══
             if plan.slices and screenshots:
                 # 切片模式: 每片独立送 LLM，合并去重
+                _ocr_text_for_sliced = OcrEngine.blocks_to_text(ocr_blocks) if ocr_blocks else ""
                 skus = await self._extract_sliced(raw, plan, screenshots,
-                                                     catalog_profile=catalog_profile)
+                                                     catalog_profile=catalog_profile,
+                                                     ocr_text=_ocr_text_for_sliced)
                 extraction_method = "sliced_vision"
 
                 # 切片零结果回退: 回退到整页 single_stage 提取
@@ -730,6 +755,7 @@ class PageProcessor:
         plan: PagePlan,
         screenshots: list[bytes],
         catalog_profile: CatalogProfile | None = None,
+        ocr_text: str = "",
     ) -> list[SKUResult]:
         """切片模式提取: 每片独立送 LLM，合并去重。"""
         lo, hi = plan.expected_sku_range
@@ -802,7 +828,7 @@ class PageProcessor:
         if all_skus:
             # 切片合并后: 综合打分 + 去重 (与整页模式对齐)
             before = len(all_skus)
-            all_skus = score_and_filter(all_skus, ocr_text="",
+            all_skus = score_and_filter(all_skus, ocr_text=ocr_text,
                                           catalog_profile=catalog_profile,
                                           scene_filter=plan.scene_filter)
             all_skus = split_compound_models(all_skus)

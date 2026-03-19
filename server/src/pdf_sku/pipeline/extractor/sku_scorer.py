@@ -330,10 +330,11 @@ def _compute_penalty(
             penalty -= 0.25
             return penalty  # 直接返回，不再检查黑名单
 
-    # 纯图片 PDF (profiler 无品类数据) → 跳过场景惩罚
-    # 理由: 无法判断图册主营品类，交给其他维度评分
+    # 纯图片 PDF (profiler 无品类数据): 无品类→跳过软黑名单，硬黑名单仍生效
     if catalog_profile and not catalog_profile.category_page_counts:
-        return 0.0
+        if _is_scene_prop(name) and no_model_price:
+            penalty += PENALTY_HARD_BLACKLIST
+        return penalty
 
     # 硬黑名单 + 无型号无价格
     if _is_scene_prop(name) and no_model_price:
