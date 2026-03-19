@@ -41,6 +41,7 @@ W_LLM_CONFIDENCE = 0.15
 # ── 场景惩罚 ──
 PENALTY_HARD_BLACKLIST = -0.20   # 硬黑名单 + 无型号无价格
 PENALTY_SOFT_BLACKLIST = -0.12   # 软黑名单 + scene_filter
+PENALTY_PURE_IMG_NO_OCR = -0.15  # 纯图目录: OCR 有产品信号但 SKU 未被 OCR 验证
 
 # ── 阈值 ──
 SCORE_THRESHOLD = 0.25
@@ -102,6 +103,13 @@ def _score_ocr_grounded(sku: SKUResult, ocr_text: str) -> float:
     return 0.0
 
 
+def _extract_prefix(model: str) -> str:
+    """从型号中提取字母前缀用于匹配。"""
+    from pdf_sku.pipeline.catalog_profiler import _PREFIX_RE
+    m = _PREFIX_RE.match(model)
+    return m.group(1).upper() if m else ""
+
+
 def _score_catalog_relevance(
     sku: SKUResult, catalog_profile: CatalogProfile | None,
 ) -> float:
@@ -110,8 +118,21 @@ def _score_catalog_relevance(
         return 0.5  # 无 profile 时给中性分
 
     name = (sku.attributes.get("product_name") or "").strip().lower()
+    model = (sku.attributes.get("model_number") or "").strip()
     if not name:
         return 0.0
+
+    # 优先级 1: 型号匹配已知前缀 → 1.0
+    if model and catalog_profile.model_prefixes:
+        prefix = _extract_prefix(model)
+        if prefix and prefix in catalog_profile.model_prefixes:
+            return 1.0
+
+    # 优先级 2: 产品名 == 品牌名 → 0.0（品牌名不是产品）
+    if catalog_profile.brand_names:
+        name_stripped = name.strip().lower()
+        if name_stripped in {b.lower() for b in catalog_profile.brand_names}:
+            return 0.0
 
     # 检查是否命中主营品类 (最长匹配优先, 避免 "床头柜" 误匹配 "床")
     from pdf_sku.pipeline.catalog_profiler import _SYNONYM_TO_CATEGORY
@@ -302,6 +323,13 @@ def _compute_penalty(
     no_model_price = has_model == 0.0 and has_price == 0.0
     penalty = 0.0
 
+    # 品牌名充当产品名 + 无型号无价格 → 强惩罚
+    if catalog_profile and catalog_profile.brand_names and no_model_price:
+        name_stripped = name.strip().lower()
+        if name_stripped in {b.lower() for b in catalog_profile.brand_names}:
+            penalty -= 0.25
+            return penalty  # 直接返回，不再检查黑名单
+
     # 纯图片 PDF (profiler 无品类数据) → 跳过场景惩罚
     # 理由: 无法判断图册主营品类，交给其他维度评分
     if catalog_profile and not catalog_profile.category_page_counts:
@@ -377,6 +405,17 @@ def score_and_filter(
             + W_NAME_QUALITY * s_name
             + W_LLM_CONFIDENCE * s_llm
         )
+
+        # 纯图目录 OCR 反向验证: OCR 明确有产品信息但此 SKU 不在其中
+        ocr_has_product_signal = bool(
+            ocr_text and len(ocr_text) >= 50
+            and (_MODEL_RE.search(ocr_text) or _PRICE_RE.search(ocr_text))
+        )
+        if (is_pure_img and ocr_has_product_signal
+                and s_model == 0.0 and s_price == 0.0 and s_ocr == 0.0):
+            raw_score += PENALTY_PURE_IMG_NO_OCR
+            logger.debug("pure_img_ocr_penalty", name=name[:60],
+                         penalty=PENALTY_PURE_IMG_NO_OCR)
 
         # 弱信号惩罚: 极短名称 + 无型号无价格 + 低 LLM confidence
         if s_model == 0.0 and s_price == 0.0 and s_llm < 0.5:

@@ -285,7 +285,7 @@ class BenchmarkRunner:
                 )
                 for s in all_skus_flat
             ]
-            deduped = cross_page_dedup(sku_results)
+            deduped = cross_page_dedup(sku_results, catalog_profile=catalog_profile)
             deduped = dedup_by_model_variant(deduped)
             deduped = dedup_material_variants(deduped)
             # 找出保留的 SKU (通过 id 匹配)

@@ -55,6 +55,12 @@ class Settings(BaseSettings):
     nebula_api_key: str = ""
     nebula_api_base: str = "https://llm.ai-nebula.com"
     nebula_model: str = "gemini-2.5-flash-nothinking"
+    wanjie_api_key: str = ""
+    wanjie_api_base: str = "https://maas-openapi.wanjiedata.com/api"
+    wanjie_model: str = "gemini-2.5-flash"
+    gptproto_api_key: str = ""
+    gptproto_api_base: str = "https://gptproto.com"
+    gptproto_model: str = "gemini-2.5-flash"
     default_llm_client: str = ""
     llm_daily_budget_usd: float = 50.0
     llm_timeout_seconds: int = 60

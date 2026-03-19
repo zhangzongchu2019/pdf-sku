@@ -62,6 +62,37 @@ class CatalogProfile:
     combo_keyword_ratio: float = 0.0                             # 组合关键词页占比
     multi_category_page_ratio: float = 0.0                       # 多品类共现页占比
     is_pure_image_catalog: bool = False                          # 纯图产品目录（大部分页面无文字）
+    brand_names: set[str] = field(default_factory=set)           # 封面/扉页大字体品牌名
+    model_prefixes: set[str] = field(default_factory=set)        # 高频型号前缀 (BT-、NAV、FP-)
+    all_model_numbers: set[str] = field(default_factory=set)     # 全文出现的所有型号
+
+
+_PREFIX_RE = re.compile(r'^([A-Za-z]{1,5})[-\s]?\d')
+
+
+def _extract_model_prefix(model: str) -> str:
+    """从型号中提取字母前缀: BT-SF711 → BT, NAV332 → NAV, FP-35 → FP。"""
+    m = _PREFIX_RE.match(model)
+    return m.group(1).upper() if m else ""
+
+
+def _collect_brand_candidate(span: dict, brand_set: set[str]) -> None:
+    """从 span 级别信息中采集品牌名候选。"""
+    size = span.get("size", 0)
+    text = (span.get("text") or "").strip()
+    if size >= 16 and 2 <= len(text) <= 15:
+        # 排除纯数字、纯标点、品类同义词
+        if re.match(r'^[\d\s\-_.,:;!?]+$', text):
+            return
+        text_lower = text.lower()
+        if text_lower in _SYNONYM_TO_CATEGORY:
+            return
+        # 排除常见非品牌大字: 目录、前言、产品等
+        _NON_BRAND = {"目录", "前言", "后记", "附录", "产品", "系列", "index",
+                       "contents", "catalog", "catalogue", "page", "product"}
+        if text_lower in _NON_BRAND:
+            return
+        brand_set.add(text)
 
 
 def scan_catalog(pdf_path: str) -> CatalogProfile:
@@ -93,6 +124,13 @@ def scan_catalog(pdf_path: str) -> CatalogProfile:
         combo_keyword_pages = 0              # 含组合关键词的页数
         multi_cat_pages = 0                  # 含 ≥2 品类的页数
         content_pages = 0                    # 有内容的页数
+        # 型号采集
+        all_models: set[str] = set()
+        prefix_counter: dict[str, int] = {}  # 型号前缀 → 出现次数
+        # 品牌名检测页: 前 3 页 + 末页
+        brand_scan_pages = set(range(min(3, doc.page_count)))
+        if doc.page_count > 1:
+            brand_scan_pages.add(doc.page_count - 1)
 
         for page_idx in range(doc.page_count):
             try:
@@ -106,6 +144,26 @@ def scan_catalog(pdf_path: str) -> CatalogProfile:
 
             content_pages += 1
             has_model = bool(_MODEL_RE.search(text))
+
+            # ── 型号采集 ──
+            page_models = _MODEL_RE.findall(text.upper())
+            for m in page_models:
+                all_models.add(m)
+                prefix = _extract_model_prefix(m)
+                if prefix:
+                    prefix_counter[prefix] = prefix_counter.get(prefix, 0) + 1
+
+            # ── 品牌名检测 (前 3 页 + 末页) ──
+            if page_idx in brand_scan_pages:
+                try:
+                    page_dict = page.get_text("dict")
+                    for block in page_dict.get("blocks", []):
+                        for line in block.get("lines", []):
+                            for span in line.get("spans", []):
+                                _collect_brand_candidate(
+                                    span, profile.brand_names)
+                except Exception:
+                    pass  # dict 解析失败不影响主流程
 
             # 组合关键词检测
             if any(kw in text for kw in _COMBO_KEYWORDS):
@@ -132,6 +190,12 @@ def scan_catalog(pdf_path: str) -> CatalogProfile:
             if len(found_cats) == 1 and has_model:
                 cat = next(iter(found_cats))
                 exclusive_cats[cat] = exclusive_cats.get(cat, 0) + 1
+
+        # 型号前缀: 频次 ≥ 3 的加入 profile
+        profile.all_model_numbers = all_models
+        profile.model_prefixes = {
+            p for p, cnt in prefix_counter.items() if cnt >= 3
+        }
     finally:
         doc.close()
 
@@ -182,6 +246,9 @@ def scan_catalog(pdf_path: str) -> CatalogProfile:
                 is_combo=profile.is_combo_catalog,
                 combo_kw_ratio=profile.combo_keyword_ratio,
                 multi_cat_ratio=profile.multi_category_page_ratio,
-                is_pure_image=profile.is_pure_image_catalog)
+                is_pure_image=profile.is_pure_image_catalog,
+                brand_names=sorted(profile.brand_names),
+                model_prefixes=sorted(profile.model_prefixes),
+                model_count=len(profile.all_model_numbers))
 
     return profile

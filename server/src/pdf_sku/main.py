@@ -80,6 +80,30 @@ def create_llm_service(redis=None):
         ))
         openrouter_names.append(name)
 
+    # 万界方舟 (Gemini 原生 API) — 命名为 openrouter_wanjie 以加入轮询池
+    if settings.wanjie_api_key:
+        from pdf_sku.llm_adapter.client.gemini import GeminiClient as _GC_W
+        name = "openrouter_wanjie"
+        register_client(name, _GC_W(
+            api_key=settings.wanjie_api_key,
+            model=settings.wanjie_model,
+            timeout=settings.llm_timeout_seconds,
+            api_base=settings.wanjie_api_base,
+        ))
+        openrouter_names.append(name)
+
+    # GPTProto (Gemini 原生 API) — 命名为 openrouter_gptproto 以加入轮询池
+    if settings.gptproto_api_key:
+        from pdf_sku.llm_adapter.client.gemini import GeminiClient as _GC_GP
+        name = "openrouter_gptproto"
+        register_client(name, _GC_GP(
+            api_key=settings.gptproto_api_key,
+            model=settings.gptproto_model,
+            timeout=settings.llm_timeout_seconds,
+            api_base=settings.gptproto_api_base,
+        ))
+        openrouter_names.append(name)
+
     # Apiyi (OpenAI 兼容中转) — 命名为 openrouter_apiyi 以加入轮询池
     if settings.apiyi_api_key:
         from pdf_sku.llm_adapter.client.openrouter import OpenRouterClient as _ORC_A
@@ -111,7 +135,7 @@ def create_llm_service(redis=None):
     if settings.qwen_api_key:
         fallback_chain.append("qwen")
 
-    # 加权轮询: OpenRouter×2, Nebula×1, APIYI×1
+    # 加权轮询: OpenRouter×2, Nebula×1, APIYI×1, 万界×1
     provider_weights: dict[str, int] = {}
     for name in openrouter_names:
         if name in ("openrouter", "openrouter_1"):

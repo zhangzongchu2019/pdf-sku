@@ -558,18 +558,83 @@ def split_compound_models(skus: list[SKUResult]) -> list[SKUResult]:
     return result
 
 
-def cross_page_dedup(all_skus: list[SKUResult]) -> list[SKUResult]:
+def cross_page_dedup(
+    all_skus: list[SKUResult],
+    catalog_profile: "CatalogProfile | None" = None,
+) -> list[SKUResult]:
     """
-    跨页去重: 对所有页面汇总的 SKU 进行 model_number 去重 + 名称相似度去重。
+    跨页去重: 对所有页面汇总的 SKU 进行 model_number 去重 + 安全名称去重。
     用于 benchmark runner 汇总后消除跨页表格产生的重复。
-    阈值 0.95: 只合并几乎完全相同的 SKU，避免误删不同产品。
     """
     if len(all_skus) <= 1:
         return all_skus
     before = len(all_skus)
     # 跨页去重只按 model_number: 跨页同名不等于同产品（如不同页的"餐椅"）
     result = dedup_by_model(all_skus)
+    # 无型号安全去重: 高频重复的品牌名/通用词
+    result = _dedup_no_model_safe(result, catalog_profile)
     removed = before - len(result)
     if removed:
         logger.info("cross_page_dedup_done", before=before, after=len(result), removed=removed)
     return result
+
+
+def _dedup_no_model_safe(
+    skus: list[SKUResult],
+    catalog_profile: "CatalogProfile | None" = None,
+) -> list[SKUResult]:
+    """安全去重无型号同名 SKU。
+
+    规则（同时满足才去重）:
+    - 无 model_number
+    - 同名出现 ≥ 5 次
+    - 或同名 ≥ 3 次 且 名称是品牌名 / 短通用词 (≤3 字)
+
+    保留策略: 每组保留 confidence 最高的 1 个。
+    安全阀: 同名 < 3 次绝不去重。
+    """
+    if len(skus) <= 2:
+        return skus
+
+    # 按名称分组 (仅无型号)
+    from collections import defaultdict
+    name_groups: dict[str, list[int]] = defaultdict(list)  # name_lower → [indices]
+    for i, sku in enumerate(skus):
+        model = (sku.attributes.get("model_number") or "").strip()
+        if model:
+            continue
+        name = (sku.attributes.get("product_name") or "").strip().lower()
+        if name:
+            name_groups[name].append(i)
+
+    # 品牌名集合 (小写)
+    brand_lower: set[str] = set()
+    if catalog_profile and catalog_profile.brand_names:
+        brand_lower = {b.lower() for b in catalog_profile.brand_names}
+
+    remove_indices: set[int] = set()
+    for name, indices in name_groups.items():
+        count = len(indices)
+        if count < 3:
+            continue  # 安全阀: < 3 次绝不去重
+
+        should_dedup = False
+        if count >= 5:
+            should_dedup = True
+        elif count >= 3:
+            # 品牌名 或 短通用词 (≤3 字)
+            if name in brand_lower or len(name) <= 3:
+                should_dedup = True
+
+        if should_dedup:
+            # 保留 confidence 最高的 1 个
+            best_idx = max(indices, key=lambda i: skus[i].confidence)
+            for idx in indices:
+                if idx != best_idx:
+                    remove_indices.add(idx)
+
+    if remove_indices:
+        logger.info("dedup_no_model_safe_done",
+                     total=len(skus), removed=len(remove_indices))
+        return [s for i, s in enumerate(skus) if i not in remove_indices]
+    return skus
