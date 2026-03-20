@@ -56,6 +56,14 @@ SCENE_PROPS: set[str] = {
     "充电器", "床头充电器", "小夜灯", "音箱",
     "空调", "空气净化器", "纯色墙面", "艺术画", "相机",
     "床头板",
+    # 零部件/材料
+    "铝合金脚", "椅脚", "家具腿", "桌腿", "椅腿",
+    "坐垫", "海绵坐垫", "座垫",
+    "板材", "木纹板材", "背板", "面板",
+    "连接件", "横梁", "脚杯", "脚垫",
+    "写字板",
+    "涂料桶", "工人", "背景板", "装饰板",
+    "屏风", "壁挂镜",
 }
 
 # ── 场景软黑名单 (某些图册是正品，但场景渲染图中多为道具) ──
@@ -136,6 +144,12 @@ MARKETING_KEYWORDS: set[str] = {
     "目录", "封面", "封底", "前言", "后记", "附录", "备注",
     "温馨提示", "注意事项", "使用说明", "安装说明",
     "公司简介", "企业文化", "发展历程", "荣誉资质",
+    # 品牌文化/理念
+    "高素养", "高质量", "高标准", "服务理念", "生产体系",
+    "以和为贵", "真材实料", "匠心",
+    "品牌故事", "品牌介绍",
+    # 联系方式
+    "联系方式", "联系我们", "地址", "电话", "传真", "邮箱", "网址",
     # 英文常见营销
     "best seller", "hot sale", "new arrival", "free shipping",
     "limited offer", "special offer", "buy now",
@@ -234,12 +248,29 @@ def pre_filter(skus: list[SKUResult], *, scene_filter: bool = False) -> list[SKU
                          confidence=sku.confidence)
             continue
 
+        # 9) 无型号 + 无价格 + confidence < 0.4 → 高概率 FP
+        if not has_model and not has_price and sku.confidence < 0.4:
+            removed += 1
+            logger.debug("sku_low_conf_no_model_filtered", name=name[:60],
+                         confidence=sku.confidence)
+            continue
+
         # 没命中关键词，保留
         kept.append(sku)
 
     if removed:
         logger.info("pre_filter_done", total=len(skus), removed=removed, kept=len(kept))
     return kept
+
+
+def normalize_model(model: str) -> str:
+    """标准化型号: 全角→半角、去尾部 #*、去空格、大写。"""
+    import unicodedata
+    m = model.strip()
+    m = unicodedata.normalize('NFKC', m)  # 全角→半角 (Ｗ→W, ０→0)
+    m = re.sub(r'[#*]+$', '', m)   # 去尾部 #*
+    m = re.sub(r'\s+', '', m)      # 去所有空格
+    return m.upper()
 
 
 def dedup_by_model(skus: list[SKUResult]) -> list[SKUResult]:
@@ -259,10 +290,36 @@ def dedup_by_model(skus: list[SKUResult]) -> list[SKUResult]:
             continue
         # 颜色感知: 同型号不同颜色视为不同 SKU
         color = (sku.attributes.get("color") or "").strip()
-        key = f"{model.upper()}||{color.upper()}" if color else model.upper()
+        norm = normalize_model(model)
+        key = f"{norm}||{color.upper()}" if color else norm
         existing = model_map.get(key)
         if existing is None or sku.confidence > existing.confidence:
             model_map[key] = sku
+
+    # 后缀合并: 纯数字短型号 (如 "01") 可能是长型号 (如 "BK(贝壳)01") 的片段
+    # 当短型号是某个长型号的结尾部分时，合并到长型号
+    _PURE_NUM_RE = re.compile(r'^\d{1,4}$')
+    keys = list(model_map.keys())
+    remove_keys: set[str] = set()
+    for short_key in keys:
+        norm_short = short_key.split("||")[0]  # 去掉颜色部分
+        if not _PURE_NUM_RE.match(norm_short):
+            continue
+        for long_key in keys:
+            if long_key == short_key or long_key in remove_keys:
+                continue
+            norm_long = long_key.split("||")[0]
+            if len(norm_long) > len(norm_short) and norm_long.endswith(norm_short):
+                # 短型号是长型号的后缀 → 合并，保留 confidence 高的
+                if model_map[long_key].confidence >= model_map[short_key].confidence:
+                    remove_keys.add(short_key)
+                else:
+                    # 短型号 conf 更高，保留长型号的名称信息但用短的 conf
+                    model_map[long_key].confidence = model_map[short_key].confidence
+                    remove_keys.add(short_key)
+                break
+    for k in remove_keys:
+        del model_map[k]
 
     result = list(model_map.values()) + no_model
     removed = len(skus) - len(result)
@@ -443,6 +500,11 @@ def dedup_by_model_variant(skus: list[SKUResult]) -> list[SKUResult]:
             # base 本身必须含数字才算合法 base model
             # (避免 FP-21, FP-22 → base="FP" 被误合并)
             if not re.search(r'\d', base):
+                continue
+            # base 太短 (< 4 字符) → 不是合法 base，而是独立短型号
+            # (避免 24-07, 24-08 → base="24" 被误合并;
+            #  22-71, 22-72 → base="22" 被误合并)
+            if len(base) < 4:
                 continue
             key = base.upper()
             base_groups.setdefault(key, []).append((i, sku))

@@ -12,6 +12,23 @@ import structlog
 logger = structlog.get_logger()
 _parser = ResponseParser()
 
+
+def _sanitize_attrs(item: dict) -> dict:
+    """LLM 返回的属性值可能是 list/dict/None，统一转为 str。"""
+    attrs = {}
+    for k, v in item.items():
+        if k == "confidence":
+            continue
+        if isinstance(v, list):
+            attrs[k] = ", ".join(str(x) for x in v)
+        elif isinstance(v, dict):
+            attrs[k] = str(v)
+        elif v is None:
+            attrs[k] = ""
+        else:
+            attrs[k] = v  # str / int / float 保持原样
+    return attrs
+
 SINGLE_STAGE_PROMPT = """从这个 PDF 页面中提取所有商品(SKU)信息。
 对每个商品提取: product_name, model_number, price, specs, color, tag, source。
 
@@ -59,6 +76,22 @@ RESCUE_PROMPT = """这个 PDF 页面包含商品但之前提取不完整。请�
 
 仅返回 JSON 数组:
 [{{"product_name": "...", "model_number": "...", "price": "...", "specs": "...", "color": "...", "confidence": 0.7}}]"""
+
+
+SCENE_FILTER_TEXT = ("\n\n## 场景过滤（严格执行）\n"
+                     "此页面可能包含样板间/展厅场景图。你必须严格区分「主营产品」和「场景装饰物」。\n\n"
+                     "### 只提取主营产品\n"
+                     "- 页面上有文字标注（名称/型号/价格）的产品\n"
+                     "- 目录的主营品类（如沙发、床、柜子等大件家具）\n\n"
+                     "### 必须忽略的场景装饰物（即使清晰可见也不要提取）\n"
+                     "吊灯、落地灯、台灯、壁灯、装饰画、挂画、"
+                     "绿植、盆栽、花瓶、地毯、地垫、抱枕、靠枕、窗帘、"
+                     "摆件、雕塑、烛台、相框、书本、杂志、花艺、干花、"
+                     "果盘、托盘、餐具、毛毯、枕头、床单\n\n"
+                     "### 判断标准\n"
+                     "- 没有文字标注 + 属于上述装饰物类别 → 不提取\n"
+                     "- 即使图片中能看到这些物品，如果没有产品标签/型号/价格，就是场景布置而非在售商品\n"
+                     "- 宁可少提取装饰物，也不要把场景布置当成商品")
 
 
 COMPANION_PROMPT = """仔细观察这个 PDF 页面截图。页面上已经识别出以下主产品:
@@ -122,20 +155,7 @@ class SingleStageExtractor:
             if region_hint:
                 prompt += f"\n\n## 区域上下文\n{region_hint}"
             if scene_filter:
-                prompt += ("\n\n## 场景过滤（严格执行）\n"
-                           "此页面可能包含样板间/展厅场景图。你必须严格区分「主营产品」和「场景装饰物」。\n\n"
-                           "### 只提取主营产品\n"
-                           "- 页面上有文字标注（名称/型号/价格）的产品\n"
-                           "- 目录的主营品类（如沙发、床、柜子等大件家具）\n\n"
-                           "### 必须忽略的场景装饰物（即使清晰可见也不要提取）\n"
-                           "吊灯、落地灯、台灯、壁灯、装饰画、挂画、"
-                           "绿植、盆栽、花瓶、地毯、地垫、抱枕、靠枕、窗帘、"
-                           "摆件、雕塑、烛台、相框、书本、杂志、花艺、干花、"
-                           "果盘、托盘、餐具、毛毯、枕头、床单\n\n"
-                           "### 判断标准\n"
-                           "- 没有文字标注 + 属于上述装饰物类别 → 不提取\n"
-                           "- 即使图片中能看到这些物品，如果没有产品标签/型号/价格，就是场景布置而非在售商品\n"
-                           "- 宁可少提取装饰物，也不要把场景布置当成商品")
+                prompt += SCENE_FILTER_TEXT
 
             if page_class == "IMG_LABEL":
                 prompt += ("\n\n## 产品标签页提取（重要）\n"
@@ -161,8 +181,7 @@ class SingleStageExtractor:
                 results = []
                 for item in parsed.data:
                     if isinstance(item, dict):
-                        attrs = {k: v for k, v in item.items()
-                                 if k not in ("confidence",)}
+                        attrs = _sanitize_attrs(item)
                         results.append(SKUResult(
                             attributes=attrs,
                             validity="valid" if attrs.get("product_name") else "invalid",
@@ -188,6 +207,7 @@ class SingleStageExtractor:
         self,
         raw: ParsedPageIR,
         screenshot: bytes | None = None,
+        scene_filter: bool = False,
     ) -> list[SKUResult]:
         """二次提取 (rescue pass): 用更激进的 Prompt 查找遗漏的商品。"""
         if not self._llm or not screenshot:
@@ -200,6 +220,8 @@ class SingleStageExtractor:
                 if len(text_content) > 3000:
                     text_content = text_content[:3000] + "..."
                 prompt += f"\n\n## 本页 OCR 文本\n{text_content}"
+            if scene_filter:
+                prompt += SCENE_FILTER_TEXT
 
             resp = await self._llm._call_llm(
                 operation="extract_sku_rescue",
@@ -215,8 +237,7 @@ class SingleStageExtractor:
                 results = []
                 for item in parsed.data:
                     if isinstance(item, dict):
-                        attrs = {k: v for k, v in item.items()
-                                 if k not in ("confidence",)}
+                        attrs = _sanitize_attrs(item)
                         results.append(SKUResult(
                             attributes=attrs,
                             validity="valid" if attrs.get("product_name") else "invalid",
@@ -261,8 +282,7 @@ class SingleStageExtractor:
                 results = []
                 for item in parsed.data:
                     if isinstance(item, dict):
-                        attrs = {k: v for k, v in item.items()
-                                 if k not in ("confidence",)}
+                        attrs = _sanitize_attrs(item)
                         results.append(SKUResult(
                             attributes=attrs,
                             validity="valid" if attrs.get("product_name") else "invalid",
