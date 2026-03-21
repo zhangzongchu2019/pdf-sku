@@ -121,6 +121,7 @@ def _extract_prefix(model: str) -> str:
 
 def _score_catalog_relevance(
     sku: SKUResult, catalog_profile: CatalogProfile | None,
+    *, pure_visual: bool = False,
 ) -> float:
     """名称命中图册主营品类 → 1.0，出现过但非主营 → 0.3，完全无关 → 0。"""
     if not catalog_profile or not catalog_profile.main_categories:
@@ -158,7 +159,7 @@ def _score_catalog_relevance(
             # 太泛化的名称不应该因为"显而易见"而加分
             stripped = name.strip().lower()
             if stripped == synonym and len(stripped) <= 4:
-                return 0.0
+                return 0.7 if pure_visual else 0.0
             return 1.0
         elif cat_name in catalog_profile.category_page_counts:
             return 0.3
@@ -389,6 +390,8 @@ def score_and_filter(
 
     kept: list[SKUResult] = []
     removed = 0
+    is_combo = catalog_profile and catalog_profile.is_combo_catalog
+    is_pure_img = catalog_profile and catalog_profile.is_pure_image_catalog
 
     for sku in skus:
         name = (sku.attributes.get("product_name") or "").strip()
@@ -401,20 +404,25 @@ def score_and_filter(
         s_model = _score_has_model(sku)
         s_price = _score_has_price(sku)
         s_ocr = _score_ocr_grounded(sku, ocr_text)
-        s_catalog = _score_catalog_relevance(sku, catalog_profile)
+        s_catalog = _score_catalog_relevance(
+            sku, catalog_profile,
+            pure_visual=(pure_visual or bool(is_pure_img)),
+        )
         s_name = _score_name_quality(sku)
         s_llm = min(1.0, max(0.0, sku.confidence))
 
         # 硬过滤: name_quality=0 表示确定不是产品 (尺寸描述/变体规格/无型号床垫等)
         # 组合图册/纯图目录/纯图页面中通用家具名词（如"床""沙发"）是合法产品名，跳过硬过滤
-        is_combo = catalog_profile and catalog_profile.is_combo_catalog
-        is_pure_img = catalog_profile and catalog_profile.is_pure_image_catalog
         generic_exempt = ((is_combo or is_pure_img or pure_visual)
                           and name.strip().lower() in _GENERIC_FURNITURE_NAMES)
         if s_name == 0.0 and not generic_exempt:
             removed += 1
             logger.debug("sku_name_quality_hard_filtered", name=name[:60])
             continue
+
+        # 纯图目录中通用家具名是合法产品名，给予基础分
+        if generic_exempt and s_name == 0.0:
+            s_name = 0.5
 
         # 加权求和
         raw_score = (
@@ -446,8 +454,10 @@ def score_and_filter(
                 raw_score -= 0.15
 
         # 全英文名称 + 无硬信号 → 大概率是 LLM 图片描述
+        # 纯图目录/纯图页面豁免: 英文产品名是合法的
         is_all_english = _ALL_ENGLISH_RE.match(name)
-        if is_all_english and s_model == 0.0 and s_price == 0.0 and s_catalog == 0.0:
+        if (is_all_english and s_model == 0.0 and s_price == 0.0 and s_catalog == 0.0
+                and not pure_visual and not is_pure_img):
             raw_score -= 0.15
 
         # ── name-only 结构性惩罚（行业无关）──

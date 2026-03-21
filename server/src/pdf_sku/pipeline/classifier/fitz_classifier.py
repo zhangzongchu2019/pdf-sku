@@ -67,6 +67,7 @@ class PagePlan:
     expected_sku_range: tuple[int, int] = (1, 10)  # 预估 SKU 数范围
     scene_filter: bool = False             # 是否启用场景过滤
     legacy_type: str = "B"                 # 映射到旧 A/B/C/D
+    pure_visual: bool = False              # 纯图产品页: text≤30 + img_coverage>85%
 
 
 def extract_fitz_meta(page) -> FitzPageMeta:
@@ -334,6 +335,12 @@ class FitzClassifier:
                         eff_h = max(eff_h, nh)
                 estimated = max(10, int(eff_h / 150))
                 plan.expected_sku_range = (5, estimated)
+            elif pc == SINGLE_LARGE and m.image_count >= 3:
+                # 多图页: 用 image_count 估算 SKU 数
+                plan.expected_sku_range = (
+                    max(2, m.image_count),
+                    max(10, m.image_count * 2),
+                )
             else:
                 plan.expected_sku_range = (1, 10)
 
@@ -370,7 +377,13 @@ class FitzClassifier:
                 plan.expected_sku_range = (1, 10)
 
         elif pc in (MIXED_TABLE, MIXED_OTHER):
-            if m.text_len > 0:
+            if pc == MIXED_OTHER and m.image_count >= 3 and m.text_len < 100:
+                # 低文字+多图页: 用 image_count 估算
+                plan.expected_sku_range = (
+                    max(1, m.image_count // 2),
+                    max(5, m.image_count + 2),
+                )
+            elif m.text_len > 0:
                 plan.expected_sku_range = (
                     max(1, m.text_len // 200),
                     max(2, m.text_len // 100),
@@ -379,11 +392,24 @@ class FitzClassifier:
                 plan.expected_sku_range = (1, 5)
 
         # 场景过滤: 对大图覆盖但产品数少的页面启用
+        # 纯图页(text_len≤30)不启用，避免误杀纯图目录中的产品
         if pc in (SINGLE_STD, SINGLE_LARGE, IMG_LABEL, MULTI_SPARSE) and m.img_coverage > 0.60:
-            plan.scene_filter = True
+            if m.text_len > 30:
+                plan.scene_filter = True
         # IMG_DENSE: 高图片覆盖 + 低文字量 → 场景渲染图册
         if pc == IMG_DENSE and m.img_coverage > 0.60 and m.text_len < 50:
             plan.scene_filter = True
-        # SINGLE_TALL: 高图片覆盖 → 长条场景图
+        # SINGLE_TALL: 高图片覆盖 → 长条场景图 (纯图页除外)
         if pc == SINGLE_TALL and m.img_coverage > 0.60:
-            plan.scene_filter = True
+            if m.text_len > 30:
+                plan.scene_filter = True
+
+        # 纯图产品页标记: 几乎无文字 + 高图片覆盖
+        # 用于下游切片/提取/评分的特殊处理路径
+        if m.text_len <= 30 and m.img_coverage > 0.85 and pc != BLANK:
+            plan.pure_visual = True
+            plan.scene_filter = False  # 纯图页产品无文字标注是正常的
+        # 宽松级: 少量文字但图片几乎全覆盖 (如 text=46, img_cov=1.0)
+        elif m.text_len <= 80 and m.img_coverage >= 0.95 and pc != BLANK:
+            plan.pure_visual = True
+            plan.scene_filter = False

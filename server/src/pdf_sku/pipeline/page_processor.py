@@ -363,7 +363,7 @@ class PageProcessor:
             if catalog_profile and catalog_profile.is_pure_image_catalog:
                 _ocr_page_text = OcrEngine.blocks_to_text(ocr_blocks) if ocr_blocks else ""
                 _page_has_product_signal = _has_product_signal(_ocr_page_text)
-                if not _page_has_product_signal:
+                if not _page_has_product_signal and not plan.pure_visual:
                     plan.scene_filter = True
                     logger.info("pure_img_scene_filter_restored", page=page_no,
                                 ocr_len=len(_ocr_page_text))
