@@ -850,13 +850,14 @@ class PageProcessor:
             elif isinstance(r, list):
                 if r:
                     all_skus.extend(r)
-                elif slice_lo >= 2:
+                elif slice_lo >= 2 and len(plan.slices) <= 6:
                     # 预期每片有 ≥2 SKU 但返回 0 → 重试
+                    # 切片数 >6 时每片可能正常无 SKU，不标记重试
                     retry_indices.append(idx)
 
         # 重试零 SKU 切片（每页产品密度高时，空切片通常是 LLM 遗漏）
         # 允许最多 75% 切片失败仍触发重试
-        if retry_indices and len(retry_indices) <= max(len(plan.slices) - 1, len(plan.slices) * 3 // 4):
+        if retry_indices and len(retry_indices) <= len(plan.slices):
             retry_tasks = []
             for idx in retry_indices:
                 ss = screenshots[idx]

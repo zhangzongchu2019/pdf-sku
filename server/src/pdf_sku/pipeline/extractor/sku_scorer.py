@@ -43,6 +43,15 @@ PENALTY_HARD_BLACKLIST = -0.20   # 硬黑名单 + 无型号无价格
 PENALTY_SOFT_BLACKLIST = -0.12   # 软黑名单 + scene_filter
 PENALTY_PURE_IMG_NO_OCR = -0.15  # 纯图目录: OCR 有产品信号但 SKU 未被 OCR 验证
 
+# ── name-only 结构性惩罚（行业无关）──
+PENALTY_NAME_ONLY_BASE       = -0.15   # 完全无属性的基础惩罚
+PENALTY_NAME_ONLY_NO_OCR     = -0.10   # OCR 有产品信号但此 name 未验证
+PENALTY_NAME_ONLY_PAGE_MODEL = -0.15   # 同页已有 model-bearing SKU
+PENALTY_NAME_ONLY_SHORT      = -0.10   # 名称极短 (≤3字)
+
+# ── 品类感知过滤 ──
+PENALTY_CATEGORY_IRRELEVANT = -0.20  # 方案A: 名称不属于主营品类 + 无型号无价格
+
 # ── 阈值 ──
 SCORE_THRESHOLD = 0.25
 
@@ -289,7 +298,11 @@ def _check_scene_exemption(
     _, cat_name = best_match
 
     if not strict:
-        return cat_name in catalog_profile.main_categories
+        # 软黑名单: 需要在 main_categories 且有更强证据
+        if cat_name not in catalog_profile.main_categories:
+            return False
+        return (catalog_profile.exclusive_pages.get(cat_name, 0) >= 1
+                or cat_name in catalog_profile.model_co_occurred)
     else:
         # 严格: 需要独占页面 (该品类是某些页面的唯一品类)
         if catalog_profile.exclusive_pages.get(cat_name, 0) >= 1:
@@ -360,8 +373,14 @@ def score_and_filter(
     ocr_text: str = "",
     catalog_profile: CatalogProfile | None = None,
     scene_filter: bool = False,
+    page_has_model_bearing: bool = False,
+    pure_visual: bool = False,
 ) -> list[SKUResult]:
     """多维打分 + 阈值过滤，替代 pre_filter + ocr_cross_validate。
+
+    pure_visual=True 时对纯图产品页放宽过滤:
+    - 通用家具名词豁免硬过滤
+    - name-only 惩罚豁免
 
     过滤后将综合分数调制回写到 sku.confidence。
     """
@@ -387,10 +406,10 @@ def score_and_filter(
         s_llm = min(1.0, max(0.0, sku.confidence))
 
         # 硬过滤: name_quality=0 表示确定不是产品 (尺寸描述/变体规格/无型号床垫等)
-        # 组合图册/纯图目录中通用家具名词（如"床""沙发"）是合法产品名，跳过硬过滤
+        # 组合图册/纯图目录/纯图页面中通用家具名词（如"床""沙发"）是合法产品名，跳过硬过滤
         is_combo = catalog_profile and catalog_profile.is_combo_catalog
         is_pure_img = catalog_profile and catalog_profile.is_pure_image_catalog
-        generic_exempt = ((is_combo or is_pure_img)
+        generic_exempt = ((is_combo or is_pure_img or pure_visual)
                           and name.strip().lower() in _GENERIC_FURNITURE_NAMES)
         if s_name == 0.0 and not generic_exempt:
             removed += 1
@@ -431,6 +450,41 @@ def score_and_filter(
         if is_all_english and s_model == 0.0 and s_price == 0.0 and s_catalog == 0.0:
             raw_score -= 0.15
 
+        # ── name-only 结构性惩罚（行业无关）──
+        attrs = sku.attributes or {}
+        _specs = (attrs.get("specs") or attrs.get("size") or "").strip()
+        _color = (attrs.get("color") or "").strip()
+        is_name_only = (s_model == 0.0 and s_price == 0.0
+                        and not _specs and not _color)
+
+        if is_name_only:
+            # 豁免: 组合图册 或 (纯图目录 且 同批无 model-bearing SKU)
+            # 或 pure_visual 页面 (text≤30, img>85%): 纯图页面不可能有型号/价格,
+            # name-only 是此类页面的正常产出, 不应被惩罚
+            page_has_minimal_text = len(ocr_text.strip()) < 30 if ocr_text else True
+            name_only_exempt = (is_combo
+                                or (is_pure_img and not page_has_model_bearing)
+                                or ((page_has_minimal_text or pure_visual)
+                                    and not page_has_model_bearing))
+
+            if not name_only_exempt:
+                raw_score += PENALTY_NAME_ONLY_BASE           # -0.15
+
+                if ocr_has_product_signal and s_ocr == 0.0:   # OCR 有信号但 name 未验证
+                    raw_score += PENALTY_NAME_ONLY_NO_OCR      # -0.10
+
+                if page_has_model_bearing:                     # 同页有型号产品
+                    raw_score += PENALTY_NAME_ONLY_PAGE_MODEL  # -0.15
+
+                if len(name.replace(" ", "")) <= 3:            # 极短名称
+                    raw_score += PENALTY_NAME_ONLY_SHORT       # -0.10
+
+                logger.debug("name_only_penalty", name=name[:60],
+                             base=PENALTY_NAME_ONLY_BASE,
+                             no_ocr=PENALTY_NAME_ONLY_NO_OCR if (ocr_has_product_signal and s_ocr == 0.0) else 0,
+                             page_model=PENALTY_NAME_ONLY_PAGE_MODEL if page_has_model_bearing else 0,
+                             short=PENALTY_NAME_ONLY_SHORT if len(name.replace(" ", "")) <= 3 else 0)
+
         # 场景惩罚
         penalty = _compute_penalty(
             sku,
@@ -439,6 +493,33 @@ def score_and_filter(
             scene_filter=scene_filter,
             catalog_profile=catalog_profile,
         )
+
+        # ── 品类感知过滤 (AND 策略: 方案A∩B 交集) ──
+        # 无价格即触发；有型号但无价格的非主营品类给予较轻惩罚
+        if (s_price == 0.0
+                and catalog_profile and catalog_profile.main_categories):
+            from pdf_sku.pipeline.catalog_profiler import _SYNONYM_TO_CATEGORY
+            name_lower = name.lower()
+
+            # 最长匹配: SKU 名称命中的品类词
+            matched_cat: str | None = None
+            best_len = 0
+            for synonym, cat_name in _SYNONYM_TO_CATEGORY.items():
+                if synonym in name_lower and len(synonym) > best_len:
+                    matched_cat = cat_name
+                    best_len = len(synonym)
+
+            # 命中了品类词，但不属于主营品类 → 惩罚
+            if matched_cat and matched_cat not in catalog_profile.main_categories:
+                if s_model == 0.0:
+                    penalty += PENALTY_CATEGORY_IRRELEVANT       # -0.20 (无型号)
+                else:
+                    penalty += PENALTY_CATEGORY_IRRELEVANT / 2   # -0.10 (有型号但非主营)
+                logger.debug("category_irrelevant_penalty",
+                             name=name[:60],
+                             matched_cat=matched_cat,
+                             has_model=s_model > 0,
+                             main_cats=list(catalog_profile.main_categories)[:5])
 
         final_score = max(0.0, min(1.0, raw_score + penalty))
 
