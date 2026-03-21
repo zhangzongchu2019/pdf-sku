@@ -34,7 +34,7 @@ def plan_slices(meta: FitzPageMeta, plan: PagePlan) -> list[tuple] | None:
     pc = plan.page_class
 
     if pc == SINGLE_LARGE:
-        return _slice_single_large(meta)
+        return _slice_single_large(meta, pure_visual=plan.pure_visual)
     elif pc == SINGLE_TALL:
         return _slice_single_tall(meta)
     elif pc in (IMG_DENSE, IMG_LABEL):
@@ -88,16 +88,24 @@ def render_slice(
         doc.close()
 
 
-def _slice_single_large(meta: FitzPageMeta) -> list[tuple] | None:
-    """SINGLE_LARGE: 将页面分为 2-4 块，每块不超过 MAX_SLICE_W x MAX_SLICE_H。
+def _slice_single_large(meta: FitzPageMeta, *, pure_visual: bool = False) -> list[tuple] | None:
+    """SINGLE_LARGE: 将页面分为 2-9 块，每块不超过目标尺寸。
 
     利用图片 bbox 找安全切割线（不穿过图片）。
     注意: 页面可能因嵌入高分辨率图片而被分类为 SINGLE_LARGE，
     即使 PDF 页面尺寸 < MAX_SLICE_W/H，仍应切片以获得足够像素密度。
+
+    pure_visual=True 时使用更小的目标尺寸 (700)，产生更多切片，
+    适用于单张合成图内含多个产品的纯图目录页。
     """
     pw, ph = meta.page_width, meta.page_height
     if pw <= 0 or ph <= 0:
         return None
+
+    # pure_visual: 更激进的切片 (700) — 合成产品图需要高密度
+    # 普通 SINGLE_LARGE: 适中切片 (900)
+    target_w = 700.0 if pure_visual else 900.0
+    target_h = 700.0 if pure_visual else 900.0
 
     # 考虑原生图片分辨率: 高分辨率嵌入图需要更多切片
     eff_w, eff_h = pw, ph
@@ -107,13 +115,17 @@ def _slice_single_large(meta: FitzPageMeta) -> list[tuple] | None:
             eff_h = max(eff_h, nh)
 
     # 计算需要的行列数 (基于有效尺寸)
-    cols = max(1, int(eff_w / MAX_SLICE_W + 0.5))
-    rows = max(1, int(eff_h / MAX_SLICE_H + 0.5))
+    cols = max(1, int(eff_w / target_w + 0.5))
+    rows = max(1, int(eff_h / target_h + 0.5))
+
+    # 多图页面: 确保切片数匹配图片密度
+    if meta.image_count >= 6:
+        rows = max(rows, 2)
+        cols = max(cols, 2)
 
     # 已被分类为 SINGLE_LARGE → 保证至少 2 片
     # (分类可能基于 native_dim > 1500 而非 page pt)
     if rows <= 1 and cols <= 1:
-        # 按长边切 2 片
         if pw >= ph:
             cols = 2
         else:
@@ -198,7 +210,16 @@ def _slice_img_dense(meta: FitzPageMeta) -> list[tuple] | None:
 
         return slices if len(slices) > 1 else None
 
-    # 无网格: 按高度等分 (至少 2 片)
+    # 无网格回退: 用 image_count 估算需要的切片数，每片覆盖 ~2 张图
+    if meta.image_count >= 4:
+        n_slices = min(max(4, (meta.image_count + 1) // 2), 16)
+        row_height = ph / n_slices
+        slices = []
+        for i in range(n_slices):
+            y0 = max(0, i * row_height - TALL_OVERLAP) if i > 0 else 0
+            y1 = min(ph, (i + 1) * row_height + TALL_OVERLAP) if i < n_slices - 1 else ph
+            slices.append((0, y0, pw, y1))
+        return slices if len(slices) > 1 else None
     return _slice_single_tall(meta)
 
 

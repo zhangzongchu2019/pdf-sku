@@ -40,14 +40,14 @@ W_LLM_CONFIDENCE = 0.15
 
 # ── 场景惩罚 ──
 PENALTY_HARD_BLACKLIST = -0.20   # 硬黑名单 + 无型号无价格
-PENALTY_SOFT_BLACKLIST = -0.12   # 软黑名单 + scene_filter
+PENALTY_SOFT_BLACKLIST = -0.18   # 软黑名单 + scene_filter  # was -0.12
 PENALTY_PURE_IMG_NO_OCR = -0.15  # 纯图目录: OCR 有产品信号但 SKU 未被 OCR 验证
 
 # ── name-only 结构性惩罚（行业无关）──
 PENALTY_NAME_ONLY_BASE       = -0.15   # 完全无属性的基础惩罚
 PENALTY_NAME_ONLY_NO_OCR     = -0.10   # OCR 有产品信号但此 name 未验证
 PENALTY_NAME_ONLY_PAGE_MODEL = -0.15   # 同页已有 model-bearing SKU
-PENALTY_NAME_ONLY_SHORT      = -0.10   # 名称极短 (≤3字)
+PENALTY_NAME_ONLY_SHORT      = -0.15   # 名称极短 (≤3字)  # was -0.10
 
 # ── 品类感知过滤 ──
 PENALTY_CATEGORY_IRRELEVANT = -0.20  # 方案A: 名称不属于主营品类 + 无型号无价格
@@ -471,11 +471,9 @@ def score_and_filter(
             # 豁免: 组合图册 或 (纯图目录 且 同批无 model-bearing SKU)
             # 或 pure_visual 页面 (text≤30, img>85%): 纯图页面不可能有型号/价格,
             # name-only 是此类页面的正常产出, 不应被惩罚
-            page_has_minimal_text = len(ocr_text.strip()) < 30 if ocr_text else True
             name_only_exempt = (is_combo
                                 or (is_pure_img and not page_has_model_bearing)
-                                or ((page_has_minimal_text or pure_visual)
-                                    and not page_has_model_bearing))
+                                or (pure_visual and not page_has_model_bearing))
 
             if not name_only_exempt:
                 raw_score += PENALTY_NAME_ONLY_BASE           # -0.15
