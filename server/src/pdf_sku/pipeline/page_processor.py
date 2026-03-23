@@ -19,6 +19,7 @@ Phase 9: 导出
 from __future__ import annotations
 import asyncio
 import hashlib
+import io
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 
@@ -31,6 +32,7 @@ from pdf_sku.pipeline.parser.feature_extractor import FeatureExtractor
 from pdf_sku.pipeline.parser.ocr_engine import OcrEngine, OcrBlock
 from pdf_sku.pipeline.layout_detector import (
     detect_all_regions, split_composite_image, LayoutRegion,
+    _FIGURE_LABELS,
 )
 from pdf_sku.pipeline.classifier.page_classifier import PageClassifier
 from pdf_sku.pipeline.classifier.fitz_classifier import (
@@ -45,6 +47,7 @@ from pdf_sku.pipeline.extractor.consistency_validator import ConsistencyValidato
 from pdf_sku.pipeline.extractor.sku_dedup import (
     run_dedup_chain, dedup_by_model, dedup_by_similarity,
     dedup_by_model_variant, dedup_material_variants,
+    _merge_variant_size,
     pre_filter, ocr_cross_validate, split_compound_models,
     normalize_model,
 )
@@ -81,6 +84,61 @@ HEADER_NORMALIZE = {
     "标签": "tag",
     "来源": "source",
 }
+
+
+def _make_refined_slices(
+    image_bboxes: list[tuple],
+    page_w: float,
+    page_h: float,
+    max_slices: int = 20,
+) -> list[tuple]:
+    """用图片 bbox 生成细粒度切片，每 1-2 张图一片。
+
+    算法: 按 Y 坐标聚类图片为行，每行按 X 坐标拆分。
+    切片间保留 40pt overlap。
+    """
+    if not image_bboxes or page_w <= 0 or page_h <= 0:
+        return []
+
+    OVERLAP = 40.0
+    ROW_GAP = 30.0  # Y 方向间距 > 此值视为不同行
+
+    # 按 Y 中心排序
+    sorted_bboxes = sorted(image_bboxes, key=lambda b: (b[1] + b[3]) / 2)
+
+    # 聚类为行
+    rows: list[list[tuple]] = []
+    current_row: list[tuple] = [sorted_bboxes[0]]
+    for bbox in sorted_bboxes[1:]:
+        prev_bottom = max(b[3] for b in current_row)
+        cur_top = bbox[1]
+        if cur_top - prev_bottom > ROW_GAP:
+            rows.append(current_row)
+            current_row = [bbox]
+        else:
+            current_row.append(bbox)
+    rows.append(current_row)
+
+    # 每行按 X 排序，每 1-2 张图生成一个切片
+    slices: list[tuple] = []
+    for row in rows:
+        row.sort(key=lambda b: b[0])  # 按 X 排序
+        row_y0 = min(b[1] for b in row)
+        row_y1 = max(b[3] for b in row)
+
+        # 每 2 张图一片
+        for i in range(0, len(row), 2):
+            chunk = row[i:i + 2]
+            x0 = max(0, min(b[0] for b in chunk) - OVERLAP)
+            x1 = min(page_w, max(b[2] for b in chunk) + OVERLAP)
+            y0 = max(0, row_y0 - OVERLAP)
+            y1 = min(page_h, row_y1 + OVERLAP)
+            slices.append((x0, y0, x1, y1))
+
+        if len(slices) >= max_slices:
+            break
+
+    return slices[:max_slices]
 
 
 def _extract_page_sync(file_path: str, page_no: int) -> ParsedPageIR:
@@ -581,6 +639,69 @@ class PageProcessor:
                     logger.info("dense_page_retry_done", page=page_no,
                                 after=len(skus))
 
+            # ═══ Phase 6.45: IMG_DENSE 细粒度二次切片 ═══
+            # 切片已提取到 SKU 但数量远低于预期 → 用图片 bbox 生成更细粒度切片
+            if (plan.page_class == IMG_DENSE
+                    and len(skus) >= 2
+                    and fitz_meta.image_bboxes
+                    and fitz_meta.page_height > 0):
+                expected_min = plan.expected_sku_range[0] or 4
+                if len(skus) < expected_min * 0.6:
+                    refined_bboxes = _make_refined_slices(
+                        fitz_meta.image_bboxes,
+                        fitz_meta.page_width, fitz_meta.page_height,
+                        max_slices=20)
+                    if refined_bboxes and len(refined_bboxes) > len(plan.slices or []):
+                        logger.info("img_dense_refined_slicing",
+                                    page=page_no,
+                                    current_skus=len(skus),
+                                    expected_min=expected_min,
+                                    refined_slices=len(refined_bboxes))
+                        ref_tasks = [
+                            loop.run_in_executor(
+                                None, render_slice, file_path, page_no, bbox, 250)
+                            for bbox in refined_bboxes
+                        ]
+                        ref_results = await asyncio.gather(
+                            *ref_tasks, return_exceptions=True)
+                        ref_skus: list[SKUResult] = []
+                        for sr in ref_results:
+                            if isinstance(sr, Exception) or not sr:
+                                continue
+                            slice_skus = await self._single_stage.extract(
+                                raw, screenshot=sr,
+                                sku_count_hint=(1, 4),
+                                scene_filter=plan.scene_filter,
+                                page_class=plan.page_class)
+                            if slice_skus:
+                                ref_skus.extend(slice_skus)
+                        if ref_skus:
+                            skus.extend(ref_skus)
+                            skus = dedup_by_model(skus)
+                            skus = dedup_by_similarity(skus)
+                            logger.info("img_dense_refined_done",
+                                        page=page_no, total=len(skus))
+
+            # ═══ Phase 6.46: 通用高密度不足检测 ═══
+            # SINGLE_LARGE/SINGLE_TALL 有 SKU 但远低于预期 → rescue 补充
+            if (plan.page_class in (SINGLE_LARGE, SINGLE_TALL)
+                    and len(skus) >= 2
+                    and effective_screenshot):
+                expected_min = plan.expected_sku_range[0] or 4
+                if len(skus) < expected_min * 0.5:
+                    logger.info("high_density_undercount_rescue",
+                                page=page_no,
+                                current_skus=len(skus),
+                                expected_min=expected_min)
+                    rescue_skus = await self._single_stage.extract_rescue(
+                        raw, screenshot=effective_screenshot)
+                    if rescue_skus:
+                        skus.extend(rescue_skus)
+                        skus = dedup_by_model(skus)
+                        skus = dedup_by_similarity(skus)
+                        logger.info("high_density_rescue_done",
+                                    page=page_no, total=len(skus))
+
             # ═══ Phase 6.5: 综合打分 + 去重链 ═══
             if skus:
                 before = len(skus)
@@ -601,6 +722,7 @@ class PageProcessor:
                                          pure_visual=plan.pure_visual)
                 skus = split_compound_models(skus)
                 skus = dedup_by_model(skus)
+                skus = _merge_variant_size(skus)
                 skus = dedup_by_model_variant(skus)
                 skus = dedup_material_variants(skus)
                 if not is_image_catalog:
@@ -705,6 +827,81 @@ class PageProcessor:
                         extraction_method = "pure_image_text_fallback"
                         logger.info("pure_image_text_fallback", page=page_no,
                                     name=first_line)
+
+            # ═══ Phase 6.59: IMG_DENSE figure rescue ═══
+            # IMG_DENSE 零 SKU + YOLO 检测到 figure → 按区域裁剪让 LLM 识别产品
+            # 单 figure 覆盖整页时，用整页截图 + 强制枚举 hint
+            if (not skus
+                    and plan.page_class == IMG_DENSE
+                    and layout_regions
+                    and screenshot):
+                figure_regions = [
+                    r for r in layout_regions
+                    if r.label in _FIGURE_LABELS
+                ]
+                if figure_regions:
+                    figure_regions.sort(
+                        key=lambda r: abs(r.bbox[2] - r.bbox[0]) * abs(r.bbox[3] - r.bbox[1]),
+                        reverse=True,
+                    )
+                    figure_regions = figure_regions[:12]
+
+                    from PIL import Image as PILImage
+                    pil_img = PILImage.open(io.BytesIO(screenshot))
+                    img_w, img_h = pil_img.size
+
+                    _RESCUE_HINT = (
+                        "这是一个产品目录页面，包含多个独立产品图片。"
+                        "请仔细观察页面中每一个独立的产品图片区域，"
+                        "为每个产品提取名称。不要遗漏任何产品。"
+                    )
+
+                    crop_tasks = []
+                    if len(figure_regions) == 1:
+                        # 单 figure 覆盖整页 → 用整页截图 + 强制枚举
+                        sku_lo = plan.expected_sku_range[0] or 2
+                        sku_hi = plan.expected_sku_range[1] or 8
+                        crop_tasks.append(self._single_stage.extract(
+                            raw, screenshot=screenshot,
+                            sku_count_hint=(sku_lo, sku_hi),
+                            region_hint=_RESCUE_HINT,
+                            scene_filter=False,
+                            page_class=plan.page_class,
+                        ))
+                    else:
+                        for region in figure_regions:
+                            x0, y0, x1, y1 = region.bbox
+                            crop = pil_img.crop(
+                                (int(x0), int(y0), int(x1), int(y1)))
+                            buf = io.BytesIO()
+                            crop.save(buf, format="JPEG", quality=85)
+                            crop_bytes = buf.getvalue()
+
+                            crop_tasks.append(self._single_stage.extract(
+                                raw, screenshot=crop_bytes,
+                                sku_count_hint=(1, 3),
+                                region_hint=_RESCUE_HINT,
+                                scene_filter=False,
+                                page_class=plan.page_class,
+                            ))
+
+                    if crop_tasks:
+                        crop_results = await asyncio.gather(
+                            *crop_tasks, return_exceptions=True)
+                        for r in crop_results:
+                            if isinstance(r, list) and r:
+                                for s in r:
+                                    s.extraction_method = "img_dense_figure_rescue"
+                                skus.extend(r)
+
+                        if skus:
+                            skus = dedup_by_model(skus)
+                            skus = dedup_by_similarity(skus, threshold=0.90)
+                            extraction_method = "img_dense_figure_rescue"
+                            logger.info("img_dense_figure_rescue",
+                                        page=page_no,
+                                        figures=len(figure_regions),
+                                        skus=len(skus))
 
             # ═══ Phase 6.6: SKUReviewer Pass 2 (B/C 类 + 有 SKU) ═══
             # 仅 IMG_LABEL+grid 跳过（有文字标签，幻觉率低）

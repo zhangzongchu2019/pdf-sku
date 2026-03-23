@@ -39,8 +39,8 @@ W_LLM_CONFIDENCE = 0.15
 # 总权重 = 1.15 (有意大于 1.0, 最终 clamp 到 [0, 1])
 
 # ── 场景惩罚 ──
-PENALTY_HARD_BLACKLIST = -0.20   # 硬黑名单 + 无型号无价格
-PENALTY_SOFT_BLACKLIST = -0.18   # 软黑名单 + scene_filter  # was -0.12
+PENALTY_HARD_BLACKLIST = -0.10   # 硬黑名单 + 无型号无价格 (降权，动态评分为主)
+PENALTY_SOFT_BLACKLIST = -0.08   # 软黑名单 + scene_filter (降权)
 PENALTY_PURE_IMG_NO_OCR = -0.15  # 纯图目录: OCR 有产品信号但 SKU 未被 OCR 验证
 
 # ── name-only 结构性惩罚（行业无关）──
@@ -58,8 +58,9 @@ SCORE_THRESHOLD = 0.25
 
 def _score_has_model(sku: SKUResult) -> float:
     """有型号 → 1.0，名称中含型号模式 → 0.5，否则 0。"""
+    from pdf_sku.pipeline.extractor.sku_dedup import _FAKE_MODEL_VALUES
     model = (sku.attributes.get("model_number") or "").strip()
-    if model:
+    if model and model.lower() not in _FAKE_MODEL_VALUES:
         return 1.0
     name = (sku.attributes.get("product_name") or "").strip()
     if _MODEL_RE.search(name):
@@ -368,6 +369,78 @@ def _compute_penalty(
     return penalty
 
 
+def _compute_prop_penalty(
+    sku: SKUResult,
+    *,
+    s_model: float,
+    s_price: float,
+    s_ocr: float,
+    s_catalog: float,
+    catalog_profile: CatalogProfile | None,
+    page_has_model_bearing: bool,
+) -> float:
+    """动态道具评分: 多维弱信号组合判定是否为场景道具。
+
+    前置条件: 有真实型号 (s_model > 0) → 直接返回 0 不惩罚。
+    信号总分 >= 0.45 → -0.30 惩罚; >= 0.35 → -0.15 惩罚。
+    """
+    if s_model > 0:
+        return 0.0  # 有型号 → 不是道具
+
+    # ── B1: fake model 快速击杀 ──
+    # fake model + 低 LLM conf + 非主营品类 → 直接判定为道具
+    from pdf_sku.pipeline.extractor.sku_dedup import _FAKE_MODEL_VALUES
+    model_raw = (sku.attributes.get("model_number") or "").strip()
+    llm_conf = min(1.0, max(0.0, sku.confidence))
+    if (model_raw and model_raw.lower() in _FAKE_MODEL_VALUES
+            and llm_conf < 0.5
+            and catalog_profile and catalog_profile.main_categories
+            and s_catalog < 0.7):
+        name = (sku.attributes.get("product_name") or "").strip()
+        logger.debug("fake_model_kill", name=name[:60],
+                     model=model_raw, conf=round(llm_conf, 2),
+                     catalog=round(s_catalog, 2))
+        return -0.50  # 足够大的惩罚，确保被过滤
+
+    signal = 0.0
+
+    # 无价格 +0.20
+    if s_price == 0.0:
+        signal += 0.20
+
+    # 不属于主营品类 +0.25
+    if catalog_profile and catalog_profile.main_categories:
+        if s_catalog == 0.0:
+            signal += 0.25
+        elif s_catalog <= 0.3:
+            signal += 0.15
+
+    # OCR 无验证 +0.15
+    if s_ocr == 0.0:
+        signal += 0.15
+
+    # LLM confidence 低 (<0.6) +0.15
+    if llm_conf < 0.6:
+        signal += 0.15
+
+    # 同页有型号产品 +0.15
+    if page_has_model_bearing:
+        signal += 0.15
+
+    # 命中已知道具词 +0.10
+    name = (sku.attributes.get("product_name") or "").strip()
+    if _is_scene_prop(name) or _is_scene_soft_prop(name):
+        signal += 0.10
+
+    if signal >= 0.45:
+        logger.debug("prop_penalty_strong", name=name[:60], signal=round(signal, 2))
+        return -0.30
+    elif signal >= 0.35:
+        logger.debug("prop_penalty_mild", name=name[:60], signal=round(signal, 2))
+        return -0.15
+    return 0.0
+
+
 def score_and_filter(
     skus: list[SKUResult],
     *,
@@ -471,9 +544,12 @@ def score_and_filter(
             # 豁免: 组合图册 或 (纯图目录 且 同批无 model-bearing SKU)
             # 或 pure_visual 页面 (text≤30, img>85%): 纯图页面不可能有型号/价格,
             # name-only 是此类页面的正常产出, 不应被惩罚
+            # 收紧: pure_visual/pure_img 豁免要求命中主营品类 (s_catalog >= 0.7),
+            #       避免场景道具 (茶几/休闲椅) 在沙发图册中被豁免
+            _cat_ok = s_catalog >= 0.7  # 命中主营品类或无 profile (0.5 中性分不够)
             name_only_exempt = (is_combo
-                                or (is_pure_img and not page_has_model_bearing)
-                                or (pure_visual and not page_has_model_bearing))
+                                or (is_pure_img and not page_has_model_bearing and _cat_ok)
+                                or (pure_visual and not page_has_model_bearing and _cat_ok))
 
             if not name_only_exempt:
                 raw_score += PENALTY_NAME_ONLY_BASE           # -0.15
@@ -502,6 +578,14 @@ def score_and_filter(
             catalog_profile=catalog_profile,
         )
 
+        # ── 动态道具惩罚 ──
+        prop_penalty = _compute_prop_penalty(
+            sku, s_model=s_model, s_price=s_price, s_ocr=s_ocr,
+            s_catalog=s_catalog, catalog_profile=catalog_profile,
+            page_has_model_bearing=page_has_model_bearing,
+        )
+        penalty += prop_penalty
+
         # ── 品类感知过滤 (AND 策略: 方案A∩B 交集) ──
         # 无价格即触发；有型号但无价格的非主营品类给予较轻惩罚
         if (s_price == 0.0
@@ -528,6 +612,15 @@ def score_and_filter(
                              matched_cat=matched_cat,
                              has_model=s_model > 0,
                              main_cats=list(catalog_profile.main_categories)[:5])
+
+        # ── B4: 无型号+低conf+无价格 快速过滤 ──
+        # conf < 0.35 + 无有效型号 + 无价格 → 直接 invalid
+        # 精准命中: 凯跃营销文案(0.27), 万日红低conf配件(0.25-0.30)
+        if s_model == 0.0 and s_price == 0.0 and s_llm < 0.35:
+            removed += 1
+            logger.debug("low_conf_no_model_price_filtered",
+                         name=name[:60], llm_conf=round(s_llm, 3))
+            continue
 
         final_score = max(0.0, min(1.0, raw_score + penalty))
 

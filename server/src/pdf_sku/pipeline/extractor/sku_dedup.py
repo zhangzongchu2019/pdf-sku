@@ -287,6 +287,21 @@ def normalize_model(model: str) -> str:
     return m.upper()
 
 
+_FAKE_MODEL_VALUES = {
+    "null", "n/a", "na", "not visible", "none", "-", "--",
+    "无", "暂无", "无型号",
+}
+
+
+def _merge_variant_color(source: SKUResult, target: SKUResult) -> None:
+    """将 source 的颜色合并到 target（规格维度）。"""
+    src_color = (source.attributes.get("color") or "").strip()
+    tgt_color = (target.attributes.get("color") or "").strip()
+    if src_color and src_color != tgt_color:
+        combined = f"{tgt_color} / {src_color}" if tgt_color else src_color
+        target.attributes["color"] = combined
+
+
 def dedup_by_model(skus: list[SKUResult]) -> list[SKUResult]:
     """
     同 model_number 去重: 保留 confidence 最高的。
@@ -299,16 +314,19 @@ def dedup_by_model(skus: list[SKUResult]) -> list[SKUResult]:
 
     for sku in skus:
         model = (sku.attributes.get("model_number") or "").strip()
-        if not model:
+        if not model or model.lower() in _FAKE_MODEL_VALUES:
             no_model.append(sku)
             continue
-        # 颜色感知: 同型号不同颜色视为不同 SKU
-        color = (sku.attributes.get("color") or "").strip()
         norm = normalize_model(model)
-        key = f"{norm}||{color.upper()}" if color else norm
+        key = norm  # 同型号合并，颜色作为规格
         existing = model_map.get(key)
-        if existing is None or sku.confidence > existing.confidence:
+        if existing is None:
             model_map[key] = sku
+        elif sku.confidence > existing.confidence:
+            _merge_variant_color(existing, sku)
+            model_map[key] = sku
+        else:
+            _merge_variant_color(sku, existing)
 
     # 后缀合并: 纯数字短型号 (如 "01") 可能是长型号 (如 "BK(贝壳)01") 的片段
     # 当短型号是某个长型号的结尾部分时，合并到长型号
@@ -634,21 +652,249 @@ def split_compound_models(skus: list[SKUResult]) -> list[SKUResult]:
     return result
 
 
+def _merge_variant_size(skus: list[SKUResult]) -> list[SKUResult]:
+    """同 model_number 的 SKU，仅尺寸(specs)不同 → 合并为一个。
+
+    目标: 丽轩地毯 Kris01 多尺寸拆分问题 (Kris01 160x230, Kris01 200x300 → 1个)。
+    实现: 同 normalized model → 合并 specs，保留 confidence 最高的。
+    """
+    if len(skus) <= 1:
+        return skus
+
+    model_groups: dict[str, list[tuple[int, SKUResult]]] = {}
+    for i, sku in enumerate(skus):
+        model = (sku.attributes.get("model_number") or "").strip()
+        if not model or model.lower() in _FAKE_MODEL_VALUES:
+            continue
+        norm = normalize_model(model)
+        model_groups.setdefault(norm, []).append((i, sku))
+
+    remove_indices: set[int] = set()
+    for norm, group in model_groups.items():
+        if len(group) <= 1:
+            continue
+
+        # 检查是否仅 specs 不同 (product_name 相同或高度相似)
+        names = [
+            (s.attributes.get("product_name") or "").strip().lower()
+            for _, s in group
+        ]
+        # 名称全部相同或高度相似 (>= 0.85) 才合并
+        base_name = names[0]
+        all_similar = all(
+            n == base_name or SequenceMatcher(None, base_name, n).ratio() >= 0.85
+            for n in names[1:]
+        )
+        if not all_similar:
+            continue
+
+        # 保留 confidence 最高的，合并 specs
+        group.sort(key=lambda x: x[1].confidence, reverse=True)
+        keeper_idx, keeper = group[0]
+        all_specs: list[str] = []
+        for _, s in group:
+            spec = (s.attributes.get("specs") or s.attributes.get("size") or "").strip()
+            if spec and spec not in all_specs:
+                all_specs.append(spec)
+
+        if all_specs:
+            keeper.attributes["specs"] = " / ".join(all_specs)
+
+        # 合并颜色
+        all_colors: list[str] = []
+        for _, s in group:
+            c = (s.attributes.get("color") or "").strip()
+            if c and c not in all_colors:
+                all_colors.append(c)
+        if len(all_colors) > 1:
+            keeper.attributes["color"] = " / ".join(all_colors)
+
+        for idx, _ in group[1:]:
+            remove_indices.add(idx)
+
+    if remove_indices:
+        logger.info("merge_variant_size_done",
+                     total=len(skus), removed=len(remove_indices))
+        return [s for i, s in enumerate(skus) if i not in remove_indices]
+    return skus
+
+
+def _merge_no_model_into_model_bearing(skus: list[SKUResult]) -> list[SKUResult]:
+    """无型号 SKU 若名称与有型号 SKU 高度相似(>=0.80)，合并掉。
+
+    处理: 场景页提取"沙发" vs 产品页有"沙发 BT-123" 的重复。
+    """
+    if len(skus) <= 1:
+        return skus
+
+    model_bearing: list[SKUResult] = []
+    no_model: list[tuple[int, SKUResult]] = []
+
+    for i, sku in enumerate(skus):
+        model = (sku.attributes.get("model_number") or "").strip()
+        if model and model.lower() not in _FAKE_MODEL_VALUES:
+            model_bearing.append(sku)
+        else:
+            no_model.append((i, sku))
+
+    if not model_bearing or not no_model:
+        return skus
+
+    # 预处理有型号 SKU 的核心名
+    mb_cores = [
+        _strip_to_core(
+            (s.attributes.get("product_name") or "").strip().lower()
+        )
+        for s in model_bearing
+    ]
+
+    remove_indices: set[int] = set()
+    for idx, sku in no_model:
+        name = (sku.attributes.get("product_name") or "").strip().lower()
+        core = _strip_to_core(name)
+        if len(core) <= 2:
+            continue  # 太短，避免误匹配
+        for mb_core in mb_cores:
+            if not mb_core:
+                continue
+            ratio = SequenceMatcher(None, core, mb_core).ratio()
+            if ratio >= 0.80:
+                remove_indices.add(idx)
+                break
+
+    if remove_indices:
+        logger.info("merge_no_model_into_model_bearing",
+                     total=len(skus), removed=len(remove_indices))
+        return [s for i, s in enumerate(skus) if i not in remove_indices]
+    return skus
+
+
+def _dedup_cross_page_by_name_similarity(
+    skus: list[SKUResult], threshold: float = 0.85,
+) -> list[SKUResult]:
+    """仅对无型号 SKU，名称核心部分相似度 >= threshold 的去重。"""
+    if len(skus) <= 1:
+        return skus
+
+    # 分离有型号 / 无型号
+    with_model: list[SKUResult] = []
+    no_model_indexed: list[tuple[int, SKUResult]] = []
+    for i, sku in enumerate(skus):
+        model = (sku.attributes.get("model_number") or "").strip()
+        if model and model.lower() not in _FAKE_MODEL_VALUES:
+            with_model.append(sku)
+        else:
+            no_model_indexed.append((i, sku))
+
+    if len(no_model_indexed) <= 1:
+        return skus
+
+    merged: set[int] = set()
+    for ai, (idx_a, sku_a) in enumerate(no_model_indexed):
+        if idx_a in merged:
+            continue
+        name_a = _strip_to_core(
+            (sku_a.attributes.get("product_name") or "").strip().lower()
+        )
+        if len(name_a) <= 2:
+            continue
+        for bi in range(ai + 1, len(no_model_indexed)):
+            idx_b, sku_b = no_model_indexed[bi]
+            if idx_b in merged:
+                continue
+            name_b = _strip_to_core(
+                (sku_b.attributes.get("product_name") or "").strip().lower()
+            )
+            if len(name_b) <= 2:
+                continue
+            ratio = SequenceMatcher(None, name_a, name_b).ratio()
+            if ratio >= threshold:
+                # 保留 confidence 高的
+                if sku_b.confidence > sku_a.confidence:
+                    merged.add(idx_a)
+                    break
+                else:
+                    merged.add(idx_b)
+
+    if merged:
+        logger.info("dedup_cross_page_by_name_similarity",
+                     total=len(skus), removed=len(merged))
+        return [s for i, s in enumerate(skus) if i not in merged]
+    return skus
+
+
+def _filter_cross_page_props(
+    skus: list[SKUResult],
+    catalog_profile: "CatalogProfile | None" = None,
+) -> list[SKUResult]:
+    """跨页汇总后清理: 无真实型号 + 无价格 + 命中道具黑名单 → 移除。
+
+    page-level 可以宽容 (单页可能就是产品页),
+    但跨页汇总后无型号无价格的道具几乎必定是 FP。
+    主营品类豁免: 命中主营品类的不移除。
+    """
+    _PRICE_RE_LOCAL = re.compile(r'[\$¥€£￥]\s*[\d,.]+|[\d,.]+\s*元')
+    kept: list[SKUResult] = []
+    removed = 0
+
+    for sku in skus:
+        model = (sku.attributes.get("model_number") or "").strip()
+        if model and model.lower() not in _FAKE_MODEL_VALUES:
+            kept.append(sku)
+            continue
+
+        name = (sku.attributes.get("product_name") or "").strip()
+        price = (sku.attributes.get("price") or "").strip()
+        has_price = bool(price) or bool(_PRICE_RE_LOCAL.search(name))
+        if has_price:
+            kept.append(sku)
+            continue
+
+        is_prop = _is_scene_prop(name) or _is_scene_soft_prop(name)
+        if not is_prop:
+            kept.append(sku)
+            continue
+
+        # 主营品类豁免
+        if catalog_profile and catalog_profile.main_categories:
+            from pdf_sku.pipeline.catalog_profiler import _SYNONYM_TO_CATEGORY
+            name_lower = name.lower()
+            matched_cat = None
+            best_len = 0
+            for synonym, cat_name in _SYNONYM_TO_CATEGORY.items():
+                if synonym in name_lower and len(synonym) > best_len:
+                    matched_cat = cat_name
+                    best_len = len(synonym)
+            if matched_cat and matched_cat in catalog_profile.main_categories:
+                kept.append(sku)
+                continue
+
+        removed += 1
+        logger.debug("cross_page_prop_filtered", name=name[:60])
+
+    if removed:
+        logger.info("filter_cross_page_props_done",
+                     total=len(skus), removed=removed)
+    return kept
+
+
 def cross_page_dedup(
     all_skus: list[SKUResult],
     catalog_profile: "CatalogProfile | None" = None,
 ) -> list[SKUResult]:
     """
-    跨页去重: 对所有页面汇总的 SKU 进行 model_number 去重 + 安全名称去重。
+    跨页去重: 对所有页面汇总的 SKU 进行多步去重。
     用于 benchmark runner 汇总后消除跨页表格产生的重复。
     """
     if len(all_skus) <= 1:
         return all_skus
     before = len(all_skus)
-    # 跨页去重只按 model_number: 跨页同名不等于同产品（如不同页的"餐椅"）
-    result = dedup_by_model(all_skus)
-    # 无型号安全去重: 高频重复的品牌名/通用词
-    result = _dedup_no_model_safe(result, catalog_profile)
+    result = dedup_by_model(all_skus)                      # 型号去重
+    result = _merge_variant_size(result)                    # 同型号尺寸变体合并
+    result = _merge_no_model_into_model_bearing(result)     # 无型号→有型号合并
+    result = _dedup_cross_page_by_name_similarity(result)   # 名称相似度去重
+    result = _dedup_no_model_safe(result, catalog_profile)  # 高频重名去重
+    result = _filter_cross_page_props(result, catalog_profile)  # 跨页道具清理
     removed = before - len(result)
     if removed:
         logger.info("cross_page_dedup_done", before=before, after=len(result), removed=removed)
@@ -695,11 +941,11 @@ def _dedup_no_model_safe(
             continue  # 安全阀: < 3 次绝不去重
 
         should_dedup = False
-        if count >= 5:
+        if count >= 3:
             should_dedup = True
-        elif count >= 3:
-            # 品牌名 或 短通用词 (≤3 字)
-            if name in brand_lower or len(name) <= 3:
+        elif count >= 2:
+            # 品牌名 或 短通用词 (≤4 字)
+            if name in brand_lower or len(name) <= 4:
                 should_dedup = True
 
         if should_dedup:

@@ -196,7 +196,7 @@ def _slice_img_dense(meta: FitzPageMeta) -> list[tuple] | None:
         else:
             n_slices = rows
 
-        n_slices = min(n_slices, 12)  # 上限
+        n_slices = min(n_slices, 20)  # 上限 (佛山奢品嘉 avg 20图/页)
 
         if n_slices <= 1:
             return None

@@ -210,8 +210,9 @@ def scan_datasets(data_root: Path | None = None) -> list[ReferenceDataset]:
         excels = sorted(
             list(folder.glob("*.xlsx")) + list(folder.glob("*.XLSX")))
 
-        # 排除临时文件
-        excels = [e for e in excels if not e.name.startswith("~$")]
+        # 排除临时文件 (~$ = MS Office, .~ = LibreOffice)
+        excels = [e for e in excels
+                  if not e.name.startswith("~$") and not e.name.startswith(".~")]
 
         if not pdfs:
             continue
