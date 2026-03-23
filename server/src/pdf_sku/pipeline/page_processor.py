@@ -38,7 +38,7 @@ from pdf_sku.pipeline.classifier.page_classifier import PageClassifier
 from pdf_sku.pipeline.classifier.fitz_classifier import (
     FitzClassifier, FitzPageMeta, PagePlan, extract_fitz_meta,
     BLANK, TABLE, SINGLE_LARGE, SINGLE_TALL, IMG_DENSE,
-    IMG_LABEL, MIXED_TABLE,
+    IMG_LABEL, MIXED_TABLE, MULTI_SPARSE, MIXED_OTHER,
 )
 from pdf_sku.pipeline.slicer.page_slicer import plan_slices, render_slice
 from pdf_sku.pipeline.extractor.single_stage import SingleStageExtractor
@@ -646,7 +646,7 @@ class PageProcessor:
                     and fitz_meta.image_bboxes
                     and fitz_meta.page_height > 0):
                 expected_min = plan.expected_sku_range[0] or 4
-                if len(skus) < expected_min * 0.6:
+                if len(skus) < expected_min * 0.8:
                     refined_bboxes = _make_refined_slices(
                         fitz_meta.image_bboxes,
                         fitz_meta.page_width, fitz_meta.page_height,
@@ -684,11 +684,11 @@ class PageProcessor:
 
             # ═══ Phase 6.46: 通用高密度不足检测 ═══
             # SINGLE_LARGE/SINGLE_TALL 有 SKU 但远低于预期 → rescue 补充
-            if (plan.page_class in (SINGLE_LARGE, SINGLE_TALL)
+            if (plan.page_class in (SINGLE_LARGE, SINGLE_TALL, MULTI_SPARSE, IMG_LABEL, MIXED_OTHER)
                     and len(skus) >= 2
                     and effective_screenshot):
                 expected_min = plan.expected_sku_range[0] or 4
-                if len(skus) < expected_min * 0.5:
+                if len(skus) < expected_min * 0.7:
                     logger.info("high_density_undercount_rescue",
                                 page=page_no,
                                 current_skus=len(skus),
@@ -827,6 +827,42 @@ class PageProcessor:
                         extraction_method = "pure_image_text_fallback"
                         logger.info("pure_image_text_fallback", page=page_no,
                                     name=first_line)
+
+            # ═══ Phase 6.585: 纯图零 SKU Vision 兜底 ═══
+            # 零 SKU + 纯图目录 + 有截图 + 非 BLANK → 300 DPI 重渲 + rescue
+            if (not skus
+                    and plan.pure_visual
+                    and screenshot
+                    and plan.page_class != BLANK):
+                logger.info("pure_visual_zero_sku_rescue", page=page_no,
+                            page_class=plan.page_class)
+                try:
+                    hi_dpi_img = await loop.run_in_executor(
+                        None, render_slice, file_path, page_no,
+                        (0, 0, fitz_meta.page_width, fitz_meta.page_height), 300)
+                    if hi_dpi_img:
+                        rescue_skus = await self._single_stage.extract_rescue(
+                            raw, screenshot=hi_dpi_img, scene_filter=False)
+                        if rescue_skus:
+                            ocr_full_text = OcrEngine.blocks_to_text(ocr_blocks) if ocr_blocks else ""
+                            _rescue_has_model = any(
+                                (s.attributes.get("model_number") or "").strip()
+                                for s in rescue_skus
+                            )
+                            rescue_skus = score_and_filter(
+                                rescue_skus, ocr_text=ocr_full_text,
+                                catalog_profile=catalog_profile,
+                                scene_filter=False,
+                                page_has_model_bearing=_rescue_has_model,
+                                pure_visual=True)
+                            if rescue_skus:
+                                skus = rescue_skus
+                                extraction_method = "pure_visual_rescue"
+                                logger.info("pure_visual_rescue_done",
+                                            page=page_no, found=len(skus))
+                except Exception as e:
+                    logger.warning("pure_visual_rescue_failed",
+                                   page=page_no, error=str(e))
 
             # ═══ Phase 6.59: IMG_DENSE figure rescue ═══
             # IMG_DENSE 零 SKU + YOLO 检测到 figure → 按区域裁剪让 LLM 识别产品
@@ -1138,6 +1174,19 @@ class PageProcessor:
                 if vision_skus:
                     table_skus.extend(vision_skus)
                     table_skus = dedup_by_model(table_skus)
+            # R1: TABLE/MIXED_TABLE 零结果 → vision 回退
+            # 某些 TABLE 页 (如佛山奢品嘉) 实际是图文混排，表格规则提取零结果
+            if not table_skus and has_screenshot:
+                logger.info("table_zero_vision_fallback", page=raw.page_no,
+                            page_class=plan.page_class if plan else None)
+                table_skus = await self._single_stage.extract(
+                    raw, screenshot=screenshot,
+                    sku_count_hint=sku_count_hint,
+                    scene_filter=scene_filter,
+                    page_class=plan.page_class if plan else None)
+                if table_skus:
+                    for s in table_skus:
+                        s.extraction_method = "table_vision_fallback"
             return table_skus
 
         # B/C 类: OCR-Guided + Vision 并行融合

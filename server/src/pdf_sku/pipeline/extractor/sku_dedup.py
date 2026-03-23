@@ -318,7 +318,7 @@ def dedup_by_model(skus: list[SKUResult]) -> list[SKUResult]:
             no_model.append(sku)
             continue
         norm = normalize_model(model)
-        key = norm  # 同型号合并，颜色作为规格
+        key = norm  # 同型号合并，颜色/尺寸作为规格 (用户确认: 同编号不同颜色尺寸=同一产品)
         existing = model_map.get(key)
         if existing is None:
             model_map[key] = sku

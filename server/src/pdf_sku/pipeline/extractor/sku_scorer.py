@@ -28,6 +28,9 @@ logger = structlog.get_logger()
 _PRICE_RE = re.compile(r'[\$¥€£￥]\s*[\d,.]+|[\d,.]+\s*元')
 _MODEL_RE = re.compile(r'[A-Za-z]{1,5}[-\s]?\d{3,}|[A-Z]{2,}\d+|\d{3,}#')
 
+# P2: 尺寸模式 — LLM 误将尺寸字符串当型号 (如 "2400*1200*750mm")
+_DIMENSION_MODEL_RE = re.compile(r'^\d+\s*[*×xX]\s*\d+(?:\s*[*×xX]\s*\d+)?\s*(?:mm|cm|m)?$', re.IGNORECASE)
+
 # ── 权重 ──
 W_HAS_MODEL = 0.30
 W_HAS_PRICE = 0.25
@@ -61,6 +64,9 @@ def _score_has_model(sku: SKUResult) -> float:
     from pdf_sku.pipeline.extractor.sku_dedup import _FAKE_MODEL_VALUES
     model = (sku.attributes.get("model_number") or "").strip()
     if model and model.lower() not in _FAKE_MODEL_VALUES:
+        # P2: 尺寸模式当型号 → 视同无型号
+        if _DIMENSION_MODEL_RE.match(model):
+            return 0.0
         return 1.0
     name = (sku.attributes.get("product_name") or "").strip()
     if _MODEL_RE.search(name):
@@ -621,6 +627,15 @@ def score_and_filter(
             logger.debug("low_conf_no_model_price_filtered",
                          name=name[:60], llm_conf=round(s_llm, 3))
             continue
+
+        # ── P1: 纯图目录场景道具强过滤 ──
+        # 无型号+无价格+LLM conf<0.50 → 额外 -0.30 惩罚
+        # 精准命中: 相约餐饮装饰品(conf 0.4-0.5), 凯跃场景道具(conf 0.35-0.50)
+        if (is_pure_img and s_model == 0.0 and s_price == 0.0
+                and s_llm < 0.50 and s_catalog < 0.7):
+            penalty += -0.30
+            logger.debug("pure_img_no_signal_penalty", name=name[:60],
+                         llm_conf=round(s_llm, 3), catalog=round(s_catalog, 2))
 
         final_score = max(0.0, min(1.0, raw_score + penalty))
 

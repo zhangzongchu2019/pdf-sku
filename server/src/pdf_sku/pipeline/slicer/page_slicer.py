@@ -21,8 +21,8 @@ MAX_SLICE_W = 1200.0
 MAX_SLICE_H = 1200.0
 
 # 纵向切片: 每片高度
-TALL_SLICE_H = 900.0
-TALL_OVERLAP = 80.0  # 切片间重叠 (pt)
+TALL_SLICE_H = 700.0
+TALL_OVERLAP = 120.0  # 切片间重叠 (pt)
 
 
 def plan_slices(meta: FitzPageMeta, plan: PagePlan) -> list[tuple] | None:
@@ -212,7 +212,7 @@ def _slice_img_dense(meta: FitzPageMeta) -> list[tuple] | None:
 
     # 无网格回退: 用 image_count 估算需要的切片数，每片覆盖 ~2 张图
     if meta.image_count >= 4:
-        n_slices = min(max(4, (meta.image_count + 1) // 2), 16)
+        n_slices = min(max(4, meta.image_count), 20)  # 每张图一片，上限 20
         row_height = ph / n_slices
         slices = []
         for i in range(n_slices):
