@@ -183,36 +183,56 @@ def _slice_single_tall(meta: FitzPageMeta) -> list[tuple] | None:
 
 
 def _slice_img_dense(meta: FitzPageMeta) -> list[tuple] | None:
-    """IMG_DENSE: 按网格行分组，每行一片。若无网格则按高度等分。"""
+    """IMG_DENSE: 2D 网格切片（横+纵），最低 8 片，上限 30。
+
+    改进: 对 cols>=3 的网格做真正的 2D 分割（行×列），而不仅仅是纵向翻倍。
+    无网格时最低切 8 片，确保密集页面的覆盖密度。
+    """
     pw, ph = meta.page_width, meta.page_height
 
     if meta.grid and meta.grid[0] >= 2:
         rows = meta.grid[0]
         cols = meta.grid[1] if len(meta.grid) > 1 else 1
 
-        # 每行产品多 (cols>=3) 时每行切两片，确保每片不超过 ~4 个产品
+        # 2D 网格切片: 横向也切
         if cols >= 3:
-            n_slices = rows * 2
+            n_cols = 2
+            n_rows = rows
         else:
-            n_slices = rows
+            n_cols = 1
+            n_rows = rows
 
-        n_slices = min(n_slices, 20)  # 上限 (佛山奢品嘉 avg 20图/页)
+        n_total = n_rows * n_cols
+        # 最低 8 片保障: grid=(3,1) 等低值场景需加密切片
+        if n_total < 8:
+            if n_cols == 1:
+                n_rows = max(n_rows, 8)
+            else:
+                n_rows = max(n_rows, 8 // n_cols)
+            n_total = n_rows * n_cols
+        n_total = min(n_total, 30)
+        n_rows = min(n_rows, 30 // max(n_cols, 1))
 
-        if n_slices <= 1:
+        if n_total <= 1:
             return None
 
-        row_height = ph / n_slices
+        col_w = pw / n_cols
+        row_h = ph / n_rows
+        h_overlap = 40.0  # 横向重叠 (pt)
         slices = []
-        for i in range(n_slices):
-            y0 = max(0, i * row_height - TALL_OVERLAP) if i > 0 else 0
-            y1 = min(ph, (i + 1) * row_height + TALL_OVERLAP) if i < n_slices - 1 else ph
-            slices.append((0, y0, pw, y1))
+        for r in range(n_rows):
+            for c in range(n_cols):
+                x0 = max(0, c * col_w - h_overlap) if c > 0 else 0
+                x1 = min(pw, (c + 1) * col_w + h_overlap) if c < n_cols - 1 else pw
+                y0 = max(0, r * row_h - TALL_OVERLAP) if r > 0 else 0
+                y1 = min(ph, (r + 1) * row_h + TALL_OVERLAP) if r < n_rows - 1 else ph
+                slices.append((x0, y0, x1, y1))
 
         return slices if len(slices) > 1 else None
 
-    # 无网格回退: 用 image_count 估算需要的切片数，每片覆盖 ~2 张图
+    # 无网格回退: 最低 8 片，上限 30，确保密集页面的覆盖密度
     if meta.image_count >= 4:
-        n_slices = min(max(4, meta.image_count), 20)  # 每张图一片，上限 20
+        n_slices = min(max(8, meta.image_count * 2), 30)
         row_height = ph / n_slices
         slices = []
         for i in range(n_slices):

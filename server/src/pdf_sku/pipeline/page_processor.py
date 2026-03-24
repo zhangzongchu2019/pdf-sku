@@ -40,7 +40,7 @@ from pdf_sku.pipeline.classifier.fitz_classifier import (
     BLANK, TABLE, SINGLE_LARGE, SINGLE_TALL, IMG_DENSE,
     IMG_LABEL, MIXED_TABLE, MULTI_SPARSE, MIXED_OTHER,
 )
-from pdf_sku.pipeline.slicer.page_slicer import plan_slices, render_slice
+from pdf_sku.pipeline.slicer.page_slicer import plan_slices, render_slice, TALL_OVERLAP
 from pdf_sku.pipeline.extractor.single_stage import SingleStageExtractor
 from pdf_sku.pipeline.extractor.ocr_guided import OcrGuidedExtractor
 from pdf_sku.pipeline.extractor.consistency_validator import ConsistencyValidator
@@ -473,6 +473,57 @@ class PageProcessor:
                         scene_filter=plan.scene_filter,
                         page_class=plan.page_class)
                     extraction_method = "sliced_vision_fallback"
+
+                # 低产出密度检测: 提取数远低于预期 → 加密切片二次提取
+                _expect_lo = plan.expected_sku_range[0] if plan.expected_sku_range else 0
+                if (skus and _expect_lo >= 8
+                        and len(skus) < _expect_lo * 0.3
+                        and plan.page_class == IMG_DENSE
+                        and plan.pure_visual
+                        and screenshot):
+                    logger.info("low_density_retry", page=page_no,
+                                found=len(skus), expected_lo=_expect_lo,
+                                old_slices=len(plan.slices))
+                    # 加密: 切片数翻倍，最多 24
+                    _pw = fitz_meta.page_width
+                    _ph = fitz_meta.page_height
+                    _n_retry = min(len(plan.slices) * 2, 24)
+                    _row_h = _ph / _n_retry
+                    _retry_bboxes = []
+                    for _i in range(_n_retry):
+                        _y0 = max(0, _i * _row_h - TALL_OVERLAP) if _i > 0 else 0
+                        _y1 = min(_ph, (_i + 1) * _row_h + TALL_OVERLAP) if _i < _n_retry - 1 else _ph
+                        _retry_bboxes.append((0, _y0, _pw, _y1))
+                    # 渲染 + 提取
+                    _retry_imgs = await asyncio.gather(*[
+                        loop.run_in_executor(None, render_slice, file_path, page_no, bbox, 250)
+                        for bbox in _retry_bboxes
+                    ], return_exceptions=True)
+                    _retry_skus: list[SKUResult] = []
+                    _retry_tasks = []
+                    for _ri, _rimg in enumerate(_retry_imgs):
+                        if isinstance(_rimg, Exception) or not _rimg:
+                            continue
+                        _hint = (f"区域{_ri+1}/{_n_retry}。"
+                                 f"逐一提取每个产品，不同颜色/尺寸各算独立SKU。")
+                        _retry_tasks.append(self._single_stage.extract(
+                            raw, screenshot=_rimg,
+                            sku_count_hint=(1, max(3, _expect_lo // _n_retry + 1)),
+                            region_hint=_hint,
+                            scene_filter=False,
+                            page_class=plan.page_class))
+                    if _retry_tasks:
+                        _retry_results = await asyncio.gather(*_retry_tasks, return_exceptions=True)
+                        for _rr in _retry_results:
+                            if isinstance(_rr, list) and _rr:
+                                _retry_skus.extend(_rr)
+                    if len(_retry_skus) > len(skus):
+                        _retry_skus = dedup_by_model(_retry_skus)
+                        _retry_skus = dedup_by_similarity(_retry_skus, threshold=0.90)
+                        logger.info("low_density_retry_done", page=page_no,
+                                    old=len(skus), new=len(_retry_skus))
+                        skus = _retry_skus
+                        extraction_method = "low_density_retry"
 
                 # 切片 + 整页均零结果，OCR 有内容 → OCR-guided 回退
                 if not skus and ocr_text_len > 30:
@@ -948,7 +999,8 @@ class PageProcessor:
                 before_review = len(skus)
                 skus = await self._reviewer.review(
                     skus, screenshot=review_screenshot,
-                    scene_filter=plan.scene_filter)
+                    scene_filter=plan.scene_filter,
+                    pure_visual=plan.pure_visual)
                 if len(skus) < before_review:
                     logger.info("reviewer_applied",
                                 page=page_no, before=before_review, after=len(skus))
@@ -1083,9 +1135,9 @@ class PageProcessor:
             elif isinstance(r, list):
                 if r:
                     all_skus.extend(r)
-                elif slice_lo >= 2 and len(plan.slices) <= 6:
-                    # 预期每片有 ≥2 SKU 但返回 0 → 重试
-                    # 切片数 >6 时每片可能正常无 SKU，不标记重试
+                elif plan.page_class in (IMG_DENSE, IMG_LABEL) or (slice_lo >= 2 and len(plan.slices) <= 6):
+                    # IMG_DENSE/IMG_LABEL: 零结果切片始终重试（纯图页不应有空片）
+                    # 其他页面: 预期每片有 ≥2 SKU 但返回 0 → 重试
                     retry_indices.append(idx)
 
         # 重试零 SKU 切片（每页产品密度高时，空切片通常是 LLM 遗漏）
@@ -1097,7 +1149,9 @@ class PageProcessor:
                 if not ss:
                     continue
                 hint = (f"这是页面的第{idx+1}/{len(plan.slices)}个区域。"
-                        f"请仔细查看，列出所有可见的产品/SKU。")
+                        f"请先数一数这个区域有几个不同的产品图片，然后逐一提取。"
+                        f"即使没有文字标注，每个产品图片也要提取一条记录。"
+                        f"product_name 用简短中文描述(如'餐椅'、'沙发')即可。")
                 retry_range = (1, slice_hi)  # 降低下限，放宽预期
                 retry_tasks.append(self._single_stage.extract(
                     raw, screenshot=ss,
@@ -1131,8 +1185,11 @@ class PageProcessor:
                                           pure_visual=plan.pure_visual)
             all_skus = split_compound_models(all_skus)
             all_skus = dedup_by_model(all_skus)
-            # 密集产品页面用宽松阈值 similarity 去重 (仅合并几乎相同的名称)
-            if plan.page_class in (IMG_DENSE, IMG_LABEL, SINGLE_TALL):
+            # 密集产品页面: IMG_DENSE pure_visual 只按型号去重，跳过名称去重
+            # (同类不同产品名称一样是正常的，如"餐椅"x20)
+            if plan.page_class == IMG_DENSE and plan.pure_visual:
+                pass  # 已做 dedup_by_model，跳过 similarity 去重
+            elif plan.page_class in (IMG_DENSE, IMG_LABEL, SINGLE_TALL):
                 all_skus = dedup_by_similarity(all_skus, threshold=0.90)
             else:
                 all_skus = dedup_by_similarity(all_skus, threshold=0.98)

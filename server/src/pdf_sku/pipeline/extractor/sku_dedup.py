@@ -809,6 +809,18 @@ def _dedup_cross_page_by_name_similarity(
                 continue
             ratio = SequenceMatcher(None, name_a, name_b).ratio()
             if ratio >= threshold:
+                # 豁免: 颜色不同 → 是不同产品变体，不去重
+                color_a = (sku_a.attributes.get("color") or "").strip().lower()
+                color_b = (sku_b.attributes.get("color") or "").strip().lower()
+                if color_a and color_b and color_a != color_b:
+                    continue
+                # 豁免: 来自不同页面且都是 pure_visual 提取
+                page_a = getattr(sku_a, "page_no", None)
+                page_b = getattr(sku_b, "page_no", None)
+                if (page_a and page_b and page_a != page_b
+                        and getattr(sku_a, "extraction_method", "") in ("pure_visual_rescue", "img_dense_figure_rescue")
+                        and getattr(sku_b, "extraction_method", "") in ("pure_visual_rescue", "img_dense_figure_rescue")):
+                    continue
                 # 保留 confidence 高的
                 if sku_b.confidence > sku_a.confidence:
                     merged.add(idx_a)
@@ -878,6 +890,47 @@ def _filter_cross_page_props(
     return kept
 
 
+_COLOR_SPLIT_RE = re.compile(r'[/、，,；;]\s*')
+
+
+def expand_color_variants(skus: list[SKUResult]) -> list[SKUResult]:
+    """将 color 字段包含多个颜色值的 SKU 展开为独立 SKU。
+
+    例如: model=801#, color="浅灰色/深灰色/白色" → 3 个独立 SKU。
+    仅对有 model_number 且 color 含分隔符的 SKU 执行。
+    """
+    result: list[SKUResult] = []
+    expanded_total = 0
+    for sku in skus:
+        model = (sku.attributes.get("model_number") or "").strip()
+        color = (sku.attributes.get("color") or "").strip()
+        if not model or not color:
+            result.append(sku)
+            continue
+        colors = [c.strip() for c in _COLOR_SPLIT_RE.split(color) if c.strip()]
+        if len(colors) <= 1:
+            result.append(sku)
+            continue
+        # 展开: 每个颜色一个独立 SKU
+        for c in colors:
+            new_attrs = dict(sku.attributes)
+            new_attrs["color"] = c
+            new_sku = SKUResult(
+                sku_id=sku.sku_id,
+                attributes=new_attrs,
+                confidence=sku.confidence,
+                extraction_method=sku.extraction_method,
+            )
+            if hasattr(sku, "page_no"):
+                new_sku.page_no = sku.page_no
+            result.append(new_sku)
+        expanded_total += len(colors) - 1
+    if expanded_total:
+        logger.info("expand_color_variants", original=len(skus),
+                     expanded=expanded_total, total=len(result))
+    return result
+
+
 def cross_page_dedup(
     all_skus: list[SKUResult],
     catalog_profile: "CatalogProfile | None" = None,
@@ -895,6 +948,8 @@ def cross_page_dedup(
     result = _dedup_cross_page_by_name_similarity(result)   # 名称相似度去重
     result = _dedup_no_model_safe(result, catalog_profile)  # 高频重名去重
     result = _filter_cross_page_props(result, catalog_profile)  # 跨页道具清理
+    # 颜色变体展开 (在所有去重之后，确保不被 dedup_by_model 合并回去)
+    result = expand_color_variants(result)
     removed = before - len(result)
     if removed:
         logger.info("cross_page_dedup_done", before=before, after=len(result), removed=removed)

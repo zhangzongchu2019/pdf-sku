@@ -396,9 +396,10 @@ class FitzClassifier:
         if pc in (SINGLE_STD, SINGLE_LARGE, IMG_LABEL, MULTI_SPARSE) and m.img_coverage > 0.60:
             if m.text_len > 30:
                 plan.scene_filter = True
-        # IMG_DENSE: 高图片覆盖 + 低文字量 → 场景渲染图册
-        if pc == IMG_DENSE and m.img_coverage > 0.60 and m.text_len < 50:
-            plan.scene_filter = True
+        # IMG_DENSE: 不启用 scene_filter — 密集产品网格页的特征恰恰是高图覆盖+低文字
+        # 由 pure_visual 逻辑接管，避免误杀纯图产品
+        # if pc == IMG_DENSE and m.img_coverage > 0.60 and m.text_len < 50:
+        #     plan.scene_filter = True
         # SINGLE_TALL: 高图片覆盖 → 长条场景图 (纯图页除外)
         if pc == SINGLE_TALL and m.img_coverage > 0.60:
             if m.text_len > 30:
@@ -411,5 +412,9 @@ class FitzClassifier:
             plan.scene_filter = False  # 纯图页产品无文字标注是正常的
         # 宽松级: 少量文字但图片几乎全覆盖 (如 text=46, img_cov=1.0)
         elif m.text_len <= 80 and m.img_coverage >= 0.95 and pc != BLANK:
+            plan.pure_visual = True
+            plan.scene_filter = False
+        # IMG_DENSE: 文字量<=200 (分类条件本身就是 <200) → 标记 pure_visual
+        elif pc == IMG_DENSE and m.text_len <= 200:
             plan.pure_visual = True
             plan.scene_filter = False
