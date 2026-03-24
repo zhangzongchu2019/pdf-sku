@@ -552,7 +552,7 @@ def score_and_filter(
             # name-only 是此类页面的正常产出, 不应被惩罚
             # 收紧: pure_visual/pure_img 豁免要求命中主营品类 (s_catalog >= 0.7),
             #       避免场景道具 (茶几/休闲椅) 在沙发图册中被豁免
-            _cat_ok = s_catalog >= 0.7  # 命中主营品类或无 profile (0.5 中性分不够)
+            _cat_ok = s_catalog >= 0.5  # 中性分 (无 profile) 也允许豁免
             name_only_exempt = (is_combo
                                 or (is_pure_img and not page_has_model_bearing and _cat_ok)
                                 or (pure_visual and not page_has_model_bearing and _cat_ok))
@@ -622,7 +622,7 @@ def score_and_filter(
         # ── B4: 无型号+低conf+无价格 快速过滤 ──
         # conf < 0.35 + 无有效型号 + 无价格 → 直接 invalid
         # 精准命中: 凯跃营销文案(0.27), 万日红低conf配件(0.25-0.30)
-        if s_model == 0.0 and s_price == 0.0 and s_llm < 0.35:
+        if s_model == 0.0 and s_price == 0.0 and s_llm < 0.25:
             removed += 1
             logger.debug("low_conf_no_model_price_filtered",
                          name=name[:60], llm_conf=round(s_llm, 3))
@@ -632,7 +632,7 @@ def score_and_filter(
         # 无型号+无价格+LLM conf<0.50 → 额外 -0.30 惩罚
         # 精准命中: 相约餐饮装饰品(conf 0.4-0.5), 凯跃场景道具(conf 0.35-0.50)
         if (is_pure_img and s_model == 0.0 and s_price == 0.0
-                and s_llm < 0.50 and s_catalog < 0.7):
+                and s_llm < 0.40 and s_catalog == 0.0):
             penalty += -0.30
             logger.debug("pure_img_no_signal_penalty", name=name[:60],
                          llm_conf=round(s_llm, 3), catalog=round(s_catalog, 2))

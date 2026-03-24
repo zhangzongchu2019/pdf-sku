@@ -236,6 +236,16 @@ def scan_datasets(data_root: Path | None = None) -> list[ReferenceDataset]:
             )
             datasets.append(ds)
 
+    # ── 重名检测: 多 PDF 文件夹可能产生同名数据集 ──
+    name_counts: dict[str, int] = {}
+    for ds in datasets:
+        name_counts[ds.name] = name_counts.get(ds.name, 0) + 1
+
+    if any(c > 1 for c in name_counts.values()):
+        for ds in datasets:
+            if name_counts[ds.name] > 1:
+                ds.name = f"{ds.folder.name}/{ds.pdf_path.stem}"
+
     return datasets
 
 
