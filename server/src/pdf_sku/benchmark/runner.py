@@ -326,6 +326,58 @@ class BenchmarkRunner:
                 logger.info("combo_color_dedup_done",
                             before=len(all_skus_flat), after=deduped_total)
 
+        # ═══ 颜色变体展开 (在所有去重之后，dict 层执行确保写入缓存) ═══
+        import re
+        _color_split = re.compile(r'[/、，,；;]\s*')
+        expand_total = 0
+        for page in pages:
+            expanded = []
+            for sku in page.get("skus", []):
+                attrs = sku.get("attributes", {})
+                _m = attrs.get("model_number") or ""
+                _c = attrs.get("color") or ""
+                model = (str(_m) if not isinstance(_m, str) else _m).strip()
+                color = (str(_c) if not isinstance(_c, str) else _c).strip()
+                if not model or not color:
+                    expanded.append(sku)
+                    continue
+                colors = [c.strip() for c in _color_split.split(color) if c.strip()]
+                if len(colors) <= 1:
+                    expanded.append(sku)
+                    continue
+                for c in colors:
+                    new_sku = json.loads(json.dumps(sku))  # deep copy dict
+                    new_sku["attributes"]["color"] = c
+                    expanded.append(new_sku)
+                expand_total += len(colors) - 1
+            page["skus"] = expanded
+            page["sku_count"] = len(expanded)
+        if expand_total:
+            logger.info("color_expand_done", expanded=expand_total,
+                        total_after=sum(len(p.get("skus", [])) for p in pages))
+
+        # ═══ 颜色展开后去重: 同 model+color 组合只保留首次出现 ═══
+        seen_mc: set[str] = set()
+        dedup_color_removed = 0
+        for page in pages:
+            new_skus = []
+            for sku in page.get("skus", []):
+                attrs = sku.get("attributes", {})
+                _m = (str(attrs.get("model_number") or "")).strip().upper()
+                _c = (str(attrs.get("color") or "")).strip()
+                if _m:
+                    key = f"{_m}||{_c}"
+                    if key in seen_mc:
+                        dedup_color_removed += 1
+                        continue
+                    seen_mc.add(key)
+                new_skus.append(sku)
+            page["skus"] = new_skus
+            page["sku_count"] = len(new_skus)
+        if dedup_color_removed:
+            logger.info("dedup_color_expand_done", removed=dedup_color_removed,
+                        total_after=sum(len(p.get("skus", [])) for p in pages))
+
         total_skus = sum(len(p.get("skus", [])) for p in pages)
 
         elapsed = time.time() - t0
@@ -348,6 +400,109 @@ class BenchmarkRunner:
             self._processor.clear_job_cache(job_id)
 
         return output
+
+    async def save_run_to_db(
+        self,
+        results: list,  # list[ComparisonResult]
+        run_results: list[dict],
+        *,
+        run_tag: str,
+        description: str = "",
+        started_at: datetime | None = None,
+    ) -> str:
+        """将 benchmark 结果保存到数据库。返回 run_id。
+
+        Args:
+            results: compare_dataset() 返回的 ComparisonResult 列表
+            run_results: 每个数据集的 pipeline 输出 dict 列表
+            run_tag: 轮次标签，如 "v6", "fix-color-expand"
+            description: 本轮修改说明
+            started_at: 运行开始时间
+        """
+        import subprocess
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+        from pdf_sku.common.models import BenchmarkRun, BenchmarkDatasetResult
+        from pdf_sku.settings import settings
+
+        engine = create_async_engine(settings.database_url, pool_size=2)
+        session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+        # git info
+        git_commit = None
+        git_branch = None
+        try:
+            git_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], text=True, timeout=5
+            ).strip()[:40]
+            git_branch = subprocess.check_output(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True, timeout=5
+            ).strip()[:200]
+        except Exception:
+            pass
+
+        # 汇总指标
+        n = len(results)
+        avg_p = sum(r.precision for r in results) / n if n else None
+        avg_r = sum(r.recall for r in results) / n if n else None
+        avg_f1 = sum(r.f1 for r in results) / n if n else None
+
+        run = BenchmarkRun(
+            run_tag=run_tag,
+            git_commit=git_commit,
+            git_branch=git_branch,
+            description=description or None,
+            total_datasets=n,
+            avg_precision=avg_p,
+            avg_recall=avg_r,
+            avg_f1=avg_f1,
+            config={
+                "page_concurrency": PAGE_CONCURRENCY,
+                "dataset_concurrency": DATASET_CONCURRENCY,
+            },
+            started_at=started_at or datetime.now(),
+            completed_at=datetime.now(),
+        )
+
+        # 构建 run_result 查找表 (dataset_name → dict)
+        rr_map = {rr.get("dataset"): rr for rr in run_results}
+
+        for cr in results:
+            rr = rr_map.get(cr.dataset_name, {})
+            ds_result = BenchmarkDatasetResult(
+                dataset_name=cr.dataset_name,
+                pdf_path=rr.get("pdf"),
+                gt_count=cr.expected_count,
+                pred_count=cr.actual_count,
+                matched_count=cr.matched_count,
+                precision=cr.precision,
+                recall=cr.recall,
+                f1=cr.f1,
+                fn_count=len(cr.missing_skus),
+                fp_count=len(cr.extra_skus),
+                elapsed_seconds=rr.get("elapsed_seconds"),
+                total_pages=rr.get("total_pages"),
+                details={
+                    "fn_names": [
+                        s.product_name or s.model_number or ""
+                        for s in cr.missing_skus[:50]
+                    ],
+                    "fp_names": [
+                        s.get("attributes", {}).get("product_name", "")
+                        or s.get("attributes", {}).get("model_number", "")
+                        for s in cr.extra_skus[:50]
+                    ],
+                },
+            )
+            run.dataset_results.append(ds_result)
+
+        async with session_factory() as session:
+            session.add(run)
+            await session.commit()
+            run_id = str(run.run_id)
+
+        await engine.dispose()
+        logger.info("benchmark_saved_to_db", run_id=run_id, run_tag=run_tag, datasets=n)
+        return run_id
 
     def shutdown(self):
         if self._pool:
