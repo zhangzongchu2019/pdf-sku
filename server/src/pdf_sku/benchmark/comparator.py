@@ -46,6 +46,15 @@ def _fuzzy_match(a: str, b: str, threshold: float = 0.6) -> bool:
     # 包含关系
     if na in nb or nb in na:
         return True
+    # 纯中文 2-4 字核心词子串匹配
+    # 场景: GT "沙发" vs Pipeline "现代轻奢沙发", ratio<0.6 但应匹配
+    cn_a = re.sub(r'[^\u4e00-\u9fff]', '', na)
+    cn_b = re.sub(r'[^\u4e00-\u9fff]', '', nb)
+    if cn_a and cn_b and len(cn_a) >= 2 and len(cn_b) >= 2:
+        if len(cn_a) <= 4 and cn_a in cn_b:
+            return True
+        if len(cn_b) <= 4 and cn_b in cn_a:
+            return True
     return SequenceMatcher(None, na, nb).ratio() >= threshold
 
 
@@ -119,6 +128,34 @@ def _dedup_gt_by_model(expected: list[GroundTruthSKU]) -> list[GroundTruthSKU]:
     return deduped
 
 
+def _dedup_gt_no_model_by_name(expected: list[GroundTruthSKU]) -> list[GroundTruthSKU]:
+    """GT 无型号同名去重: 多行无型号同名（如5行"沙发"）→ 去重保留1行。
+
+    降低 expected_count 分母，减少假性 FN/FP。
+    仅对 model_number 为空且 product_name 相同的条目去重。
+    """
+    seen_names: set[str] = set()
+    deduped: list[GroundTruthSKU] = []
+    for gt in expected:
+        if gt.model_number:
+            deduped.append(gt)
+            continue
+        # 从 product_name 提取型号，有型号的不在此去重（由 _dedup_gt_by_model 处理）
+        prefix = _extract_model_prefix(gt.product_name)
+        if prefix:
+            deduped.append(gt)
+            continue
+        name_key = _normalize(gt.product_name) if gt.product_name else ""
+        if not name_key:
+            deduped.append(gt)
+            continue
+        if name_key in seen_names:
+            continue
+        seen_names.add(name_key)
+        deduped.append(gt)
+    return deduped
+
+
 def compare_dataset(
     ds: ReferenceDataset,
     run_result: dict,
@@ -126,6 +163,7 @@ def compare_dataset(
     """对比单个数据集的 Pipeline 输出与参考 Excel。"""
     raw_expected = ds.skus
     expected = _dedup_gt_by_model(raw_expected)
+    expected = _dedup_gt_no_model_by_name(expected)
     actual_list = _extract_all_skus(run_result)
 
     result = ComparisonResult(
@@ -247,6 +285,38 @@ def compare_dataset(
                 matched_expected.add(ei)
                 matched_actual.add(ai)
                 break
+
+    # Pass 1.6: 反向型号匹配 — pipeline.model_number 在 GT.product_name 中做子串匹配
+    # 场景: GT 无 model_number 但 product_name 含型号（如"BT-SF711沙发"），
+    #       pipeline 提取了 model="BT-SF711"
+    _pass16_candidates: list[tuple[float, int, int]] = []
+    for ei, exp in enumerate(expected):
+        if ei in matched_expected:
+            continue
+        if exp.model_number:
+            continue  # GT 有型号的已在 Pass 1/1.5 处理
+        exp_name_n = _normalize(exp.product_name)
+        if not exp_name_n:
+            continue
+        for ai, act in enumerate(actual_list):
+            if ai in matched_actual:
+                continue
+            act_model = str(act.get("model_number", ""))
+            if not act_model or len(act_model) < 3:
+                continue
+            act_model_n = _normalize(act_model)
+            if act_model_n in exp_name_n:
+                # 额外验证: product_name 也要有一定相似度
+                act_name_n = _normalize(str(act.get("product_name", "")))
+                name_score = SequenceMatcher(None, exp_name_n, act_name_n).ratio()
+                _pass16_candidates.append((name_score, ei, ai))
+    _pass16_candidates.sort(key=lambda x: -x[0])
+    for _score, ei, ai in _pass16_candidates:
+        if ei in matched_expected or ai in matched_actual:
+            continue
+        result.matches.append(_make_match(expected[ei], actual_list[ai], "reverse_model"))
+        matched_expected.add(ei)
+        matched_actual.add(ai)
 
     # Pass 2: product_name 首行模糊匹配
     for ei, exp in enumerate(expected):

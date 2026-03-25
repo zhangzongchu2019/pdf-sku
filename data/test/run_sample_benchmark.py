@@ -5,13 +5,13 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "server" / "src"))
 
 from pdf_sku.benchmark.excel_parser import scan_datasets
 from pdf_sku.benchmark.runner import BenchmarkRunner, archive_cache, clear_cache
 
 SAMPLE_FILE = "/tmp/sample_datasets.json"
-DATASET_CONCURRENCY = 2
+DATASET_CONCURRENCY = 3
 
 
 async def main():

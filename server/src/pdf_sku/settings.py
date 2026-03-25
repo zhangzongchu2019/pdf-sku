@@ -81,6 +81,7 @@ class Settings(BaseSettings):
     # === Paths ===
     tus_upload_dir: str = "/data/tus-uploads"
     job_data_dir: str = "/data/jobs"
+    benchmark_image_dir: str = "/data/benchmark_images"
 
     # === Layout Detection & OCR ===
     layout_detect_enabled: bool = True

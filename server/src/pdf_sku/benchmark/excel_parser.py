@@ -1,6 +1,7 @@
 """解析参考 Excel 文件，自适应 22/27 列格式。"""
 from __future__ import annotations
 
+import os
 import re
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -9,8 +10,10 @@ from openpyxl import load_workbook
 
 from .models import GroundTruthSKU, ReferenceDataset
 
-# 参考数据根目录
-DEFAULT_DATA_ROOT = Path("/home/zzc/Documents/pdf整理")
+# 参考数据根目录: 项目同级的 "pdf整理" 目录
+# 可通过环境变量 PDF_DATA_ROOT 覆盖
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
+DEFAULT_DATA_ROOT = Path(os.environ.get("PDF_DATA_ROOT", str(_PROJECT_ROOT.parent / "pdf整理")))
 
 # 通过表头名称定位列（不依赖固定列号）
 HEADER_MAP = {
@@ -126,6 +129,49 @@ def parse_excel(excel_path: Path) -> list[GroundTruthSKU]:
         ))
 
     return skus
+
+
+def analyze_gt_dup(skus: list[GroundTruthSKU]) -> dict | None:
+    """分析 GT 中是否存在同型号多颜色/规格变体。
+
+    返回 None 表示无显著重复；否则返回 dup_info dict，
+    可直接写入 benchmark_dataset_results.details["gt_dup_info"]。
+    """
+    if len(skus) < 2:
+        return None
+
+    from collections import Counter
+
+    models: list[str] = []
+    for s in skus:
+        raw = (s.product_name or "").strip()
+        if not raw:
+            continue
+        # 取第一行作为 base model（颜色通常在后续行或斜杠后）
+        base = re.split(r"[\r\n]+", raw)[0].strip()
+        base = re.sub(r"[（(].*$", "", base).strip()
+        if base:
+            models.append(base)
+
+    if not models:
+        return None
+
+    counter = Counter(models)
+    total = len(models)
+    unique = len(counter)
+    dup_ratio = total / unique if unique else 0
+
+    if dup_ratio < 1.2 or sum(1 for c in counter.values() if c > 1) < 2:
+        return None
+
+    top_dups = {m: c for m, c in counter.most_common(10) if c > 1}
+    return {
+        "has_color_variants": True,
+        "gt_total": total,
+        "unique_models": unique,
+        "dup_ratio": round(dup_ratio, 2),
+        "top_dups": top_dups,
+    }
 
 
 def _stem_similarity(a: str, b: str) -> float:

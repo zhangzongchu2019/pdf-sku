@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
 
 import structlog
 from fastapi import FastAPI
@@ -128,24 +129,29 @@ def create_llm_service(redis=None):
         else:
             default_client = "openrouter"
 
-    # Fallback 链: 所有 openrouter keys → gemini → qwen
-    fallback_chain = list(openrouter_names)
+    # Fallback 链: 按优先级排序 — openrouter_1 > openrouter > apiyi > gemini > 万界 > qwen
+    _priority_order = ["openrouter_1", "openrouter", "openrouter_apiyi",
+                       "gemini", "openrouter_wanjie", "openrouter_gptproto", "qwen"]
+    _all_names = set(openrouter_names)
     if settings.gemini_api_key:
-        fallback_chain.append("gemini")
+        _all_names.add("gemini")
     if settings.qwen_api_key:
-        fallback_chain.append("qwen")
+        _all_names.add("qwen")
+    fallback_chain = [n for n in _priority_order if n in _all_names]
+    # 追加优先级列表中未列出的 provider
+    for n in openrouter_names:
+        if n not in fallback_chain:
+            fallback_chain.append(n)
 
-    # 加权轮询: OpenRouter×2, Nebula×1, APIYI×1, 万界×1
-    provider_weights: dict[str, int] = {}
-    for name in openrouter_names:
-        if name in ("openrouter", "openrouter_1"):
-            provider_weights[name] = 2
-        elif "nebula" in name:
-            provider_weights[name] = 1
-        elif "apiyi" in name:
-            provider_weights[name] = 1
-        else:
-            provider_weights[name] = 1
+    # 加权轮询: openrouter_1×2, openrouter×2, apiyi×1, gemini×1, 万界×1, qwen×1
+    provider_weights: dict[str, int] = {
+        "openrouter_1": 2,
+        "openrouter": 2,
+        "openrouter_apiyi": 1,
+        "gemini": 1,
+        "openrouter_wanjie": 1,
+        "qwen": 1,
+    }
 
     logger.info("llm_providers_configured",
                 default=default_client,
@@ -472,5 +478,15 @@ def create_app() -> FastAPI:
     app.include_router(config_router)  # already has /api/v1/config prefix
     app.include_router(collab_router)  # already has /api/v1 prefix
     app.include_router(feedback_router)  # already has /api/v1 prefix
+
+    # ─── 静态文件: 产品图片服务 ───
+    from starlette.staticfiles import StaticFiles
+    benchmark_img_dir = Path(settings.benchmark_image_dir)
+    if benchmark_img_dir.exists():
+        app.mount(
+            "/images/benchmark",
+            StaticFiles(directory=str(benchmark_img_dir)),
+            name="benchmark-images",
+        )
 
     return app

@@ -471,6 +471,7 @@ def score_and_filter(
     removed = 0
     is_combo = catalog_profile and catalog_profile.is_combo_catalog
     is_pure_img = catalog_profile and catalog_profile.is_pure_image_catalog
+    is_one_per_page = catalog_profile and catalog_profile.is_one_product_per_page
 
     for sku in skus:
         name = (sku.attributes.get("product_name") or "").strip()
@@ -493,14 +494,15 @@ def score_and_filter(
         # 硬过滤: name_quality=0 表示确定不是产品 (尺寸描述/变体规格/无型号床垫等)
         # 组合图册/纯图目录/纯图页面中通用家具名词（如"床""沙发"）是合法产品名，跳过硬过滤
         generic_exempt = ((is_combo or is_pure_img or pure_visual)
-                          and name.strip().lower() in _GENERIC_FURNITURE_NAMES)
+                          and (name.strip().lower() in _GENERIC_FURNITURE_NAMES
+                               or _is_descriptive_chinese(name)))
         if s_name == 0.0 and not generic_exempt:
             removed += 1
             logger.debug("sku_name_quality_hard_filtered", name=name[:60])
             continue
 
-        # 纯图目录中通用家具名是合法产品名，给予基础分
-        if generic_exempt and s_name == 0.0:
+        # 纯图目录中通用家具名/描述性名称是合法产品名，给予基础分
+        if generic_exempt and s_name < 0.5:
             s_name = 0.5
 
         # 加权求和
@@ -545,6 +547,7 @@ def score_and_filter(
         _color = (attrs.get("color") or "").strip()
         is_name_only = (s_model == 0.0 and s_price == 0.0
                         and not _specs and not _color)
+        name_only_exempt = False
 
         if is_name_only:
             # 豁免: 组合图册 或 (纯图目录 且 同批无 model-bearing SKU)
@@ -553,9 +556,13 @@ def score_and_filter(
             # 收紧: pure_visual/pure_img 豁免要求命中主营品类 (s_catalog >= 0.7),
             #       避免场景道具 (茶几/休闲椅) 在沙发图册中被豁免
             _cat_ok = s_catalog >= 0.5  # 中性分 (无 profile) 也允许豁免
+            # OCR 验证通过 (s_ocr >= 0.5) = 产品名确实在页面文字中，不是幻觉
+            _ocr_verified = s_ocr >= 0.5
             name_only_exempt = (is_combo
                                 or (is_pure_img and not page_has_model_bearing and _cat_ok)
-                                or (pure_visual and not page_has_model_bearing and _cat_ok))
+                                or (pure_visual and _cat_ok)  # pure_visual 放宽
+                                or (_ocr_verified and is_all_english and _cat_ok)  # OCR验证+英文名=真实产品
+                                or (_ocr_verified and pure_visual))  # OCR验证+纯图=真实产品
 
             if not name_only_exempt:
                 raw_score += PENALTY_NAME_ONLY_BASE           # -0.15
@@ -590,11 +597,23 @@ def score_and_filter(
             s_catalog=s_catalog, catalog_profile=catalog_profile,
             page_has_model_bearing=page_has_model_bearing,
         )
+        # pure_visual + name_only_exempt: 已确认是合法产品，跳过道具惩罚
+        # pure_visual 非豁免: 减半道具惩罚
+        if pure_visual and prop_penalty < 0:
+            if is_name_only and name_only_exempt:
+                prop_penalty = 0.0
+            else:
+                prop_penalty = prop_penalty * 0.5
+        # 英文系列前缀 (如 HOLIDAY 沙发, SONMA 沙发): 有区分度，降级惩罚
+        if prop_penalty < 0 and re.search(r'[A-Za-z]{3,}', name):
+            prop_penalty = prop_penalty * 0.5
         penalty += prop_penalty
 
         # ── 品类感知过滤 (AND 策略: 方案A∩B 交集) ──
         # 无价格即触发；有型号但无价格的非主营品类给予较轻惩罚
+        # pure_visual 页面跳过: 纯图密集目录中非主营品类产品也是合法产品
         if (s_price == 0.0
+                and not pure_visual
                 and catalog_profile and catalog_profile.main_categories):
             from pdf_sku.pipeline.catalog_profiler import _SYNONYM_TO_CATEGORY
             name_lower = name.lower()
@@ -638,6 +657,14 @@ def score_and_filter(
                          llm_conf=round(s_llm, 3), catalog=round(s_catalog, 2))
 
         final_score = max(0.0, min(1.0, raw_score + penalty))
+
+        # 每页一产品纯图目录: 几乎不可能有型号/价格/OCR 信号,
+        # 只要 LLM 识别出产品名就应保留, 使用极低阈值
+        if is_one_per_page and pure_visual and final_score < SCORE_THRESHOLD:
+            if name and s_name > 0.0:
+                final_score = max(final_score, SCORE_THRESHOLD)
+                logger.debug("one_product_per_page_rescue",
+                             name=name[:60], score=round(final_score, 3))
 
         if final_score >= SCORE_THRESHOLD:
             # 将综合分数调制回写 confidence

@@ -25,12 +25,13 @@ import structlog
 
 logger = structlog.get_logger()
 
-MAX_RETRIES = 2
+MAX_RETRIES_PER_PROVIDER = 3  # 每个 provider 的重试次数
 EVAL_BATCH_SIZE = 5
 # 全局 LLM 并发上限，防止 API 429。通过环境变量 LLM_MAX_CONCURRENCY 可调。
 LLM_MAX_CONCURRENCY = int(os.environ.get("LLM_MAX_CONCURRENCY", "12"))
 # 连续超时阈值: 连续 N 次超时后自动禁用 provider
-CONSECUTIVE_TIMEOUT_LIMIT = int(os.environ.get("LLM_TIMEOUT_SKIP_THRESHOLD", "10"))
+CONSECUTIVE_ERROR_LIMIT = int(os.environ.get("LLM_ERROR_SKIP_THRESHOLD", "3"))
+PROVIDER_COOLDOWN_SECONDS = int(os.environ.get("LLM_PROVIDER_COOLDOWN", "600"))  # 10 minutes
 
 
 class LLMService:
@@ -65,7 +66,7 @@ class LLMService:
         weights = provider_weights or {}
         pool_entries: list[str] = []
         pool_members = [
-            n for n in self._fallback_chain if n.startswith(default_client_name)
+            n for n in self._fallback_chain if weights.get(n, 0) > 0
         ] or [default_client_name]
         for name in pool_members:
             w = weights.get(name, 1)
@@ -73,9 +74,9 @@ class LLMService:
         self._robin_pool = pool_entries if pool_entries else [default_client_name]
         self._robin_iter = itertools.cycle(self._robin_pool)
 
-        # 连续超时计数器 (per provider)
-        self._consecutive_timeouts: dict[str, int] = {}
-        self._disabled_providers: set[str] = set()
+        # 连续错误计数器 (per provider)
+        self._consecutive_errors: dict[str, int] = {}
+        self._disabled_until: dict[str, float] = {}  # provider → timestamp when re-enabled
 
     @property
     def current_model_name(self) -> str:
@@ -85,21 +86,32 @@ class LLMService:
             return self._default_client
 
     def _is_provider_disabled(self, name: str) -> bool:
-        return name in self._disabled_providers
+        if name not in self._disabled_until:
+            return False
+        import time
+        if time.monotonic() >= self._disabled_until[name]:
+            # 冷却结束，重新启用
+            del self._disabled_until[name]
+            self._consecutive_errors[name] = 0
+            logger.info("provider_auto_reenabled", provider=name)
+            return False
+        return True
 
-    def _record_timeout(self, name: str) -> None:
-        """记录超时，连续达到阈值时自动禁用。"""
-        self._consecutive_timeouts[name] = self._consecutive_timeouts.get(name, 0) + 1
-        count = self._consecutive_timeouts[name]
-        if count >= CONSECUTIVE_TIMEOUT_LIMIT:
-            self._disabled_providers.add(name)
+    def _record_error(self, name: str) -> None:
+        """记录错误，连续达到阈值时自动禁用 5 分钟。"""
+        self._consecutive_errors[name] = self._consecutive_errors.get(name, 0) + 1
+        count = self._consecutive_errors[name]
+        if count >= CONSECUTIVE_ERROR_LIMIT:
+            import time
+            self._disabled_until[name] = time.monotonic() + PROVIDER_COOLDOWN_SECONDS
             logger.warning("provider_auto_disabled",
-                           provider=name, consecutive_timeouts=count)
+                           provider=name, consecutive_errors=count,
+                           cooldown_seconds=PROVIDER_COOLDOWN_SECONDS)
 
     def _record_success(self, name: str) -> None:
-        """成功后重置超时计数。"""
-        if name in self._consecutive_timeouts:
-            self._consecutive_timeouts[name] = 0
+        """成功后重置错误计数。"""
+        if name in self._consecutive_errors:
+            self._consecutive_errors[name] = 0
 
     async def evaluate_document(
         self,
@@ -241,13 +253,21 @@ class LLMService:
             if fb != primary and fb not in providers and not self._is_provider_disabled(fb):
                 providers.append(fb)
 
+        # 总重试次数: provider数量 * 每provider重试次数 - 1
+        # 确保充分利用所有可用 provider
+        max_total_attempts = len(providers) * MAX_RETRIES_PER_PROVIDER - 1
+        total_attempts = 0
         last_error = None
+
         for provider_name in providers:
             client = get_client(provider_name)
             if not client:
                 continue
 
-            for attempt in range(MAX_RETRIES + 1):
+            for attempt in range(MAX_RETRIES_PER_PROVIDER):
+                if total_attempts >= max_total_attempts:
+                    break
+
                 # 1. 熔断检查
                 try:
                     self._circuit.check()
@@ -296,25 +316,24 @@ class LLMService:
                 except Exception as e:
                     self._circuit.record_failure()
                     last_error = e
-                    # 检测超时类异常
-                    is_timeout = _is_timeout_error(e)
-                    if is_timeout:
-                        self._record_timeout(provider_name)
+                    total_attempts += 1
 
-                    if attempt < MAX_RETRIES:
+                    if attempt < MAX_RETRIES_PER_PROVIDER - 1:
                         logger.warning("llm_call_retry",
                                         attempt=attempt + 1, error=repr(e),
                                         operation=operation,
                                         provider=provider_name)
                         continue
-                    # 本 provider 重试耗尽，跳到下一个
+                    # 本 provider 重试耗尽，记录一次连续错误
+                    self._record_error(provider_name)
                     logger.warning("llm_provider_exhausted",
                                     provider=provider_name, error=repr(e),
                                     operation=operation)
                     break
 
         raise RetryableError(
-            f"LLM call failed after trying {len(providers)} providers: {last_error}"
+            f"LLM call failed after {total_attempts} attempts "
+            f"across {len(providers)} providers: {last_error}"
         )
 
     @staticmethod

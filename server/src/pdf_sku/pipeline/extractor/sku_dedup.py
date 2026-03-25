@@ -73,6 +73,17 @@ SCENE_PROPS: set[str] = {
     "床品套件", "四件套",
     # 企业/材料信息
     "涂料", "华润涂料",
+    # 办公场景道具
+    "文件柜", "打印机", "电脑", "笔记本电脑", "显示器",
+    "键盘", "鼠标", "文件架", "笔筒", "计算器",
+    "白板", "投影仪", "电话机",
+    # 餐饮场景道具
+    "餐具套装", "碗碟", "刀叉", "杯子", "水杯", "酒杯",
+    "咖啡杯", "茶杯", "餐盘", "碗", "盘子",
+    "纸巾盒", "牙签盒", "调料瓶", "调料架",
+    # 装饰花纹/材质描述词 (非产品)
+    "纹理", "花纹", "图案", "样板", "样品",
+    "木纹", "石纹", "布纹", "皮纹",
 }
 
 # ── 场景软黑名单 (某些图册是正品，但场景渲染图中多为道具) ──
@@ -233,6 +244,15 @@ def pre_filter(skus: list[SKUResult], *, scene_filter: bool = False) -> list[SKU
         if _is_descriptive_chinese(name):
             removed += 1
             logger.debug("sku_descriptive_cn_filtered", name=name[:60])
+            continue
+
+        # 5b) 色卡/材料描述检测: 名称 ≤6 字 + 无型号无价格 + 名称命中色卡特征词
+        _SWATCH_KEYWORDS = {"色卡", "面料", "材质选择", "color", "fabric", "swatch",
+                            "材质", "皮样", "布样", "色号", "色板"}
+        name_lower_cn = name.lower()
+        if len(name) <= 6 and any(kw in name_lower_cn for kw in _SWATCH_KEYWORDS):
+            removed += 1
+            logger.debug("sku_swatch_filtered", name=name[:60])
             continue
 
         # 6) 类目标题 (以"系列"结尾 且无型号无价格) → 过滤
@@ -809,6 +829,18 @@ def _dedup_cross_page_by_name_similarity(
                 continue
             ratio = SequenceMatcher(None, name_a, name_b).ratio()
             if ratio >= threshold:
+                # 豁免: 颜色不同 → 是不同产品变体，不去重
+                color_a = (sku_a.attributes.get("color") or "").strip().lower()
+                color_b = (sku_b.attributes.get("color") or "").strip().lower()
+                if color_a and color_b and color_a != color_b:
+                    continue
+                # 豁免: 来自不同页面且都是 pure_visual 提取
+                page_a = getattr(sku_a, "page_no", None)
+                page_b = getattr(sku_b, "page_no", None)
+                if (page_a and page_b and page_a != page_b
+                        and getattr(sku_a, "extraction_method", "") in ("pure_visual_rescue", "img_dense_figure_rescue")
+                        and getattr(sku_b, "extraction_method", "") in ("pure_visual_rescue", "img_dense_figure_rescue")):
+                    continue
                 # 保留 confidence 高的
                 if sku_b.confidence > sku_a.confidence:
                     merged.add(idx_a)
@@ -889,12 +921,19 @@ def cross_page_dedup(
     if len(all_skus) <= 1:
         return all_skus
     before = len(all_skus)
+    is_one_per_page = catalog_profile and catalog_profile.is_one_product_per_page
+
     result = dedup_by_model(all_skus)                      # 型号去重
     result = _merge_variant_size(result)                    # 同型号尺寸变体合并
-    result = _merge_no_model_into_model_bearing(result)     # 无型号→有型号合并
-    result = _dedup_cross_page_by_name_similarity(result)   # 名称相似度去重
-    result = _dedup_no_model_safe(result, catalog_profile)  # 高频重名去重
+    if not is_one_per_page:
+        # 纯图每页一产品目录: 不同页面是不同产品，通用名称("休闲椅")
+        # 相似但不代表是同一产品，跳过名称相似度去重和无型号合并
+        result = _merge_no_model_into_model_bearing(result)     # 无型号→有型号合并
+        result = _dedup_cross_page_by_name_similarity(result)   # 名称相似度去重
+        result = _dedup_no_model_safe(result, catalog_profile)  # 高频重名去重
     result = _filter_cross_page_props(result, catalog_profile)  # 跨页道具清理
+    # 注意: expand_color_variants 不在此调用 —— 由 runner 在 dict 层执行，
+    # 确保展开结果能正确写入 pages 缓存 (此处 SKUResult 对象层展开会被 runner 丢弃)
     removed = before - len(result)
     if removed:
         logger.info("cross_page_dedup_done", before=before, after=len(result), removed=removed)
@@ -909,18 +948,21 @@ def _dedup_no_model_safe(
 
     规则（同时满足才去重）:
     - 无 model_number
-    - 同名出现 ≥ 5 次
-    - 或同名 ≥ 3 次 且 名称是品牌名 / 短通用词 (≤3 字)
+    - 同名出现 ≥ 3 次 → 去重
+    - 同名 ≥ 2 次 + 名称 ≤ 4 字 + 无区分属性(color/specs 均空) → 去重
+    - 核心名词相同（strip 颜色/材质修饰词后）≥ 2 次 + 无区分属性 → 去重
 
     保留策略: 每组保留 confidence 最高的 1 个。
-    安全阀: 同名 < 3 次绝不去重。
     """
-    if len(skus) <= 2:
+    if len(skus) <= 1:
         return skus
 
-    # 按名称分组 (仅无型号)
     from collections import defaultdict
-    name_groups: dict[str, list[int]] = defaultdict(list)  # name_lower → [indices]
+    # 精确名称分组 (仅无型号)
+    name_groups: dict[str, list[int]] = defaultdict(list)
+    # 核心名词分组
+    core_groups: dict[str, list[int]] = defaultdict(list)
+
     for i, sku in enumerate(skus):
         model = (sku.attributes.get("model_number") or "").strip()
         if model:
@@ -928,6 +970,9 @@ def _dedup_no_model_safe(
         name = (sku.attributes.get("product_name") or "").strip().lower()
         if name:
             name_groups[name].append(i)
+            core = _strip_to_core(name)
+            if core:
+                core_groups[core].append(i)
 
     # 品牌名集合 (小写)
     brand_lower: set[str] = set()
@@ -935,23 +980,49 @@ def _dedup_no_model_safe(
         brand_lower = {b.lower() for b in catalog_profile.brand_names}
 
     remove_indices: set[int] = set()
+
+    # Pass A: 精确同名去重
     for name, indices in name_groups.items():
         count = len(indices)
-        if count < 3:
-            continue  # 安全阀: < 3 次绝不去重
-
         should_dedup = False
         if count >= 3:
             should_dedup = True
         elif count >= 2:
-            # 品牌名 或 短通用词 (≤4 字)
-            if name in brand_lower or len(name) <= 4:
+            # 短名称(≤4字) + 无区分属性(color/specs 均空) → 去重
+            cn_len = len(re.sub(r'[^\u4e00-\u9fff]', '', name))
+            if cn_len <= 4:
+                all_no_distinction = all(
+                    not (skus[i].attributes.get("color") or "").strip()
+                    and not (skus[i].attributes.get("specs") or "").strip()
+                    for i in indices
+                )
+                if all_no_distinction:
+                    should_dedup = True
+            # 品牌名 → 去重
+            if name in brand_lower:
                 should_dedup = True
 
         if should_dedup:
-            # 保留 confidence 最高的 1 个
             best_idx = max(indices, key=lambda i: skus[i].confidence)
             for idx in indices:
+                if idx != best_idx:
+                    remove_indices.add(idx)
+
+    # Pass B: 核心名词去重 (strip 颜色/材质修饰词后同名)
+    for core, indices in core_groups.items():
+        # 去掉已在 Pass A 中移除的
+        live = [i for i in indices if i not in remove_indices]
+        if len(live) < 2:
+            continue
+        # 仅对无区分属性的去重
+        no_distinction = [
+            i for i in live
+            if not (skus[i].attributes.get("color") or "").strip()
+            and not (skus[i].attributes.get("specs") or "").strip()
+        ]
+        if len(no_distinction) >= 2:
+            best_idx = max(no_distinction, key=lambda i: skus[i].confidence)
+            for idx in no_distinction:
                 if idx != best_idx:
                     remove_indices.add(idx)
 

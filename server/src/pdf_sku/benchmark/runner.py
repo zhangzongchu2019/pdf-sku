@@ -26,9 +26,13 @@ from .models import ReferenceDataset
 
 logger = structlog.get_logger()
 
-CACHE_DIR = Path("/home/zzc/pdf-sku/server/data/benchmark_cache")
-HISTORY_DIR = Path("/home/zzc/pdf-sku/server/data/benchmark_history")
-IMAGE_DIR = Path("/home/zzc/pdf-sku/server/data/benchmark_images")
+# 数据目录: 相对于 server/ 目录
+_SERVER_DIR = Path(__file__).resolve().parent.parent.parent.parent
+CACHE_DIR = _SERVER_DIR / "data" / "benchmark_cache"
+HISTORY_DIR = _SERVER_DIR / "data" / "benchmark_history"
+def _get_image_dir() -> Path:
+    from pdf_sku.settings import settings
+    return Path(settings.benchmark_image_dir)
 # 页面并发数，与 Orchestrator 保持一致
 # 总 LLM 并发上限 = DATASET_CONCURRENCY × PAGE_CONCURRENCY
 # 建议保持 ≤ 20 避免 API 超时
@@ -115,26 +119,83 @@ def _page_result_to_dict(pr: PageResult, page_no: int) -> dict[str, Any]:
 
 def _save_page_images(
     result: PageResult, page_no: int, image_dir: Path,
-) -> dict[str, str]:
-    """保存页面图片，返回 sku_id → 图片文件名映射。"""
+) -> dict[str, list[str]]:
+    """保存页面图片，返回 sku_id → 图片文件名列表映射。
+
+    包括：
+    - 通过 binding 关联到 SKU 的图片
+    - search_eligible 的 composite 合成图（瓦片拼合后的完整产品图）
+    """
     img_map = {img.image_id: img for img in result.images if img.data}
-    if not img_map or not result.bindings:
+    if not img_map:
         return {}
 
-    sku_image: dict[str, str] = {}
-    for binding in result.bindings:
-        if binding.is_ambiguous or not binding.image_id:
-            continue
-        img = img_map.get(binding.image_id)
-        if not img or not img.data:
-            continue
-        fname = f"p{page_no}_{binding.image_id}.jpg"
-        fpath = image_dir / fname
-        if not fpath.exists():
-            fpath.write_bytes(img.data)
-        sku_image[binding.sku_id] = fname
+    # 保存所有有数据的 search_eligible 图片到磁盘
+    saved_files: dict[str, str] = {}  # image_id → filename
+    for img in result.images:
+        if img.data and img.search_eligible:
+            # image_id 可能已包含页码前缀 (如 p1_img0)，避免重复
+            img_id = img.image_id or f"p{page_no}_img"
+            fname = f"{img_id}.jpg" if img_id.startswith("p") else f"p{page_no}_{img_id}.jpg"
+            fpath = image_dir / fname
+            if not fpath.exists():
+                fpath.write_bytes(img.data)
+            saved_files[img.image_id] = fname
 
-    return sku_image
+    # 建立 sku_id → 文件名列表 映射
+    sku_images: dict[str, list[str]] = {}
+    if result.bindings:
+        for binding in result.bindings:
+            if binding.is_ambiguous or not binding.image_id:
+                continue
+            fname = saved_files.get(binding.image_id)
+            if fname:
+                sku_images.setdefault(binding.sku_id, []).append(fname)
+
+    return sku_images
+
+
+def _consolidate_images_after_dedup(
+    all_skus_flat: list[tuple[int, int, dict]],
+    sku_results: list[SKUResult],
+    kept_ids: set[int],
+) -> None:
+    """将被去重删除的 SKU 的 image_paths 合并到存活 SKU 中。"""
+    # 建立存活 SKU 索引: model → dict, name → dict
+    survivors_by_model: dict[str, dict] = {}
+    survivors_by_name: dict[str, dict] = {}
+    for (_, _, sku_dict), sr in zip(all_skus_flat, sku_results):
+        if id(sr) in kept_ids:
+            model = (sr.attributes.get("model_number") or "").strip().upper()
+            name = (sr.attributes.get("product_name") or "").strip()
+            if model:
+                survivors_by_model[model] = sku_dict
+            if name:
+                survivors_by_name[name] = sku_dict
+
+    # 转移被删除 SKU 的图片
+    transferred = 0
+    for (_, _, sku_dict), sr in zip(all_skus_flat, sku_results):
+        if id(sr) in kept_ids:
+            continue
+        removed_images = sku_dict.get("image_paths", [])
+        if not removed_images:
+            continue
+        model = (sr.attributes.get("model_number") or "").strip().upper()
+        name = (sr.attributes.get("product_name") or "").strip()
+        target = survivors_by_model.get(model) if model else None
+        if not target:
+            target = survivors_by_name.get(name)
+        if target:
+            existing = target.get("image_paths", [])
+            for img in removed_images:
+                if img not in existing:
+                    existing.append(img)
+                    transferred += 1
+            target["image_paths"] = existing
+
+    if transferred:
+        logger.info("images_consolidated_after_dedup", transferred=transferred)
 
 
 class BenchmarkRunner:
@@ -209,9 +270,9 @@ class BenchmarkRunner:
         # 图册级预扫描
         catalog_profile = scan_catalog(pdf_path)
 
-        # 图片输出目录
+        # 图片输出目录（独立于工程源代码）
         safe_name = ds.name.replace("/", "_").replace(" ", "_")
-        image_dir = IMAGE_DIR / safe_name
+        image_dir = _get_image_dir() / safe_name
         image_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info("run_start", dataset=ds.name, pages=total_pages,
@@ -232,15 +293,19 @@ class BenchmarkRunner:
                         file_hash=fhash,
                         catalog_profile=catalog_profile,
                     )
-                    # 保存图片并建立 sku_id → image_path 映射
+                    # 保存图片并建立 sku_id → image_paths 映射
                     sku_image_map = _save_page_images(result, page_no, image_dir)
 
                     page_dict = _page_result_to_dict(result, page_no)
 
-                    # 将图片路径写入 SKU
+                    # 将图片相对 URL 写入 SKU
                     for sku_dict in page_dict["skus"]:
                         sid = sku_dict.get("sku_id", "")
-                        sku_dict["image_path"] = sku_image_map.get(sid, "")
+                        raw_paths = sku_image_map.get(sid, [])
+                        sku_dict["image_paths"] = [
+                            f"/images/benchmark/{safe_name}/{fname}"
+                            for fname in raw_paths
+                        ]
 
                     results[page_no] = page_dict
                     logger.info(
@@ -290,6 +355,10 @@ class BenchmarkRunner:
             deduped = dedup_material_variants(deduped)
             # 找出保留的 SKU (通过 id 匹配)
             kept_ids = {id(s) for s in deduped}
+
+            # 合并被去重 SKU 的图片到存活 SKU
+            _consolidate_images_after_dedup(all_skus_flat, sku_results, kept_ids)
+
             # 重建 pages 中的 skus
             remove_set: set[tuple[int, int]] = set()
             for (pi, si, _), sr in zip(all_skus_flat, sku_results):
@@ -303,27 +372,30 @@ class BenchmarkRunner:
                     ]
                     page["sku_count"] = len(page["skus"])
 
-        # ═══ 组合图册: 颜色感知去重 (同型号+同颜色才合并) ═══
+        # ═══ 组合图册: 按型号去重 (同型号不同颜色=同一产品) ═══
         if is_combo and len(all_skus_flat) > 1:
-            seen: set[str] = set()
-            remove_set: set[tuple[int, int]] = set()
+            seen: dict[str, dict] = {}  # model → first occurrence sku_dict
             for pi, page in enumerate(pages):
                 new_skus = []
                 for si, sku in enumerate(page.get("skus", [])):
                     attrs = sku.get("attributes", {})
                     model = (attrs.get("model_number") or "").strip().upper()
-                    color = (attrs.get("color") or "").strip()
-                    key = f"{model}||{color}" if model else ""
+                    key = model if model else ""
                     if key and key in seen:
+                        # 转移图片到存活 SKU
+                        survivor = seen[key]
+                        for img in sku.get("image_paths", []):
+                            if img not in survivor.get("image_paths", []):
+                                survivor.setdefault("image_paths", []).append(img)
                         continue
                     if key:
-                        seen.add(key)
+                        seen[key] = sku
                     new_skus.append(sku)
                 page["skus"] = new_skus
                 page["sku_count"] = len(new_skus)
             deduped_total = sum(len(p.get("skus", [])) for p in pages)
             if deduped_total < len(all_skus_flat):
-                logger.info("combo_color_dedup_done",
+                logger.info("combo_model_dedup_done",
                             before=len(all_skus_flat), after=deduped_total)
 
         total_skus = sum(len(p.get("skus", [])) for p in pages)
@@ -348,6 +420,109 @@ class BenchmarkRunner:
             self._processor.clear_job_cache(job_id)
 
         return output
+
+    async def save_run_to_db(
+        self,
+        results: list,  # list[ComparisonResult]
+        run_results: list[dict],
+        *,
+        run_tag: str,
+        description: str = "",
+        started_at: datetime | None = None,
+    ) -> str:
+        """将 benchmark 结果保存到数据库。返回 run_id。
+
+        Args:
+            results: compare_dataset() 返回的 ComparisonResult 列表
+            run_results: 每个数据集的 pipeline 输出 dict 列表
+            run_tag: 轮次标签，如 "v6", "fix-color-expand"
+            description: 本轮修改说明
+            started_at: 运行开始时间
+        """
+        import subprocess
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+        from pdf_sku.common.models import BenchmarkRun, BenchmarkDatasetResult
+        from pdf_sku.settings import settings
+
+        engine = create_async_engine(settings.database_url, pool_size=2)
+        session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+        # git info
+        git_commit = None
+        git_branch = None
+        try:
+            git_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], text=True, timeout=5
+            ).strip()[:40]
+            git_branch = subprocess.check_output(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True, timeout=5
+            ).strip()[:200]
+        except Exception:
+            pass
+
+        # 汇总指标
+        n = len(results)
+        avg_p = sum(r.precision for r in results) / n if n else None
+        avg_r = sum(r.recall for r in results) / n if n else None
+        avg_f1 = sum(r.f1 for r in results) / n if n else None
+
+        run = BenchmarkRun(
+            run_tag=run_tag,
+            git_commit=git_commit,
+            git_branch=git_branch,
+            description=description or None,
+            total_datasets=n,
+            avg_precision=avg_p,
+            avg_recall=avg_r,
+            avg_f1=avg_f1,
+            config={
+                "page_concurrency": PAGE_CONCURRENCY,
+                "dataset_concurrency": DATASET_CONCURRENCY,
+            },
+            started_at=started_at or datetime.now(),
+            completed_at=datetime.now(),
+        )
+
+        # 构建 run_result 查找表 (dataset_name → dict)
+        rr_map = {rr.get("dataset"): rr for rr in run_results}
+
+        for cr in results:
+            rr = rr_map.get(cr.dataset_name, {})
+            ds_result = BenchmarkDatasetResult(
+                dataset_name=cr.dataset_name,
+                pdf_path=rr.get("pdf"),
+                gt_count=cr.expected_count,
+                pred_count=cr.actual_count,
+                matched_count=cr.matched_count,
+                precision=cr.precision,
+                recall=cr.recall,
+                f1=cr.f1,
+                fn_count=len(cr.missing_skus),
+                fp_count=len(cr.extra_skus),
+                elapsed_seconds=rr.get("elapsed_seconds"),
+                total_pages=rr.get("total_pages"),
+                details={
+                    "fn_names": [
+                        s.product_name or s.model_number or ""
+                        for s in cr.missing_skus[:50]
+                    ],
+                    "fp_names": [
+                        s.get("attributes", {}).get("product_name", "")
+                        or s.get("attributes", {}).get("model_number", "")
+                        for s in cr.extra_skus[:50]
+                    ],
+                },
+            )
+            run.dataset_results.append(ds_result)
+
+        async with session_factory() as session:
+            session.add(run)
+            await session.commit()
+            run_id = str(run.run_id)
+
+        await engine.dispose()
+        logger.info("benchmark_saved_to_db", run_id=run_id, run_tag=run_tag, datasets=n)
+        return run_id
 
     def shutdown(self):
         if self._pool:

@@ -37,10 +37,10 @@ from pdf_sku.pipeline.layout_detector import (
 from pdf_sku.pipeline.classifier.page_classifier import PageClassifier
 from pdf_sku.pipeline.classifier.fitz_classifier import (
     FitzClassifier, FitzPageMeta, PagePlan, extract_fitz_meta,
-    BLANK, TABLE, SINGLE_LARGE, SINGLE_TALL, IMG_DENSE,
+    BLANK, TABLE, SINGLE_STD, SINGLE_LARGE, SINGLE_TALL, IMG_DENSE,
     IMG_LABEL, MIXED_TABLE, MULTI_SPARSE, MIXED_OTHER,
 )
-from pdf_sku.pipeline.slicer.page_slicer import plan_slices, render_slice
+from pdf_sku.pipeline.slicer.page_slicer import plan_slices, render_slice, TALL_OVERLAP
 from pdf_sku.pipeline.extractor.single_stage import SingleStageExtractor
 from pdf_sku.pipeline.extractor.ocr_guided import OcrGuidedExtractor
 from pdf_sku.pipeline.extractor.consistency_validator import ConsistencyValidator
@@ -305,6 +305,15 @@ class PageProcessor:
             # 纯图产品目录：禁用场景过滤（产品无文字标注是正常的）
             if catalog_profile and catalog_profile.is_pure_image_catalog:
                 plan.scene_filter = False
+            # 每页一产品目录：即使图片覆盖率低 (白底产品图)，
+            # 也标记 pure_visual，确保评分和 rescue 逻辑生效
+            if (catalog_profile and catalog_profile.is_one_product_per_page
+                    and not plan.pure_visual
+                    and fitz_meta.text_len <= 30
+                    and plan.page_class in (MULTI_SPARSE, SINGLE_STD,
+                                            SINGLE_LARGE, SINGLE_TALL)):
+                plan.pure_visual = True
+                plan.scene_filter = False
             logger.info("fitz_classify", page=page_no,
                         page_class=plan.page_class,
                         legacy=plan.legacy_type,
@@ -454,8 +463,29 @@ class PageProcessor:
                     fitz_page_class=plan.page_class,
                     classification_confidence=0.90)
 
+            skip_extraction = False
+
+            # ═══ Phase 5.9: 纯图每页一产品快速路径 ═══
+            # 纯图目录 + 无文字页: 跳过复杂提取流程，用轻量 prompt 直接识别产品
+            if (catalog_profile
+                    and catalog_profile.is_one_product_per_page
+                    and plan.pure_visual
+                    and screenshot
+                    and fitz_meta.text_len <= 30):
+                identify_skus = await self._single_stage.extract_pure_visual(
+                    screenshot=screenshot)
+                if identify_skus:
+                    skus = identify_skus
+                    extraction_method = "pure_visual_identify"
+                    logger.info("pure_visual_identify_done",
+                                page=page_no, found=len(skus),
+                                names=[s.attributes.get("product_name", "")[:20]
+                                       for s in skus])
+                    # 跳过后续提取/rescue/companion 流程，直接进入去重和导出
+                    skip_extraction = True
+
             # ═══ Phase 6: SKU 提取 (策略路由) ═══
-            if plan.slices and screenshots:
+            if plan.slices and screenshots and not skip_extraction:
                 # 切片模式: 每片独立送 LLM，合并去重
                 _ocr_text_for_sliced = OcrEngine.blocks_to_text(ocr_blocks) if ocr_blocks else ""
                 skus = await self._extract_sliced(raw, plan, screenshots,
@@ -474,6 +504,57 @@ class PageProcessor:
                         page_class=plan.page_class)
                     extraction_method = "sliced_vision_fallback"
 
+                # 低产出密度检测: 提取数远低于预期 → 加密切片二次提取
+                _expect_lo = plan.expected_sku_range[0] if plan.expected_sku_range else 0
+                if (skus and _expect_lo >= 8
+                        and len(skus) < _expect_lo * 0.3
+                        and plan.page_class == IMG_DENSE
+                        and plan.pure_visual
+                        and screenshot):
+                    logger.info("low_density_retry", page=page_no,
+                                found=len(skus), expected_lo=_expect_lo,
+                                old_slices=len(plan.slices))
+                    # 加密: 切片数翻倍，最多 24
+                    _pw = fitz_meta.page_width
+                    _ph = fitz_meta.page_height
+                    _n_retry = min(len(plan.slices) * 2, 24)
+                    _row_h = _ph / _n_retry
+                    _retry_bboxes = []
+                    for _i in range(_n_retry):
+                        _y0 = max(0, _i * _row_h - TALL_OVERLAP) if _i > 0 else 0
+                        _y1 = min(_ph, (_i + 1) * _row_h + TALL_OVERLAP) if _i < _n_retry - 1 else _ph
+                        _retry_bboxes.append((0, _y0, _pw, _y1))
+                    # 渲染 + 提取
+                    _retry_imgs = await asyncio.gather(*[
+                        loop.run_in_executor(None, render_slice, file_path, page_no, bbox, 250)
+                        for bbox in _retry_bboxes
+                    ], return_exceptions=True)
+                    _retry_skus: list[SKUResult] = []
+                    _retry_tasks = []
+                    for _ri, _rimg in enumerate(_retry_imgs):
+                        if isinstance(_rimg, Exception) or not _rimg:
+                            continue
+                        _hint = (f"区域{_ri+1}/{_n_retry}。"
+                                 f"逐一提取每个产品，不同颜色/尺寸各算独立SKU。")
+                        _retry_tasks.append(self._single_stage.extract(
+                            raw, screenshot=_rimg,
+                            sku_count_hint=(1, max(3, _expect_lo // _n_retry + 1)),
+                            region_hint=_hint,
+                            scene_filter=False,
+                            page_class=plan.page_class))
+                    if _retry_tasks:
+                        _retry_results = await asyncio.gather(*_retry_tasks, return_exceptions=True)
+                        for _rr in _retry_results:
+                            if isinstance(_rr, list) and _rr:
+                                _retry_skus.extend(_rr)
+                    if len(_retry_skus) > len(skus):
+                        _retry_skus = dedup_by_model(_retry_skus)
+                        _retry_skus = dedup_by_similarity(_retry_skus, threshold=0.90)
+                        logger.info("low_density_retry_done", page=page_no,
+                                    old=len(skus), new=len(_retry_skus))
+                        skus = _retry_skus
+                        extraction_method = "low_density_retry"
+
                 # 切片 + 整页均零结果，OCR 有内容 → OCR-guided 回退
                 if not skus and ocr_text_len > 30:
                     logger.info("slice_ocr_fallback", page=page_no,
@@ -485,7 +566,7 @@ class PageProcessor:
                         scene_filter=plan.scene_filter, plan=plan)
                     if skus:
                         extraction_method = "ocr_guided"
-            else:
+            elif not skip_extraction:
                 # 整页模式: 原有三路策略
                 skus = await self._extract_skus(
                     raw, page_type, screenshot, features,
@@ -497,7 +578,8 @@ class PageProcessor:
 
             # ═══ Phase 6.3: 低提取二次 Pass (rescue) ═══
             effective_screenshot = screenshot or (screenshots[0] if screenshots else b"")
-            if (len(skus) <= 1
+            if (not skip_extraction
+                    and len(skus) <= 1
                     and page_type in ("A", "B", "C")
                     and effective_screenshot):
                 retry_screenshot = effective_screenshot
@@ -728,6 +810,18 @@ class PageProcessor:
                 if not is_image_catalog:
                     skus = dedup_by_similarity(skus)
 
+                # 每页一产品目录 (多视图): MULTI_SPARSE 页面上多个
+                # 提取结果实际是同一产品的不同角度照片，合并为 1 个 SKU
+                if (catalog_profile
+                        and catalog_profile.is_one_product_per_page
+                        and plan.page_class == MULTI_SPARSE
+                        and len(skus) > 1):
+                    best = max(skus, key=lambda s: s.confidence)
+                    logger.info("multi_view_merge",
+                                page=page_no, before=len(skus),
+                                kept=best.attributes.get("product_name", "")[:40])
+                    skus = [best]
+
                 if len(skus) < before:
                     logger.info("dedup_chain_applied",
                                 page=page_no, before=before, after=len(skus))
@@ -752,7 +846,8 @@ class PageProcessor:
 
             # ═══ Phase 6.55: Companion Rescue (配套产品补提取) ═══
             # Companion SKU 经过 scorer 过滤后再加入
-            if (1 <= len(skus) <= 2
+            if (not skip_extraction
+                    and 1 <= len(skus) <= 2
                     and plan.page_class in (SINGLE_LARGE, SINGLE_TALL, IMG_LABEL,
                                             "MULTI_SPARSE", IMG_DENSE)
                     and effective_screenshot):
@@ -864,6 +959,34 @@ class PageProcessor:
                     logger.warning("pure_visual_rescue_failed",
                                    page=page_no, error=str(e))
 
+            # ═══ Phase 6.586: 纯图页面产品识别兜底 ═══
+            # 纯图目录中 single_stage 返回空 → 用轻量 prompt 只识别产品名
+            if (not skus
+                    and catalog_profile
+                    and catalog_profile.is_one_product_per_page
+                    and plan.pure_visual
+                    and effective_screenshot
+                    and fitz_meta.image_count >= 1):
+                try:
+                    identify_skus = await self._single_stage.extract_pure_visual(
+                        screenshot=screenshot)
+                    if identify_skus:
+                        skus = identify_skus
+                        extraction_method = "pure_visual_identify"
+                        skip_extraction = True
+                        logger.info("pure_visual_identify_done",
+                                    page=page_no, found=len(skus),
+                                    names=[s.attributes.get("product_name", "")[:20]
+                                           for s in skus])
+                    else:
+                        logger.warning("pure_visual_identify_empty",
+                                       page=page_no)
+                        fallback_reason = "pure_visual_api_no_result"
+                except Exception as e:
+                    logger.warning("pure_visual_identify_failed",
+                                   page=page_no, error=str(e))
+                    fallback_reason = f"pure_visual_api_error: {e}"
+
             # ═══ Phase 6.59: IMG_DENSE figure rescue ═══
             # IMG_DENSE 零 SKU + YOLO 检测到 figure → 按区域裁剪让 LLM 识别产品
             # 单 figure 覆盖整页时，用整页截图 + 强制枚举 hint
@@ -948,7 +1071,8 @@ class PageProcessor:
                 before_review = len(skus)
                 skus = await self._reviewer.review(
                     skus, screenshot=review_screenshot,
-                    scene_filter=plan.scene_filter)
+                    scene_filter=plan.scene_filter,
+                    pure_visual=plan.pure_visual)
                 if len(skus) < before_review:
                     logger.info("reviewer_applied",
                                 page=page_no, before=before_review, after=len(skus))
@@ -1083,9 +1207,9 @@ class PageProcessor:
             elif isinstance(r, list):
                 if r:
                     all_skus.extend(r)
-                elif slice_lo >= 2 and len(plan.slices) <= 6:
-                    # 预期每片有 ≥2 SKU 但返回 0 → 重试
-                    # 切片数 >6 时每片可能正常无 SKU，不标记重试
+                elif plan.page_class in (IMG_DENSE, IMG_LABEL) or (slice_lo >= 2 and len(plan.slices) <= 6):
+                    # IMG_DENSE/IMG_LABEL: 零结果切片始终重试（纯图页不应有空片）
+                    # 其他页面: 预期每片有 ≥2 SKU 但返回 0 → 重试
                     retry_indices.append(idx)
 
         # 重试零 SKU 切片（每页产品密度高时，空切片通常是 LLM 遗漏）
@@ -1097,7 +1221,9 @@ class PageProcessor:
                 if not ss:
                     continue
                 hint = (f"这是页面的第{idx+1}/{len(plan.slices)}个区域。"
-                        f"请仔细查看，列出所有可见的产品/SKU。")
+                        f"请先数一数这个区域有几个不同的产品图片，然后逐一提取。"
+                        f"即使没有文字标注，每个产品图片也要提取一条记录。"
+                        f"product_name 用简短中文描述(如'餐椅'、'沙发')即可。")
                 retry_range = (1, slice_hi)  # 降低下限，放宽预期
                 retry_tasks.append(self._single_stage.extract(
                     raw, screenshot=ss,
@@ -1131,8 +1257,11 @@ class PageProcessor:
                                           pure_visual=plan.pure_visual)
             all_skus = split_compound_models(all_skus)
             all_skus = dedup_by_model(all_skus)
-            # 密集产品页面用宽松阈值 similarity 去重 (仅合并几乎相同的名称)
-            if plan.page_class in (IMG_DENSE, IMG_LABEL, SINGLE_TALL):
+            # 密集产品页面: IMG_DENSE pure_visual 只按型号去重，跳过名称去重
+            # (同类不同产品名称一样是正常的，如"餐椅"x20)
+            if plan.page_class == IMG_DENSE and plan.pure_visual:
+                pass  # 已做 dedup_by_model，跳过 similarity 去重
+            elif plan.page_class in (IMG_DENSE, IMG_LABEL, SINGLE_TALL):
                 all_skus = dedup_by_similarity(all_skus, threshold=0.90)
             else:
                 all_skus = dedup_by_similarity(all_skus, threshold=0.98)

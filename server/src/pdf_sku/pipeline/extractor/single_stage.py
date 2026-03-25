@@ -161,6 +161,19 @@ class SingleStageExtractor:
             if scene_filter:
                 prompt += SCENE_FILTER_TEXT
 
+            if page_class == "IMG_DENSE":
+                prompt += ("\n\n## 密集产品图片页（重要）\n"
+                           "这是一个密集产品图片页面，包含多个产品图片排列成网格或密集布局。\n"
+                           "关键要求:\n"
+                           "- 每一个独立的产品图片/照片都是一个独立SKU，即使外观相似\n"
+                           "- 不同颜色、不同材质、不同尺寸的版本各自算独立SKU\n"
+                           "- 即使产品图片旁边没有任何文字标注，也必须提取\n"
+                           "- product_name 用简短中文描述即可(如\"餐椅\"、\"沙发\"、\"茶几\")\n"
+                           "- 如果能看到颜色差异，在product_name或color中注明(如\"灰色餐椅\"、\"白色餐椅\")\n"
+                           "- 先数一数这个区域有几个不同的产品图片，然后逐一提取，确保数量一致\n"
+                           "- 重要：同一款产品如果有多种颜色（如灰色、白色、黑色），每种颜色都是独立SKU，必须分别提取\n"
+                           "- 重要：同一款产品的不同尺寸（如单人位、双人位、三人位），每个尺寸也是独立SKU\n")
+
             if page_class == "IMG_LABEL":
                 prompt += ("\n\n## 产品标签页提取（重要）\n"
                            "这是产品展示页，每页通常有 1-2 个主产品。\n"
@@ -206,6 +219,68 @@ class SingleStageExtractor:
             logger.warning("single_stage_failed", error=str(e))
 
         return self._rule_extract(raw)
+
+    async def extract_pure_visual(
+        self,
+        screenshot: bytes | None = None,
+    ) -> list[SKUResult]:
+        """纯图页面产品识别: 只看图片判断展示了什么产品。
+
+        用于纯图目录中 single_stage 返回空的页面。
+        轻量 prompt, 只要求返回产品名和颜色, 不要求型号/价格等。
+        同一产品的多视角图片应合并为一个 SKU。
+        """
+        if not self._llm or not screenshot:
+            return []
+
+        prompt = (
+            "这张图片来自一本产品图册。请识别图中展示的产品。\n\n"
+            "规则:\n"
+            "- 如果多张图片是同一个产品的不同角度/视角，只算一个产品\n"
+            "- 如果是不同产品，分别列出\n"
+            "- product_name: 用简短中文描述（如\"休闲椅\"、\"沙发\"、\"茶几\"）\n"
+            "- color: 产品的主要颜色\n"
+            "- 不需要型号和价格，留空即可\n\n"
+            "仅返回 JSON 数组:\n"
+            '[{"product_name": "...", "color": "...", "confidence": 0.6}]'
+        )
+
+        try:
+            resp = await self._llm._call_llm(
+                operation="extract_pure_visual",
+                prompt=prompt,
+                images=[screenshot],
+            )
+
+            if not resp.text or not resp.text.strip():
+                logger.info("pure_visual_identify_empty_response")
+                return []
+
+            logger.debug("pure_visual_identify_raw",
+                         text=resp.text[:200])
+
+            parsed = _parser.parse(resp.text, expected_type="array")
+            if parsed.success and isinstance(parsed.data, list):
+                results = []
+                for item in parsed.data:
+                    if isinstance(item, dict):
+                        attrs = _sanitize_attrs(item)
+                        if (attrs.get("product_name") or "").strip():
+                            results.append(SKUResult(
+                                attributes=attrs,
+                                validity="valid",
+                                confidence=float(item.get("confidence", 0.5)),
+                                extraction_method="pure_visual_identify",
+                            ))
+                logger.info("pure_visual_identify_parsed",
+                            total=len(parsed.data), valid=len(results))
+                return results
+            else:
+                logger.warning("pure_visual_identify_parse_failed",
+                               text=resp.text[:200])
+        except Exception as e:
+            logger.warning("pure_visual_identify_failed", error=str(e))
+        return []
 
     async def extract_rescue(
         self,

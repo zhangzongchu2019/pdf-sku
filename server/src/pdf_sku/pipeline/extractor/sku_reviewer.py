@@ -61,6 +61,7 @@ class SKUReviewer:
         skus: list[SKUResult],
         screenshot: bytes | None = None,
         scene_filter: bool = False,
+        pure_visual: bool = False,
     ) -> list[SKUResult]:
         """审核 SKU 列表，过滤幻觉并修正字段。"""
         if not skus or not self._llm or not screenshot:
@@ -80,6 +81,12 @@ class SKUReviewer:
 
         try:
             prompt = REVIEW_PROMPT.format(sku_json=json.dumps(sku_data, ensure_ascii=False, indent=2))
+            if pure_visual:
+                prompt += ("\n\n重要提示: 此页面是纯图片产品目录页（几乎没有文字标注）。"
+                           "在这种页面中，LLM 根据图片视觉特征推断的产品名称（如\"餐椅\"、\"沙发\"、\"茶几\"）"
+                           "是合法的产品名称，不应被视为'图片内容描述'而丢弃。"
+                           "仅当商品明显是场景装饰物（如花瓶、窗帘、墙画）且不是家具产品时才丢弃。"
+                           "请宽松保留，减少误丢。")
             if scene_filter:
                 prompt += ("\n注意: 此页面为场景展示页。"
                            "没有文字标注（名称/型号/价格）的物品应判定为 discard。"
