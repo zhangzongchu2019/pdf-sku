@@ -25,7 +25,7 @@ import structlog
 
 logger = structlog.get_logger()
 
-MAX_RETRIES = 2
+MAX_RETRIES_PER_PROVIDER = 3  # 每个 provider 的重试次数
 EVAL_BATCH_SIZE = 5
 # 全局 LLM 并发上限，防止 API 429。通过环境变量 LLM_MAX_CONCURRENCY 可调。
 LLM_MAX_CONCURRENCY = int(os.environ.get("LLM_MAX_CONCURRENCY", "12"))
@@ -253,13 +253,21 @@ class LLMService:
             if fb != primary and fb not in providers and not self._is_provider_disabled(fb):
                 providers.append(fb)
 
+        # 总重试次数: provider数量 * 每provider重试次数 - 1
+        # 确保充分利用所有可用 provider
+        max_total_attempts = len(providers) * MAX_RETRIES_PER_PROVIDER - 1
+        total_attempts = 0
         last_error = None
+
         for provider_name in providers:
             client = get_client(provider_name)
             if not client:
                 continue
 
-            for attempt in range(MAX_RETRIES + 1):
+            for attempt in range(MAX_RETRIES_PER_PROVIDER):
+                if total_attempts >= max_total_attempts:
+                    break
+
                 # 1. 熔断检查
                 try:
                     self._circuit.check()
@@ -308,8 +316,9 @@ class LLMService:
                 except Exception as e:
                     self._circuit.record_failure()
                     last_error = e
+                    total_attempts += 1
 
-                    if attempt < MAX_RETRIES:
+                    if attempt < MAX_RETRIES_PER_PROVIDER - 1:
                         logger.warning("llm_call_retry",
                                         attempt=attempt + 1, error=repr(e),
                                         operation=operation,
@@ -323,7 +332,8 @@ class LLMService:
                     break
 
         raise RetryableError(
-            f"LLM call failed after trying {len(providers)} providers: {last_error}"
+            f"LLM call failed after {total_attempts} attempts "
+            f"across {len(providers)} providers: {last_error}"
         )
 
     @staticmethod

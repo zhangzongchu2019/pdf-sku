@@ -7,7 +7,7 @@ import fnmatch
 import sys
 from pathlib import Path
 
-from .excel_parser import scan_datasets, load_dataset, DEFAULT_DATA_ROOT
+from .excel_parser import scan_datasets, load_dataset, analyze_gt_dup, DEFAULT_DATA_ROOT
 from .models import ReferenceDataset
 
 
@@ -223,6 +223,177 @@ async def _async_full(args: argparse.Namespace) -> None:
         runner.shutdown()
 
 
+def cmd_full_db(args: argparse.Namespace) -> None:
+    """全流程 + 逐个数据集写入数据库。"""
+    asyncio.run(_async_full_db(args))
+
+
+async def _async_full_db(args: argparse.Namespace) -> None:
+    import subprocess
+    from datetime import datetime
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+    from .comparator import compare_dataset
+    from .report import print_comparison, print_summary
+    from .runner import BenchmarkRunner, DATASET_CONCURRENCY, PAGE_CONCURRENCY
+    from pdf_sku.common.models import BenchmarkRun, BenchmarkDatasetResult
+    from pdf_sku.settings import settings
+
+    data_root = Path(args.data_root) if args.data_root else None
+    datasets = scan_datasets(data_root)
+    datasets = _filter_datasets(datasets, args.filter)
+    datasets = [ds for ds in datasets if ds.pdf_path and ds.excel_path]
+
+    if not datasets:
+        print("没有匹配的数据集")
+        return
+
+    # --force 时自动归档旧缓存并清空
+    if args.force:
+        from .runner import archive_cache, clear_cache
+        tag = args.tag if hasattr(args, 'tag') and args.tag else ""
+        archived = archive_cache(tag=tag)
+        if archived:
+            print(f"旧缓存已归档: {archived}")
+        removed = clear_cache()
+        if removed:
+            print(f"已清空 {removed} 个缓存文件")
+
+    # DB 连接
+    engine = create_async_engine(settings.database_url, pool_size=5)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    # git info
+    git_commit = git_branch = None
+    try:
+        git_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, timeout=5
+        ).strip()[:40]
+        git_branch = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True, timeout=5
+        ).strip()[:200]
+    except Exception:
+        pass
+
+    run_tag = args.tag or f"full-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    started_at = datetime.now()
+
+    # 创建 BenchmarkRun
+    run = BenchmarkRun(
+        run_tag=run_tag,
+        git_commit=git_commit,
+        git_branch=git_branch,
+        description=args.desc or None,
+        total_datasets=len(datasets),
+        config={
+            "page_concurrency": PAGE_CONCURRENCY,
+            "dataset_concurrency": DATASET_CONCURRENCY,
+        },
+        started_at=started_at,
+    )
+    async with session_factory() as session:
+        session.add(run)
+        await session.commit()
+        run_id = run.run_id
+    print(f"\nBenchmark Run: {run_id}  tag={run_tag}")
+    print(f"数据集: {len(datasets)} 个\n")
+
+    runner = BenchmarkRunner()
+    results = []
+    run_results = []
+    results_lock = asyncio.Lock()
+    ds_sem = asyncio.Semaphore(DATASET_CONCURRENCY)
+    completed = [0]
+
+    async def process_one(ds: ReferenceDataset):
+        async with ds_sem:
+            print(f"\n{'='*60}")
+            print(f"[{completed[0]+1}/{len(datasets)}] {ds.name}")
+            print(f"{'='*60}")
+
+            # 1. Run
+            run_result = await runner.run_dataset(ds, force=args.force)
+
+            # 2. Compare
+            load_dataset(ds)
+            cr = compare_dataset(ds, run_result)
+            print_comparison(cr)
+
+            # 3. 写入数据库
+            details = {
+                "fn_names": [
+                    s.product_name or s.model_number or ""
+                    for s in cr.missing_skus[:50]
+                ],
+                "fp_names": [
+                    s.get("attributes", {}).get("product_name", "")
+                    or s.get("attributes", {}).get("model_number", "")
+                    for s in cr.extra_skus[:50]
+                ],
+            }
+            gt_dup_info = analyze_gt_dup(ds.skus)
+            if gt_dup_info:
+                details["gt_dup_info"] = gt_dup_info
+
+            ds_result = BenchmarkDatasetResult(
+                run_id=run_id,
+                dataset_name=cr.dataset_name,
+                pdf_path=str(ds.pdf_path) if ds.pdf_path else None,
+                gt_count=cr.expected_count,
+                pred_count=cr.actual_count,
+                matched_count=cr.matched_count,
+                precision=cr.precision,
+                recall=cr.recall,
+                f1=cr.f1,
+                fn_count=len(cr.missing_skus),
+                fp_count=len(cr.extra_skus),
+                elapsed_seconds=run_result.get("elapsed_seconds"),
+                total_pages=run_result.get("total_pages"),
+                details=details,
+            )
+            async with session_factory() as session:
+                session.add(ds_result)
+                await session.commit()
+
+            async with results_lock:
+                results.append(cr)
+                run_results.append(run_result)
+                completed[0] += 1
+
+            print(f"  -> 已存入 DB  P={cr.precision:.1%} R={cr.recall:.1%} F1={cr.f1:.1%}")
+
+    try:
+        await asyncio.gather(*[process_one(ds) for ds in datasets])
+
+        # 更新 BenchmarkRun 汇总
+        n = len(results)
+        avg_p = sum(r.precision for r in results) / n if n else None
+        avg_r = sum(r.recall for r in results) / n if n else None
+        avg_f1 = sum(r.f1 for r in results) / n if n else None
+
+        async with session_factory() as session:
+            from sqlalchemy import update
+            await session.execute(
+                update(BenchmarkRun).where(BenchmarkRun.run_id == run_id).values(
+                    avg_precision=avg_p,
+                    avg_recall=avg_r,
+                    avg_f1=avg_f1,
+                    completed_at=datetime.now(),
+                )
+            )
+            await session.commit()
+
+        if results:
+            print_summary(results)
+
+        print(f"\n全部完成! run_id={run_id} avg_P={avg_p:.1%} avg_R={avg_r:.1%} avg_F1={avg_f1:.1%}")
+
+    finally:
+        runner.shutdown()
+        await engine.dispose()
+
+
 def cmd_history(args: argparse.Namespace) -> None:
     """查看历史归档列表。"""
     from .runner import list_history
@@ -371,6 +542,13 @@ def main():
     p_full.add_argument("--tag", default="", help="归档标签")
     p_full.add_argument("--output", default=None, help="输出目录")
 
+    # full-db
+    p_fdb = sub.add_parser("full-db", help="全流程 + 逐个写入数据库")
+    p_fdb.add_argument("--filter", default=None, help="文件名模式")
+    p_fdb.add_argument("--force", action="store_true", help="强制重新运行")
+    p_fdb.add_argument("--tag", default="", help="运行标签")
+    p_fdb.add_argument("--desc", default="", help="本轮修改说明")
+
     # history
     p_hist = sub.add_parser("history", help="查看历史归档")
 
@@ -387,6 +565,7 @@ def main():
         "compare": cmd_compare,
         "export": cmd_export,
         "full": cmd_full,
+        "full-db": cmd_full_db,
         "history": cmd_history,
         "compare-history": cmd_compare_history,
     }

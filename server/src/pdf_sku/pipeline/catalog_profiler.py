@@ -62,6 +62,7 @@ class CatalogProfile:
     combo_keyword_ratio: float = 0.0                             # 组合关键词页占比
     multi_category_page_ratio: float = 0.0                       # 多品类共现页占比
     is_pure_image_catalog: bool = False                          # 纯图产品目录（大部分页面无文字）
+    is_one_product_per_page: bool = False                        # 每页一个产品（多视图纯图目录）
     brand_names: set[str] = field(default_factory=set)           # 封面/扉页大字体品牌名
     model_prefixes: set[str] = field(default_factory=set)        # 高频型号前缀 (BT-、NAV、FP-)
     all_model_numbers: set[str] = field(default_factory=set)     # 全文出现的所有型号
@@ -127,6 +128,8 @@ def scan_catalog(pdf_path: str) -> CatalogProfile:
         # 型号采集
         all_models: set[str] = set()
         prefix_counter: dict[str, int] = {}  # 型号前缀 → 出现次数
+        # 每页一产品检测: 无文字 + 少量图片 (1-4 张, 多视图)
+        sparse_img_pages = 0  # 无文字 + 有图片的页面数
         # 品牌名检测页: 前 3 页 + 末页
         brand_scan_pages = set(range(min(3, doc.page_count)))
         if doc.page_count > 1:
@@ -140,6 +143,13 @@ def scan_catalog(pdf_path: str) -> CatalogProfile:
                 continue
 
             if not text or len(text.strip()) < 5:
+                # 统计无文字但有少量图片的页面 (多视图产品页)
+                try:
+                    img_count = len(page.get_images())
+                    if 1 <= img_count <= 4:
+                        sparse_img_pages += 1
+                except Exception:
+                    pass
                 continue
 
             content_pages += 1
@@ -238,6 +248,13 @@ def scan_catalog(pdf_path: str) -> CatalogProfile:
         if text_sparse_pages / profile.total_pages > 0.60:
             profile.is_pure_image_catalog = True
 
+        # 每页一产品检测：大部分页面是无文字+少量图片(1-4张多视图)
+        # 典型场景：每页展示同一产品的正面/侧面/背面照片
+        if (profile.is_pure_image_catalog
+                and sparse_img_pages >= 3
+                and sparse_img_pages / profile.total_pages > 0.50):
+            profile.is_one_product_per_page = True
+
     logger.info("catalog_scan_done",
                 total_pages=profile.total_pages,
                 main_categories=sorted(profile.main_categories),
@@ -247,6 +264,7 @@ def scan_catalog(pdf_path: str) -> CatalogProfile:
                 combo_kw_ratio=profile.combo_keyword_ratio,
                 multi_cat_ratio=profile.multi_category_page_ratio,
                 is_pure_image=profile.is_pure_image_catalog,
+                is_one_product_per_page=profile.is_one_product_per_page,
                 brand_names=sorted(profile.brand_names),
                 model_prefixes=sorted(profile.model_prefixes),
                 model_count=len(profile.all_model_numbers))

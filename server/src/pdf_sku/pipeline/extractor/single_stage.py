@@ -220,6 +220,68 @@ class SingleStageExtractor:
 
         return self._rule_extract(raw)
 
+    async def extract_pure_visual(
+        self,
+        screenshot: bytes | None = None,
+    ) -> list[SKUResult]:
+        """纯图页面产品识别: 只看图片判断展示了什么产品。
+
+        用于纯图目录中 single_stage 返回空的页面。
+        轻量 prompt, 只要求返回产品名和颜色, 不要求型号/价格等。
+        同一产品的多视角图片应合并为一个 SKU。
+        """
+        if not self._llm or not screenshot:
+            return []
+
+        prompt = (
+            "这张图片来自一本产品图册。请识别图中展示的产品。\n\n"
+            "规则:\n"
+            "- 如果多张图片是同一个产品的不同角度/视角，只算一个产品\n"
+            "- 如果是不同产品，分别列出\n"
+            "- product_name: 用简短中文描述（如\"休闲椅\"、\"沙发\"、\"茶几\"）\n"
+            "- color: 产品的主要颜色\n"
+            "- 不需要型号和价格，留空即可\n\n"
+            "仅返回 JSON 数组:\n"
+            '[{"product_name": "...", "color": "...", "confidence": 0.6}]'
+        )
+
+        try:
+            resp = await self._llm._call_llm(
+                operation="extract_pure_visual",
+                prompt=prompt,
+                images=[screenshot],
+            )
+
+            if not resp.text or not resp.text.strip():
+                logger.info("pure_visual_identify_empty_response")
+                return []
+
+            logger.debug("pure_visual_identify_raw",
+                         text=resp.text[:200])
+
+            parsed = _parser.parse(resp.text, expected_type="array")
+            if parsed.success and isinstance(parsed.data, list):
+                results = []
+                for item in parsed.data:
+                    if isinstance(item, dict):
+                        attrs = _sanitize_attrs(item)
+                        if (attrs.get("product_name") or "").strip():
+                            results.append(SKUResult(
+                                attributes=attrs,
+                                validity="valid",
+                                confidence=float(item.get("confidence", 0.5)),
+                                extraction_method="pure_visual_identify",
+                            ))
+                logger.info("pure_visual_identify_parsed",
+                            total=len(parsed.data), valid=len(results))
+                return results
+            else:
+                logger.warning("pure_visual_identify_parse_failed",
+                               text=resp.text[:200])
+        except Exception as e:
+            logger.warning("pure_visual_identify_failed", error=str(e))
+        return []
+
     async def extract_rescue(
         self,
         raw: ParsedPageIR,
