@@ -910,47 +910,6 @@ def _filter_cross_page_props(
     return kept
 
 
-_COLOR_SPLIT_RE = re.compile(r'[/、，,；;]\s*')
-
-
-def expand_color_variants(skus: list[SKUResult]) -> list[SKUResult]:
-    """将 color 字段包含多个颜色值的 SKU 展开为独立 SKU。
-
-    例如: model=801#, color="浅灰色/深灰色/白色" → 3 个独立 SKU。
-    仅对有 model_number 且 color 含分隔符的 SKU 执行。
-    """
-    result: list[SKUResult] = []
-    expanded_total = 0
-    for sku in skus:
-        model = (sku.attributes.get("model_number") or "").strip()
-        color = (sku.attributes.get("color") or "").strip()
-        if not model or not color:
-            result.append(sku)
-            continue
-        colors = [c.strip() for c in _COLOR_SPLIT_RE.split(color) if c.strip()]
-        if len(colors) <= 1:
-            result.append(sku)
-            continue
-        # 展开: 每个颜色一个独立 SKU
-        for c in colors:
-            new_attrs = dict(sku.attributes)
-            new_attrs["color"] = c
-            new_sku = SKUResult(
-                sku_id=sku.sku_id,
-                attributes=new_attrs,
-                confidence=sku.confidence,
-                extraction_method=sku.extraction_method,
-            )
-            if hasattr(sku, "page_no"):
-                new_sku.page_no = sku.page_no
-            result.append(new_sku)
-        expanded_total += len(colors) - 1
-    if expanded_total:
-        logger.info("expand_color_variants", original=len(skus),
-                     expanded=expanded_total, total=len(result))
-    return result
-
-
 def cross_page_dedup(
     all_skus: list[SKUResult],
     catalog_profile: "CatalogProfile | None" = None,

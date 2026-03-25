@@ -303,17 +303,15 @@ class BenchmarkRunner:
                     ]
                     page["sku_count"] = len(page["skus"])
 
-        # ═══ 组合图册: 颜色感知去重 (同型号+同颜色才合并) ═══
+        # ═══ 组合图册: 按型号去重 (同型号不同颜色=同一产品) ═══
         if is_combo and len(all_skus_flat) > 1:
             seen: set[str] = set()
-            remove_set: set[tuple[int, int]] = set()
             for pi, page in enumerate(pages):
                 new_skus = []
                 for si, sku in enumerate(page.get("skus", [])):
                     attrs = sku.get("attributes", {})
                     model = (attrs.get("model_number") or "").strip().upper()
-                    color = (attrs.get("color") or "").strip()
-                    key = f"{model}||{color}" if model else ""
+                    key = model if model else ""
                     if key and key in seen:
                         continue
                     if key:
@@ -323,60 +321,8 @@ class BenchmarkRunner:
                 page["sku_count"] = len(new_skus)
             deduped_total = sum(len(p.get("skus", [])) for p in pages)
             if deduped_total < len(all_skus_flat):
-                logger.info("combo_color_dedup_done",
+                logger.info("combo_model_dedup_done",
                             before=len(all_skus_flat), after=deduped_total)
-
-        # ═══ 颜色变体展开 (在所有去重之后，dict 层执行确保写入缓存) ═══
-        import re
-        _color_split = re.compile(r'[/、，,；;]\s*')
-        expand_total = 0
-        for page in pages:
-            expanded = []
-            for sku in page.get("skus", []):
-                attrs = sku.get("attributes", {})
-                _m = attrs.get("model_number") or ""
-                _c = attrs.get("color") or ""
-                model = (str(_m) if not isinstance(_m, str) else _m).strip()
-                color = (str(_c) if not isinstance(_c, str) else _c).strip()
-                if not model or not color:
-                    expanded.append(sku)
-                    continue
-                colors = [c.strip() for c in _color_split.split(color) if c.strip()]
-                if len(colors) <= 1:
-                    expanded.append(sku)
-                    continue
-                for c in colors:
-                    new_sku = json.loads(json.dumps(sku))  # deep copy dict
-                    new_sku["attributes"]["color"] = c
-                    expanded.append(new_sku)
-                expand_total += len(colors) - 1
-            page["skus"] = expanded
-            page["sku_count"] = len(expanded)
-        if expand_total:
-            logger.info("color_expand_done", expanded=expand_total,
-                        total_after=sum(len(p.get("skus", [])) for p in pages))
-
-        # ═══ 颜色展开后去重: 同 model+color 组合只保留首次出现 ═══
-        seen_mc: set[str] = set()
-        dedup_color_removed = 0
-        for page in pages:
-            new_skus = []
-            for sku in page.get("skus", []):
-                attrs = sku.get("attributes", {})
-                _m = (str(attrs.get("model_number") or "")).strip().upper()
-                _c = (str(attrs.get("color") or "")).strip()
-                if _m:
-                    key = f"{_m}||{_c}"
-                    if key in seen_mc:
-                        dedup_color_removed += 1
-                        continue
-                    seen_mc.add(key)
-                new_skus.append(sku)
-            page["skus"] = new_skus
-            page["sku_count"] = len(new_skus)
-        if dedup_color_removed:
-            logger.info("dedup_color_expand_done", removed=dedup_color_removed,
-                        total_after=sum(len(p.get("skus", [])) for p in pages))
 
         total_skus = sum(len(p.get("skus", [])) for p in pages)
 
