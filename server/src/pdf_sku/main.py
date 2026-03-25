@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
 
 import structlog
 from fastapi import FastAPI
@@ -477,5 +478,15 @@ def create_app() -> FastAPI:
     app.include_router(config_router)  # already has /api/v1/config prefix
     app.include_router(collab_router)  # already has /api/v1 prefix
     app.include_router(feedback_router)  # already has /api/v1 prefix
+
+    # ─── 静态文件: 产品图片服务 ───
+    from starlette.staticfiles import StaticFiles
+    benchmark_img_dir = Path(settings.benchmark_image_dir)
+    if benchmark_img_dir.exists():
+        app.mount(
+            "/images/benchmark",
+            StaticFiles(directory=str(benchmark_img_dir)),
+            name="benchmark-images",
+        )
 
     return app
