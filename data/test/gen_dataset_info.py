@@ -3,14 +3,14 @@
 import json, sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pdf-sku/server/src"))
-sys.path.insert(0, "/home/zzc/pdf-sku/server/src")
+_project_root = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_project_root / "server" / "src"))
 
 from pdf_sku.benchmark.excel_parser import scan_datasets, load_dataset
 
 # Load baseline
 baseline = {}
-with open("/home/zzc/.claude/projects/-home-zzc-pdf-sku/memory/benchmark-142-datasets.json") as f:
+with open(Path.home() / ".claude/projects/-home-zzc-pdf-sku/memory/benchmark-142-datasets.json") as f:
     for ds in json.load(f):
         baseline[ds["name"]] = ds
 

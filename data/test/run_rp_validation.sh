@@ -1,7 +1,7 @@
 #!/bin/bash
 # R+P 合并改进验证: 测试本次分析中 R/P 低下的目标数据集
 # 对应 commit: 352ba53 (feat: R+P 合并改进)
-cd /home/zzc/pdf-sku/server
+cd "$(dirname "$0")/../../server"
 
 DATASETS=(
   # ── R 低下 (FN 主导, A1/A2/A3 改进目标) ──
