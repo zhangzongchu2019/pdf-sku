@@ -1,4 +1,4 @@
-import { useAuthStore } from "../stores/authStore";
+import { getAuthToken, useAuthStore } from "../stores/authStore";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "/api/v1";
 
@@ -10,7 +10,7 @@ class ApiError extends Error {
 }
 
 function getAuthHeaders(): Record<string, string> {
-  const token = useAuthStore.getState().token;
+  const token = getAuthToken();
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
