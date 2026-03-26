@@ -12,8 +12,7 @@ export type JobInternalStatus =
   | "DEGRADED_HUMAN" | "FULL_IMPORTED" | "REJECTED"
   | "ORPHANED" | "CANCELLED";
 
-export type JobUserStatus =
-  | "processing" | "partial_success" | "completed" | "needs_manual" | "failed";
+export type JobUserStatus = JobStatus;
 
 export interface Job {
   job_id: string;
@@ -22,7 +21,7 @@ export interface Job {
   file_hash: string;
   category: string | null;
   status: JobInternalStatus;
-  user_status: JobStatus;
+  user_status: JobUserStatus;
   action_hint: string | null;
   route?: Route;
   degrade_reason: string | null;

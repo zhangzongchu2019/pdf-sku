@@ -3,14 +3,22 @@ import { useNavigate } from "react-router-dom";
 import { useUploadStore } from "../stores/uploadStore";
 import { useJobStore } from "../stores/jobStore";
 import { useNotificationStore } from "../stores/notificationStore";
-import { formatBytes } from "../utils/format";
+import { formatBytes, formatStatusLabel } from "../utils/format";
 
 const MAX_SIZE = 100 * 1024 * 1024; // 100MB
 
 export default function UploadPage() {
   const navigate = useNavigate();
   const fileRef = useRef<HTMLInputElement>(null);
-  const { uploads, addFile, startUpload, removeUpload, clearCompleted } = useUploadStore();
+  const {
+    uploads,
+    addFile,
+    startUpload,
+    setStatus,
+    setError,
+    removeUpload,
+    clearCompleted,
+  } = useUploadStore();
   const createJob = useJobStore((s) => s.createJob);
   const notify = useNotificationStore((s) => s.add);
 
@@ -18,9 +26,38 @@ export default function UploadPage() {
   const [category, setCategory] = useState("");
   const [dragActive, setDragActive] = useState(false);
 
+  const uploadAndCreateJob = useCallback(async (
+    uploadId: string,
+    merchantIdValue: string,
+    categoryValue?: string,
+    navigateOnSuccess = false,
+  ) => {
+    try {
+      const fileId = await startUpload(uploadId);
+      const job = await createJob(fileId, merchantIdValue, categoryValue);
+      setStatus(uploadId, "completed");
+      notify({ type: "success", message: `任务创建成功: ${job.job_id.slice(0, 8)}...` });
+      if (navigateOnSuccess) {
+        navigate(`/jobs/${job.job_id}`);
+      }
+    } catch (e: any) {
+      const message = e?.message || "上传失败";
+      setError(uploadId, message);
+      notify({ type: "error", message });
+    }
+  }, [startUpload, createJob, setStatus, setError, notify, navigate]);
+
   const handleFiles = useCallback((files: FileList | File[]) => {
-    const arr = Array.from(files);
-    for (const file of arr) {
+    const merchantIdValue = merchantId.trim();
+    if (!merchantIdValue) {
+      notify({ type: "error", message: "请先填写商户 ID，再拖拽或选择文件" });
+      return;
+    }
+
+    const categoryValue = category.trim() || undefined;
+    const validFiles: File[] = [];
+
+    for (const file of Array.from(files)) {
       if (!file.name.toLowerCase().endsWith(".pdf")) {
         notify({ type: "error", message: `${file.name} 不是 PDF 文件` });
         continue;
@@ -29,9 +66,15 @@ export default function UploadPage() {
         notify({ type: "error", message: `${file.name} 超过 100MB 限制` });
         continue;
       }
-      addFile(file);
+      validFiles.push(file);
     }
-  }, [addFile, notify]);
+
+    const navigateOnSuccess = validFiles.length === 1;
+    for (const file of validFiles) {
+      const uploadId = addFile(file);
+      void uploadAndCreateJob(uploadId, merchantIdValue, categoryValue, navigateOnSuccess);
+    }
+  }, [merchantId, category, addFile, notify, uploadAndCreateJob]);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -39,20 +82,18 @@ export default function UploadPage() {
     handleFiles(e.dataTransfer.files);
   }, [handleFiles]);
 
-  const handleUploadAndCreate = useCallback(async (uploadId: string) => {
+  const handlePickFiles = useCallback(() => {
     if (!merchantId.trim()) {
-      notify({ type: "error", message: "请输入商户 ID" });
+      notify({ type: "error", message: "请先填写商户 ID，再选择文件" });
       return;
     }
-    try {
-      const fileId = await startUpload(uploadId);
-      const job = await createJob(fileId, merchantId, category || undefined);
-      notify({ type: "success", message: `Job 创建成功: ${job.job_id.slice(0, 8)}...` });
-      navigate(`/jobs/${job.job_id}`);
-    } catch (e: any) {
-      notify({ type: "error", message: e.message });
-    }
-  }, [merchantId, category, startUpload, createJob, notify, navigate]);
+    fileRef.current?.click();
+  }, [merchantId, notify]);
+
+  const renderUploadStatus = useCallback((status: typeof uploads[number]["status"], progress: number) => {
+    if (status === "uploading") return `上传中 ${progress}%`;
+    return formatStatusLabel(status);
+  }, []);
 
   return (
     <div className="page upload-page">
@@ -74,14 +115,17 @@ export default function UploadPage() {
         onDragOver={(e) => { e.preventDefault(); setDragActive(true); }}
         onDragLeave={() => setDragActive(false)}
         onDrop={handleDrop}
-        onClick={() => fileRef.current?.click()}
+        onClick={handlePickFiles}
       >
         <input ref={fileRef} type="file" accept=".pdf" multiple hidden
-               onChange={(e) => e.target.files && handleFiles(e.target.files)} />
+               onChange={(e) => {
+                 if (e.target.files) handleFiles(e.target.files);
+                 e.target.value = "";
+               }} />
         <div className="dropzone-content">
           <span className="dropzone-icon">📁</span>
-          <p>拖拽 PDF 文件到此处，或点击选择</p>
-          <p className="dropzone-hint">支持批量上传，单文件最大 100MB</p>
+          <p>拖拽 PDF 文件到此处，或点击选择后立即上传</p>
+          <p className="dropzone-hint">请先填写商户 ID。支持批量上传，单文件最大 100MB</p>
         </div>
       </div>
 
@@ -102,13 +146,7 @@ export default function UploadPage() {
                      style={{ width: `${u.progress.percentage}%` }} />
               </div>
               <div className="upload-actions">
-                <span className="upload-status">{u.status === "uploading" ? `${u.progress.percentage}%` : u.status}</span>
-                {u.status === "pending" && (
-                  <button className="btn btn-primary btn-sm"
-                          onClick={() => handleUploadAndCreate(u.id)}>
-                    上传并创建
-                  </button>
-                )}
+                <span className="upload-status">{renderUploadStatus(u.status, u.progress.percentage)}</span>
                 {u.status === "error" && <span className="error-text">{u.error}</span>}
                 <button className="btn btn-text btn-sm" onClick={() => removeUpload(u.id)}>✕</button>
               </div>

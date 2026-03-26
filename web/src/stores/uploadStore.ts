@@ -3,7 +3,7 @@ import { persist } from "zustand/middleware";
 import { immer } from "zustand/middleware/immer";
 import { tusUpload, UploadProgress } from "../api/upload";
 
-export type UploadStatus = "pending" | "hashing" | "uploading" | "completed" | "error";
+export type UploadStatus = "pending" | "hashing" | "uploading" | "creating" | "completed" | "error";
 
 export interface UploadItem {
   id: string;
@@ -17,10 +17,11 @@ export interface UploadItem {
 
 interface UploadState {
   uploads: UploadItem[];
-  addFile: (file: File, profileId?: string) => void;
+  addFile: (file: File, profileId?: string) => string;
   startUpload: (id: string) => Promise<string>;
   updateProgress: (uploadId: string, progress: number) => void;
   setStatus: (uploadId: string, status: UploadStatus) => void;
+  setError: (uploadId: string, error: string) => void;
   removeUpload: (id: string) => void;
   clearCompleted: () => void;
 }
@@ -43,6 +44,7 @@ export const useUploadStore = create<UploadState>()(
             status: "pending",
           });
         });
+        return id;
       },
 
       updateProgress: (uploadId, percentage) => set((s) => {
@@ -55,7 +57,18 @@ export const useUploadStore = create<UploadState>()(
 
       setStatus: (uploadId, status) => set((s) => {
         const item = s.uploads.find((u) => u.id === uploadId);
-        if (item) item.status = status;
+        if (item) {
+          item.status = status;
+          if (status !== "error") item.error = undefined;
+        }
+      }),
+
+      setError: (uploadId, error) => set((s) => {
+        const item = s.uploads.find((u) => u.id === uploadId);
+        if (item) {
+          item.status = "error";
+          item.error = error;
+        }
       }),
 
       startUpload: async (id) => {
@@ -78,7 +91,7 @@ export const useUploadStore = create<UploadState>()(
           set((s) => {
             const u = s.uploads.find((u) => u.id === id);
             if (u) {
-              u.status = "completed";
+              u.status = "creating";
               u.fileId = fileId;
             }
           });

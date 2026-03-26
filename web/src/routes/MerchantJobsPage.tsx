@@ -6,11 +6,14 @@ import { useParams, useNavigate } from "react-router-dom";
 import { opsApi } from "../api/ops";
 import { jobsApi } from "../api/jobs";
 import Pagination from "../components/common/Pagination";
+import { formatStatusLabel } from "../utils/format";
 import type { MerchantStats, Job } from "../types/models";
 
 const STATUS_COLORS: Record<string, string> = {
   processing: "#3B82F6",
+  partial_success: "#F59E0B",
   completed: "#10B981",
+  needs_manual: "#F97316",
   failed: "#EF4444",
   cancelled: "#6B7280",
   queued: "#F59E0B",
@@ -151,7 +154,7 @@ export default function MerchantJobsPage() {
                         backgroundColor: (STATUS_COLORS[j.user_status] ?? "#94A3B8") + "18",
                       }}
                     >
-                      {j.user_status}
+                      {formatStatusLabel(j.user_status)}
                     </span>
                   </td>
                   <td style={{ padding: "8px", color: "#94A3B8" }}>{j.total_pages}</td>

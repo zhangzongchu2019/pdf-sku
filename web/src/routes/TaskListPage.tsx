@@ -10,9 +10,17 @@ import Loading from "../components/common/Loading";
 import EmptyState from "../components/common/EmptyState";
 import EditableSkuGrid from "../components/tasks/EditableSkuGrid";
 import { formatDate } from "../utils/format";
+import { TaskStatus } from "../types/enums";
 import type { HumanTask } from "../types/models";
 
-const STATUSES = ["", "CREATED", "LOCKED", "COMPLETED", "SKIPPED", "ESCALATED"];
+const STATUS_FILTERS = [
+  { value: "", label: "全部" },
+  { value: TaskStatus.CREATED, label: "待处理" },
+  { value: TaskStatus.PROCESSING, label: "处理中" },
+  { value: TaskStatus.COMPLETED, label: "已完成" },
+  { value: TaskStatus.SKIPPED, label: "已作废" },
+  { value: TaskStatus.ESCALATED, label: "已升级" },
+] as const;
 
 export default function TaskListPage() {
   const navigate = useNavigate();
@@ -34,7 +42,7 @@ export default function TaskListPage() {
     try {
       const res = await tasksApi.list({ status: filter || undefined, page });
       const filtered = hideSkipped && !filter
-        ? res.items.filter((t) => t.status !== "SKIPPED")
+        ? res.items.filter((t) => t.status !== TaskStatus.SKIPPED)
         : res.items;
       setTasks(filtered);
       setTotal(res.total); // 保持后端分页总数，避免分页跳页失真
@@ -132,10 +140,10 @@ export default function TaskListPage() {
           隐藏作废（默认）
         </label>
         <span className="text-muted">当前显示 {tasks.length} 条</span>
-        {STATUSES.map((s) => (
-          <button key={s} className={`btn btn-filter ${filter === s ? "active" : ""}`}
-                  onClick={() => { setFilter(s); setPage(1); }}>
-            {s || "全部"}
+        {STATUS_FILTERS.map(({ value, label }) => (
+          <button key={value || "all"} className={`btn btn-filter ${filter === value ? "active" : ""}`}
+                  onClick={() => { setFilter(value); setPage(1); }}>
+            {label}
           </button>
         ))}
       </div>

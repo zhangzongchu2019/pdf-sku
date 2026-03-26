@@ -68,7 +68,9 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   const unreadCount = notifications.filter((n) => !n.read).length;
   const sseConnected = useSSEStore((s) => s.status === "connected");
   const uploadItems = useUploadStore((s) => s.uploads);
-  const activeUploads = uploadItems.filter((f) => f.status === "uploading" || f.status === "hashing");
+  const activeUploads = uploadItems.filter(
+    (f) => f.status === "uploading" || f.status === "hashing" || f.status === "creating",
+  );
   const { username, displayName, role, logout, isLoggedIn } = useAuthStore();
 
   const ROLE_LABELS: Record<string, string> = {

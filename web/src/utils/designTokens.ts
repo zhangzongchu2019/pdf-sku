@@ -32,6 +32,14 @@ export const STATUS_COLORS: Record<string, string> = {
   valid: "#52c41a",
   invalid: "#ff4d4f",
   needs_review: "#faad14",
+  // job user status (lowercase)
+  processing: "#1890ff",
+  partial_success: "#faad14",
+  completed: "#52c41a",
+  needs_manual: "#fa8c16",
+  failed: "#ff4d4f",
+  cancelled: "#d9d9d9",
+  queued: "#faad14",
   // calibration (lowercase aliases)
   pending: "#faad14",
   approved: "#52c41a",

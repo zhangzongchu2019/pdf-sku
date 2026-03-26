@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { formatDate, formatDuration, formatPercent, formatBytes } from "../../src/utils/format";
+import {
+  formatDate,
+  formatDuration,
+  formatPercent,
+  formatBytes,
+  formatStatusLabel,
+} from "../../src/utils/format";
 
 describe("format utilities", () => {
   describe("formatPercent", () => {
@@ -57,6 +63,24 @@ describe("format utilities", () => {
       const result = formatDate("2024-01-15T10:30:00Z");
       expect(result).toBeTruthy();
       expect(typeof result).toBe("string");
+    });
+  });
+
+  describe("formatStatusLabel", () => {
+    it("formats job statuses in Chinese", () => {
+      expect(formatStatusLabel("processing")).toBe("处理中");
+      expect(formatStatusLabel("partial_success")).toBe("部分完成");
+      expect(formatStatusLabel("needs_manual")).toBe("需人工处理");
+    });
+
+    it("formats task statuses in Chinese", () => {
+      expect(formatStatusLabel("CREATED")).toBe("待处理");
+      expect(formatStatusLabel("PROCESSING")).toBe("处理中");
+      expect(formatStatusLabel("SKIPPED")).toBe("已作废");
+    });
+
+    it("falls back to the original status when unknown", () => {
+      expect(formatStatusLabel("UNKNOWN_STATUS")).toBe("UNKNOWN_STATUS");
     });
   });
 });
