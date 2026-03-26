@@ -150,6 +150,15 @@ def analyze_gt_dup(skus: list[GroundTruthSKU]) -> dict | None:
         # 取第一行作为 base model（颜色通常在后续行或斜杠后）
         base = re.split(r"[\r\n]+", raw)[0].strip()
         base = re.sub(r"[（(].*$", "", base).strip()
+        # 去除尺寸后缀: "806# 1800/1500mm 胡桃色" → "806#"
+        base = re.sub(r"\s+\d+[/*x×]\d+.*$", "", base, flags=re.IGNORECASE).strip()
+        # 去除颜色后缀: "806# 胡桃色" → "806#"
+        base = re.sub(
+            r"\s+(象牙白|胡桃色|原木色|米白|黑色|白色|灰色|棕色|咖色|浅蓝|"
+            r"黑橡木色|胡桃木色|海棠色|柚木色|浅色|红檀色|奶油白|杏灰色|高级黑|"
+            r"珍珠白|香灰色|莫兰迪咖棕色|千鸟格|浅绿色|深灰色|米黄色|酒红色|墨绿色).*$",
+            "", base, flags=re.IGNORECASE
+        ).strip()
         if base:
             models.append(base)
 
