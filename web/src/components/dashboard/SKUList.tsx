@@ -25,6 +25,8 @@ export function SKUList({ skus, jobId, onReconcile }: SKUListProps) {
   const apiBase = import.meta.env.VITE_API_BASE || "/api/v1";
   const imgUrl = (imageId: string) =>
     jobId ? `${apiBase}/jobs/${jobId}/images/${imageId}` : "";
+  const resolveImageUrl = (img: { image_id: string; image_uri?: string }) =>
+    img.image_uri || imgUrl(img.image_id);
   const validCount = skus.filter((s) => s.validity === "valid").length;
   const needsReviewCount = skus.filter((s) => s.validity === "needs_review").length;
   const invalidCount = skus.filter((s) => s.validity === "invalid").length;
@@ -125,7 +127,7 @@ export function SKUList({ skus, jobId, onReconcile }: SKUListProps) {
                     {sku.status ?? "—"}
                   </td>
                   <td style={{ padding: "6px" }}>
-                    <ImportTag status={sku.import_status} />
+                    <ImportTag status={sku.import_confirmation} />
                   </td>
                   <td style={{ padding: "6px" }}>
                     {jobId && sku.images && sku.images.length > 0 ? (
@@ -133,9 +135,9 @@ export function SKUList({ skus, jobId, onReconcile }: SKUListProps) {
                         {sku.images.slice(0, 3).map((img: any) => (
                           <img
                             key={img.image_id}
-                            src={imgUrl(img.image_id)}
+                            src={resolveImageUrl(img)}
                             style={{ width: 32, height: 32, objectFit: "cover", borderRadius: 2, border: "1px solid #2D3548", cursor: "pointer" }}
-                            onClick={(e) => { e.stopPropagation(); setLightboxImg(imgUrl(img.image_id)); }}
+                            onClick={(e) => { e.stopPropagation(); setLightboxImg(resolveImageUrl(img)); }}
                           />
                         ))}
                         {sku.images.length > 3 && (
@@ -188,9 +190,9 @@ export function SKUList({ skus, jobId, onReconcile }: SKUListProps) {
                               {sku.images.map((img: any) => (
                                 <img
                                   key={img.image_id}
-                                  src={imgUrl(img.image_id)}
+                                  src={resolveImageUrl(img)}
                                   style={{ width: 64, height: 64, objectFit: "cover", borderRadius: 3, border: "1px solid #2D3548", cursor: "pointer" }}
-                                  onClick={(e) => { e.stopPropagation(); setLightboxImg(imgUrl(img.image_id)); }}
+                                  onClick={(e) => { e.stopPropagation(); setLightboxImg(resolveImageUrl(img)); }}
                                 />
                               ))}
                             </div>

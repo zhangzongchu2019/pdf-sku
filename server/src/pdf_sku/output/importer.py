@@ -140,16 +140,16 @@ class IncrementalImporter:
 
             if needs_update:
                 payload = {
-                    "sku_id": sku_orm.sku_external_id,
+                    "sku_id": sku_orm.sku_id,
                     "attributes": attrs,
                 }
                 try:
                     await self._adapter.upsert_sku(
-                        payload, revision=(sku_orm.confidence or 1) + 1)
+                        payload, revision=(sku_orm.revision or 1) + 1)
                     upserted += 1
                 except Exception as e:
                     logger.error("upsert_failed",
-                                 sku_id=sku_orm.sku_external_id, error=str(e))
+                                 sku_id=sku_orm.sku_id, error=str(e))
 
         logger.info("cross_page_correction",
                      job_id=job_id, upserted=upserted)

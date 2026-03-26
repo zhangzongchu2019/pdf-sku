@@ -22,9 +22,14 @@ from pdf_sku.common.models import PDFJob, Page
 from pdf_sku.common.enums import JobInternalStatus, PageStatus
 from pdf_sku.gateway.event_bus import event_bus
 from pdf_sku.gateway.user_status import update_job_status, refresh_job_page_stats
-from pdf_sku.pipeline.ir import PageResult
+from pdf_sku.pipeline.ir import PageResult, SKUResult
 from pdf_sku.pipeline.page_processor import PageProcessor
 from pdf_sku.pipeline.catalog_profiler import scan_catalog, CatalogProfile
+from pdf_sku.pipeline.extractor.sku_dedup import (
+    cross_page_dedup,
+    dedup_by_model_variant,
+    dedup_material_variants,
+)
 import structlog
 
 logger = structlog.get_logger()
@@ -91,6 +96,8 @@ class Orchestrator:
                 result = await final_db.execute(
                     select(PDFJob).where(PDFJob.job_id == job_uuid))
                 fresh_job = result.scalar_one()
+                await self._reconcile_persisted_outputs(
+                    final_db, fresh_job, catalog_profile=catalog_profile)
                 await self._finalize_job(final_db, fresh_job)
                 await final_db.commit()
 
@@ -120,8 +127,11 @@ class Orchestrator:
                     result = await self._process_single_page(
                         page_db, job, page_no, file_path,
                         catalog_profile=catalog_profile)
-                    await self._on_page_done(page_db, job, page_no, result)
+                    page_completed_event = await self._on_page_done(
+                        page_db, job, page_no, result
+                    )
                     await page_db.commit()
+                    await event_bus.publish("PageCompleted", page_completed_event)
 
         results = await asyncio.gather(
             *[process_one(p) for p in pages],
@@ -175,7 +185,7 @@ class Orchestrator:
         job: PDFJob,
         page_no: int,
         result: PageResult,
-    ) -> None:
+    ) -> dict:
         """
         每页完成: 落库 → 事件 → 人工任务(如需)。
         [C5] 导入成功后才保存 Checkpoint
@@ -207,14 +217,21 @@ class Orchestrator:
         if result.skus:
             await self._persist_skus(db, job.job_id, page_no, result)
 
-        # 发布事件
-        await event_bus.publish("PageCompleted", {
+        return {
             "job_id": str(job.job_id),
             "page_no": page_no,
+            "page_number": page_no,
             "status": result.status,
             "sku_count": len(result.skus),
             "needs_review": result.needs_review,
-        })
+            "skus": [{
+                "sku_id": sku.sku_id,
+                "attributes": sku.attributes,
+                "confidence": sku.confidence,
+                "validity": sku.validity,
+                "extraction_method": sku.extraction_method,
+            } for sku in result.skus],
+        }
 
     async def _persist_skus(
         self,
@@ -231,18 +248,17 @@ class Orchestrator:
         img_dir.mkdir(parents=True, exist_ok=True)
 
         for idx, sku in enumerate(result.skus, start=1):
-            if sku.validity == "valid":
-                bbox = [int(v) for v in sku.source_bbox] if sku.source_bbox else None
-                db.add(SKU(
-                    sku_id=sku.sku_id or f"SKU-{page_no}-{idx}",
-                    job_id=job_id,
-                    page_number=page_no,
-                    attributes=sku.attributes,
-                    validity=sku.validity,
-                    source_bbox=bbox,
-                    attribute_source="AI_EXTRACTED",
-                    status="EXTRACTED",
-                ))
+            bbox = [int(v) for v in sku.source_bbox] if sku.source_bbox else None
+            db.add(SKU(
+                sku_id=sku.sku_id or f"SKU-{page_no}-{idx}",
+                job_id=job_id,
+                page_number=page_no,
+                attributes=sku.attributes,
+                validity=sku.validity,
+                source_bbox=bbox,
+                attribute_source="AI_EXTRACTED",
+                status="EXTRACTED",
+            ))
 
         for idx, img in enumerate(result.images, start=1):
             if img.search_eligible:
@@ -281,6 +297,132 @@ class Orchestrator:
                     is_ambiguous=binding.is_ambiguous,
                     rank=binding.rank,
                 ))
+
+    async def _reconcile_persisted_outputs(
+        self,
+        db: AsyncSession,
+        job: PDFJob,
+        catalog_profile: CatalogProfile | None = None,
+    ) -> None:
+        """让数据库中的最终结果尽量与 benchmark JSON 的整理结果一致。"""
+        from pdf_sku.common.models import SKU, SKUImageBinding
+
+        sku_rows = list((await db.execute(
+            select(SKU)
+            .where(
+                SKU.job_id == job.job_id,
+                SKU.superseded == False,
+            )
+            .order_by(SKU.page_number, SKU.id)
+        )).scalars().all())
+
+        if not sku_rows:
+            await self._refresh_page_sku_counts(db, job.job_id)
+            return
+
+        survivor_by_removed: dict[str, str] = {}
+
+        if catalog_profile and catalog_profile.is_combo_catalog:
+            seen_by_model: dict[str, object] = {}
+            for row in sku_rows:
+                model = ((row.attributes or {}).get("model_number") or "").strip().upper()
+                if model and model in seen_by_model:
+                    survivor_by_removed[row.sku_id] = seen_by_model[model].sku_id
+                elif model:
+                    seen_by_model[model] = row
+        else:
+            sku_results = [
+                SKUResult(
+                    sku_id=row.sku_id,
+                    attributes=row.attributes or {},
+                    source_bbox=tuple(row.source_bbox or (0, 0, 0, 0)),
+                    validity=row.validity,
+                    confidence=0.0,
+                    extraction_method="",
+                )
+                for row in sku_rows
+            ]
+            deduped = cross_page_dedup(sku_results, catalog_profile=catalog_profile)
+            deduped = dedup_by_model_variant(deduped)
+            deduped = dedup_material_variants(deduped)
+            kept_ids = {id(s) for s in deduped}
+
+            survivors_by_model: dict[str, str] = {}
+            survivors_by_name: dict[str, str] = {}
+            for row, sku in zip(sku_rows, sku_results):
+                if id(sku) not in kept_ids:
+                    continue
+                model = ((sku.attributes.get("model_number") or "").strip().upper())
+                name = ((sku.attributes.get("product_name") or "").strip())
+                if model:
+                    survivors_by_model[model] = row.sku_id
+                if name:
+                    survivors_by_name[name] = row.sku_id
+
+            for row, sku in zip(sku_rows, sku_results):
+                if id(sku) in kept_ids:
+                    continue
+                model = ((sku.attributes.get("model_number") or "").strip().upper())
+                name = ((sku.attributes.get("product_name") or "").strip())
+                survivor = survivors_by_model.get(model) if model else None
+                if not survivor:
+                    survivor = survivors_by_name.get(name)
+                if survivor and survivor != row.sku_id:
+                    survivor_by_removed[row.sku_id] = survivor
+
+        if survivor_by_removed:
+            binding_rows = list((await db.execute(
+                select(SKUImageBinding).where(SKUImageBinding.job_id == job.job_id)
+            )).scalars().all())
+            existing_pairs = {(b.sku_id, b.image_id) for b in binding_rows}
+
+            for binding in binding_rows:
+                survivor_sku_id = survivor_by_removed.get(binding.sku_id)
+                if not survivor_sku_id:
+                    continue
+                new_pair = (survivor_sku_id, binding.image_id)
+                if new_pair in existing_pairs:
+                    await db.delete(binding)
+                    continue
+                existing_pairs.discard((binding.sku_id, binding.image_id))
+                binding.sku_id = survivor_sku_id
+                existing_pairs.add(new_pair)
+
+            removed_sku_ids = list(survivor_by_removed.keys())
+            await db.execute(
+                update(SKU)
+                .where(SKU.job_id == job.job_id, SKU.sku_id.in_(removed_sku_ids))
+                .values(superseded=True)
+            )
+            logger.info(
+                "job_output_reconciled",
+                job_id=str(job.job_id),
+                removed=len(removed_sku_ids),
+                kept=len(sku_rows) - len(removed_sku_ids),
+            )
+
+        await self._refresh_page_sku_counts(db, job.job_id)
+
+    async def _refresh_page_sku_counts(self, db: AsyncSession, job_id) -> None:
+        from pdf_sku.common.models import SKU
+
+        counts = {
+            row.page_number: row.cnt
+            for row in (await db.execute(
+                select(SKU.page_number, func.count().label("cnt"))
+                .where(
+                    SKU.job_id == job_id,
+                    SKU.superseded == False,
+                )
+                .group_by(SKU.page_number)
+            )).all()
+        }
+
+        page_rows = list((await db.execute(
+            select(Page).where(Page.job_id == job_id)
+        )).scalars().all())
+        for page in page_rows:
+            page.sku_count = counts.get(page.page_number, 0)
 
     async def _finalize_job(
         self,

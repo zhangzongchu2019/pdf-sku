@@ -13,6 +13,48 @@ import { SKUList } from "../components/dashboard/SKUList";
 import { TimelineDrawer } from "../components/dashboard/TimelineDrawer";
 import { formatDate, formatPercent } from "../utils/format";
 import type { PageHeatmapCell } from "../components/dashboard/PageHeatmap";
+import type { PageDetailSKU } from "../api/jobs";
+
+function buildSkuImageUrls(
+  sku: Pick<PageDetailSKU, "images" | "image_paths">,
+  fallbackImageUrl: (imageId: string) => string,
+) {
+  const urls: string[] = [];
+
+  for (const img of sku.images || []) {
+    const url = img.image_url || fallbackImageUrl(img.image_id);
+    if (url && !urls.includes(url)) {
+      urls.push(url);
+    }
+  }
+
+  for (const url of sku.image_paths || []) {
+    if (url && !urls.includes(url)) {
+      urls.push(url);
+    }
+  }
+
+  return urls;
+}
+
+function skuPrimaryText(sku: Pick<PageDetailSKU, "sku_id" | "attributes">) {
+  return (
+    sku.attributes?.product_name
+    || sku.attributes?.name
+    || sku.attributes?.model_number
+    || sku.attributes?.model
+    || sku.sku_id
+  );
+}
+
+function skuMetaRows(sku: Pick<PageDetailSKU, "attributes" | "import_confirmation">) {
+  return [
+    { label: "型号", value: sku.attributes?.model_number || sku.attributes?.model || "—" },
+    { label: "名称", value: sku.attributes?.product_name || sku.attributes?.name || "—" },
+    { label: "价格", value: sku.attributes?.price || "—" },
+    { label: "导入", value: sku.import_confirmation || "—" },
+  ];
+}
 
 export default function JobDetailPage() {
   const { jobId } = useParams<{ jobId: string }>();
@@ -56,6 +98,8 @@ export default function JobDetailPage() {
     `${apiBase}/jobs/${jobId}/pages/${pageNo}/screenshot`;
   const imageUrl = (imageId: string) =>
     jobsApi.getImageUrl(jobId!, imageId);
+  const resolveImageUrl = (img: { image_id: string; image_url?: string }) =>
+    img.image_url || imageUrl(img.image_id);
 
   const toggleExpand = async (pageNo: number) => {
     if (expandedPage === pageNo) {
@@ -64,6 +108,7 @@ export default function JobDetailPage() {
       return;
     }
     setExpandedPage(pageNo);
+    setPageDetail(null);
     try {
       const detail = await jobsApi.getPageDetail(jobId!, pageNo);
       setPageDetail(detail);
@@ -181,31 +226,47 @@ export default function JobDetailPage() {
                           <h4 style={{ margin: "0 0 8px", fontSize: 13, color: "#94A3B8" }}>
                             页面 SKU ({pageDetail?.skus.length ?? 0})
                           </h4>
-                          {pageDetail?.skus.map((sku) => (
-                            <div key={sku.sku_id} style={{ marginBottom: 10, padding: 8, backgroundColor: "#1B2233", borderRadius: 6, border: "1px solid #2D3548" }}>
-                              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
-                                <span style={{ color: "#E2E8F4" }}>{sku.attributes?.model || sku.attributes?.name || sku.sku_id}</span>
-                                <span style={{ color: "#64748B" }}>{sku.validity}</span>
-                              </div>
-                              {sku.images.length > 0 && (
-                                <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                                  {sku.images.slice(0, 3).map((img) => (
-                                    <img
-                                      key={img.image_id}
-                                      src={imageUrl(img.image_id)}
-                                      style={{ width: 48, height: 48, objectFit: "cover", borderRadius: 3, border: "1px solid #2D3548", cursor: "pointer" }}
-                                      onClick={(e) => { e.stopPropagation(); setLightboxImg(imageUrl(img.image_id)); }}
-                                    />
-                                  ))}
-                                  {sku.images.length > 3 && (
-                                    <span style={{ display: "flex", alignItems: "center", fontSize: 11, color: "#64748B" }}>
-                                      +{sku.images.length - 3}
-                                    </span>
-                                  )}
+                          {pageDetail?.skus.map((sku) => {
+                            const skuImages = buildSkuImageUrls(sku, imageUrl);
+                            return (
+                              <div key={sku.sku_id} style={{ marginBottom: 10, padding: 10, backgroundColor: "#1B2233", borderRadius: 6, border: "1px solid #2D3548" }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", gap: 12, fontSize: 12, marginBottom: 8 }}>
+                                  <span style={{ color: "#E2E8F4", fontWeight: 600 }}>{skuPrimaryText(sku)}</span>
+                                  <span style={{ color: "#64748B", flexShrink: 0 }}>{sku.validity}</span>
                                 </div>
-                              )}
-                            </div>
-                          ))}
+                                <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "4px 12px", marginBottom: 8, fontSize: 12 }}>
+                                  {skuMetaRows(sku).map((item) => (
+                                    <div key={`${sku.sku_id}-${item.label}`} style={{ display: "flex", gap: 6, minWidth: 0 }}>
+                                      <span style={{ color: "#64748B", flexShrink: 0 }}>{item.label}</span>
+                                      <span style={{ color: "#CBD5E1", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.value}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                                {skuImages.length > 0 ? (
+                                  <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                                    {skuImages.slice(0, 4).map((url) => (
+                                      <img
+                                        key={url}
+                                        src={url}
+                                        style={{ width: 56, height: 56, objectFit: "cover", borderRadius: 3, border: "1px solid #2D3548", cursor: "pointer" }}
+                                        onClick={(e) => { e.stopPropagation(); setLightboxImg(url); }}
+                                      />
+                                    ))}
+                                    {skuImages.length > 4 && (
+                                      <span style={{ display: "flex", alignItems: "center", fontSize: 11, color: "#64748B" }}>
+                                        +{skuImages.length - 4}
+                                      </span>
+                                    )}
+                                  </div>
+                                ) : (
+                                  <span style={{ fontSize: 11, color: "#64748B" }}>无关联图片</span>
+                                )}
+                              </div>
+                            );
+                          })}
+                          {pageDetail && pageDetail.skus.length === 0 && (
+                            <span style={{ fontSize: 12, color: "#64748B" }}>该页暂无 SKU 数据</span>
+                          )}
                           {pageDetail?.images && pageDetail.images.length > 0 && (
                             <>
                               <h4 style={{ margin: "12px 0 8px", fontSize: 13, color: "#94A3B8" }}>
@@ -215,9 +276,9 @@ export default function JobDetailPage() {
                                 {pageDetail.images.map((img) => (
                                   <img
                                     key={img.image_id}
-                                    src={imageUrl(img.image_id)}
+                                    src={resolveImageUrl(img)}
                                     style={{ width: 48, height: 48, objectFit: "cover", borderRadius: 3, border: "1px solid #2D3548", cursor: "pointer" }}
-                                    onClick={() => setLightboxImg(imageUrl(img.image_id))}
+                                    onClick={() => setLightboxImg(resolveImageUrl(img))}
                                   />
                                 ))}
                               </div>

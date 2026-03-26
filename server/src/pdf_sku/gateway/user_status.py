@@ -101,10 +101,15 @@ async def refresh_job_page_stats(db: AsyncSession, job_id: str) -> PDFJob:
     )
 
     # SKU 总数
-    from pdf_sku.common.models import SKU
+    from pdf_sku.common.models import SKU, Image
     sku_count_result = await db.execute(
         select(func.count()).where(SKU.job_id == job_id, SKU.superseded == False)
     )
     job.total_skus = sku_count_result.scalar() or 0
+
+    image_count_result = await db.execute(
+        select(func.count()).where(Image.job_id == job_id, Image.is_duplicate == False)
+    )
+    job.total_images = image_count_result.scalar() or 0
 
     return job

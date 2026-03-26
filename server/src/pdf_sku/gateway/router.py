@@ -64,6 +64,59 @@ def get_sse_manager():
     return sse_manager
 
 
+def _job_image_url(job_id: uuid.UUID | str, image_id: str) -> str:
+    return f"/api/v1/jobs/{job_id}/images/{image_id}"
+
+
+async def _build_sku_image_maps(
+    db: AsyncSession,
+    job_id: uuid.UUID,
+    sku_ids: list[str],
+) -> tuple[dict[str, list[dict]], dict[str, list[str]]]:
+    bindings_map: dict[str, list[dict]] = {sid: [] for sid in sku_ids}
+    image_paths_map: dict[str, list[str]] = {sid: [] for sid in sku_ids}
+    if not sku_ids:
+        return bindings_map, image_paths_map
+
+    binding_rows = list((await db.execute(
+        select(SKUImageBinding).where(
+            SKUImageBinding.job_id == job_id,
+            SKUImageBinding.sku_id.in_(sku_ids),
+        )
+    )).scalars().all())
+
+    image_ids = sorted({b.image_id for b in binding_rows if b.image_id})
+    image_map: dict[str, Image] = {}
+    if image_ids:
+        image_map = {
+            img.image_id: img
+            for img in (await db.execute(
+                select(Image).where(
+                    Image.job_id == job_id,
+                    Image.image_id.in_(image_ids),
+                )
+            )).scalars().all()
+        }
+
+    for binding in binding_rows:
+        if binding.sku_id not in bindings_map:
+            continue
+        image_url = _job_image_url(job_id, binding.image_id)
+        image_obj = image_map.get(binding.image_id)
+        bindings_map[binding.sku_id].append({
+            "image_id": binding.image_id,
+            "method": binding.binding_method,
+            "confidence": binding.binding_confidence,
+            "rank": binding.rank,
+            "image_url": image_url,
+            "extracted_path": image_obj.extracted_path if image_obj else None,
+        })
+        if image_url not in image_paths_map[binding.sku_id]:
+            image_paths_map[binding.sku_id].append(image_url)
+
+    return bindings_map, image_paths_map
+
+
 # ───────────────────────── TUS 端点 ─────────────────────────
 
 @router.post("/uploads", status_code=201)
@@ -552,24 +605,8 @@ async def get_page_detail(
     )
     page_images = images_result.scalars().all()
 
-    # Build SKU → images map via bindings
     sku_ids = [s.sku_id for s in page_skus]
-    bindings_map: dict[str, list] = {sid: [] for sid in sku_ids}
-    if sku_ids:
-        bindings_result = await db.execute(
-            select(SKUImageBinding).where(
-                SKUImageBinding.job_id == job_id,
-                SKUImageBinding.sku_id.in_(sku_ids),
-            )
-        )
-        for b in bindings_result.scalars().all():
-            if b.sku_id in bindings_map:
-                bindings_map[b.sku_id].append({
-                    "image_id": b.image_id,
-                    "method": b.binding_method,
-                    "confidence": b.binding_confidence,
-                    "rank": b.rank,
-                })
+    bindings_map, image_paths_map = await _build_sku_image_maps(db, job_id, sku_ids)
 
     return {
         "page": _page_to_dict(pg),
@@ -580,12 +617,14 @@ async def get_page_detail(
             "import_confirmation": s.import_confirmation,
             "source_bbox": s.source_bbox,
             "images": bindings_map.get(s.sku_id, []),
+            "image_paths": image_paths_map.get(s.sku_id, []),
         } for s in page_skus],
         "images": [{
             "image_id": img.image_id,
             "role": img.role,
             "bbox": img.bbox,
             "extracted_path": img.extracted_path,
+            "image_url": _job_image_url(job_id, img.image_id),
             "resolution": img.resolution,
             "short_edge": img.short_edge,
             "search_eligible": img.search_eligible,
@@ -621,24 +660,8 @@ async def get_skus(
         .limit(page_size)
     )).scalars().all()
 
-    # Fetch bindings for all returned SKUs
     sku_ids = [s.sku_id for s in skus]
-    bindings_map: dict[str, list] = {sid: [] for sid in sku_ids}
-    if sku_ids:
-        bindings_result = await db.execute(
-            select(SKUImageBinding).where(
-                SKUImageBinding.job_id == job_id,
-                SKUImageBinding.sku_id.in_(sku_ids),
-            )
-        )
-        for b in bindings_result.scalars().all():
-            if b.sku_id in bindings_map:
-                bindings_map[b.sku_id].append({
-                    "image_id": b.image_id,
-                    "method": b.binding_method,
-                    "confidence": b.binding_confidence,
-                    "rank": b.rank,
-                })
+    bindings_map, image_paths_map = await _build_sku_image_maps(db, job_id, sku_ids)
 
     return {
         "data": [{
@@ -648,6 +671,7 @@ async def get_skus(
             "import_confirmation": s.import_confirmation,
             "source_bbox": s.source_bbox,
             "images": bindings_map.get(s.sku_id, []),
+            "image_paths": image_paths_map.get(s.sku_id, []),
         } for s in skus],
         "pagination": {"page": page, "page_size": page_size,
                         "total_count": count, "total_pages": (count + page_size - 1) // page_size},

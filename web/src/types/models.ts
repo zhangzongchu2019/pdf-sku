@@ -64,11 +64,14 @@ export interface Page {
   page_number: number;
   status: PageStatus;
   page_type?: PageType;
+  fitz_page_class?: string;
   layout_type?: LayoutType;
   needs_review: boolean;
   sku_count: number;
   page_confidence?: number;
   extraction_method?: string;
+  slice_count?: number;
+  error_message?: string | null;
   llm_model_used?: string;
   parse_time_ms?: number;
   llm_time_ms?: number;
@@ -117,12 +120,13 @@ export interface SKU {
   attributes: Record<string, string>;
   custom_attributes: { key: string; value: string }[];
   confidence?: number;
+  extraction_method?: string;
   source_bbox?: number[];
-  import_status: string;
   import_confirmation: "confirmed" | "assumed" | "failed" | "pending";
   attribute_source: "AI_EXTRACTED" | "HUMAN_CORRECTED" | "CROSS_PAGE_MERGED" | "PROMOTED";
   status: SKUStatus;
   images: SKUImage[];
+  image_paths?: string[];
 }
 
 /* ======== Task ======== */

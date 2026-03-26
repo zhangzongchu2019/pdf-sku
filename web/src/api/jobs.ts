@@ -6,6 +6,8 @@ export interface SKUBindingImage {
   method: string;
   confidence: number;
   rank: number;
+  image_url?: string;
+  extracted_path?: string;
 }
 
 export interface PageDetailSKU {
@@ -16,7 +18,10 @@ export interface PageDetailSKU {
   validity: string;
   attribute_source: string;
   import_confirmation: string;
+  confidence?: number;
+  extraction_method?: string;
   source_bbox: number[] | null;
+  image_paths?: string[];
   images: SKUBindingImage[];
 }
 
@@ -25,6 +30,7 @@ export interface PageDetailImage {
   role: string;
   bbox: number[] | null;
   extracted_path: string;
+  image_url?: string;
   resolution: number[] | null;
   short_edge: number;
   search_eligible: boolean;
