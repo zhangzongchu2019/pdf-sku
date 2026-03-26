@@ -84,6 +84,7 @@ class Settings(BaseSettings):
     benchmark_image_dir: str = "/data/benchmark_images"
 
     # === Layout Detection & OCR ===
+    local_model_device: str = "auto"  # auto | cpu | cuda | cuda:N | mps
     layout_detect_enabled: bool = True
     doclayout_model_path: str = ""
     layout_detect_confidence: float = 0.25

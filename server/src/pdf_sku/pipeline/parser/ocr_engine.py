@@ -6,13 +6,14 @@ OCR 引擎 — 基于 RapidOCR (PaddleOCR ONNX 轻量封装)。
 """
 from __future__ import annotations
 
-import os
 import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 import structlog
+
+from pdf_sku.common.local_model_device import prepare_local_model_environment
 
 
 _nvidia_preloaded = False
@@ -83,22 +84,43 @@ class _OcrHolder:
             if self._loaded:
                 return
             self._loaded = True
-            _ensure_nvidia_libs()
+            device = prepare_local_model_environment()
+            if device.ocr_use_cuda:
+                _ensure_nvidia_libs()
             try:
                 from rapidocr_onnxruntime import RapidOCR
-                # 尝试 GPU 加速，失败则回退 CPU
-                try:
-                    self.engine = RapidOCR(
-                        det_use_cuda=True,
-                        rec_use_cuda=True,
-                        cls_use_cuda=True,
+                if device.requested == "mps":
+                    logger.warning(
+                        "ocr_device_unsupported",
+                        requested_device=device.requested,
+                        fallback_device="cpu",
                     )
+
+                rapidocr_kwargs = {}
+                if device.ocr_use_cuda:
+                    rapidocr_kwargs = {
+                        "det_use_cuda": True,
+                        "rec_use_cuda": True,
+                        "cls_use_cuda": True,
+                    }
+
+                try:
+                    self.engine = RapidOCR(**rapidocr_kwargs)
                     self.available = True
-                    logger.info("ocr_engine_loaded", backend="rapidocr_onnxruntime", gpu=True)
+                    logger.info(
+                        "ocr_engine_loaded",
+                        backend="rapidocr_onnxruntime",
+                        requested_device=device.requested,
+                        runtime_device="cuda" if device.ocr_use_cuda else "cpu",
+                    )
                 except Exception:
                     self.engine = RapidOCR()
                     self.available = True
-                    logger.info("ocr_engine_loaded", backend="rapidocr_onnxruntime", gpu=False)
+                    logger.warning(
+                        "ocr_engine_device_fallback",
+                        requested_device=device.requested,
+                        fallback_device="cpu",
+                    )
             except ImportError:
                 logger.warning("ocr_engine_skip", reason="rapidocr-onnxruntime not installed")
             except Exception as exc:

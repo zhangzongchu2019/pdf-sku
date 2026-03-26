@@ -14,7 +14,9 @@ from pathlib import Path
 
 import structlog
 
+from pdf_sku.common.local_model_device import prepare_local_model_environment
 from pdf_sku.pipeline.ir import ImageInfo, PageMetadata
+from pdf_sku.settings import settings
 
 logger = structlog.get_logger()
 
@@ -42,6 +44,7 @@ class _ModelHolder:
         self.model = None
         self.available = False
         self._loaded = False
+        self.predict_device: str | None = None
 
     @classmethod
     def get(cls) -> _ModelHolder:
@@ -58,30 +61,54 @@ class _ModelHolder:
             if self._loaded:
                 return
             self._loaded = True
+            device = prepare_local_model_environment()
             try:
                 from doclayout_yolo import YOLOv10
             except ImportError:
                 logger.info("layout_detect_skip", reason="doclayout_yolo not installed")
                 return
 
-            model_path = str(
-                Path(__file__).resolve().parents[2] / "models" / "doclayout_yolo.pt"
-            )
-            if not Path(model_path).is_file():
-                # 也尝试 server/models/
-                model_path = str(
-                    Path(__file__).resolve().parents[3] / "models" / "doclayout_yolo.pt"
-                )
-            if not Path(model_path).is_file():
-                logger.info("layout_detect_skip", reason="model not found", path=model_path)
+            model_path = _resolve_model_path()
+            if model_path is None:
                 return
 
             try:
                 self.model = YOLOv10(model_path)
+                self.predict_device = device.layout_device
                 self.available = True
-                logger.info("layout_detect_model_loaded", path=model_path)
+                logger.info(
+                    "layout_detect_model_loaded",
+                    path=model_path,
+                    requested_device=device.requested,
+                    runtime_device=device.layout_device or "auto",
+                )
             except Exception as exc:
                 logger.warning("layout_detect_load_failed", error=str(exc))
+
+
+def _resolve_model_path() -> str | None:
+    configured_path = settings.doclayout_model_path.strip()
+    candidates: list[Path] = []
+    if configured_path:
+        candidates.append(Path(configured_path).expanduser())
+
+    candidates.extend(
+        [
+            Path(__file__).resolve().parents[2] / "models" / "doclayout_yolo.pt",
+            Path(__file__).resolve().parents[3] / "models" / "doclayout_yolo.pt",
+        ]
+    )
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+
+    logger.info(
+        "layout_detect_skip",
+        reason="model not found",
+        path=str(candidates[0]) if candidates else configured_path,
+    )
+    return None
 
 
 def _remove_containing_boxes(
@@ -133,7 +160,13 @@ def detect_figures_on_image(image_data: bytes) -> list[tuple[float, float, float
     from PIL import Image as PILImage
 
     pil_img = PILImage.open(io.BytesIO(image_data))
-    results = holder.model.predict(pil_img, conf=0.25, verbose=False)
+    predict_kwargs = {
+        "conf": settings.layout_detect_confidence,
+        "verbose": False,
+    }
+    if holder.predict_device:
+        predict_kwargs["device"] = holder.predict_device
+    results = holder.model.predict(pil_img, **predict_kwargs)
     if not results:
         return []
 
@@ -168,7 +201,14 @@ def detect_all_regions(image_data: bytes) -> list[LayoutRegion]:
     from PIL import Image as PILImage
 
     pil_img = PILImage.open(io.BytesIO(image_data))
-    results = holder.model.predict(pil_img, conf=0.20, verbose=False)
+    predict_kwargs = {
+        # 保持原先的 region 检测召回，不让 figure 阈值配置影响 text/table 检测。
+        "conf": 0.20,
+        "verbose": False,
+    }
+    if holder.predict_device:
+        predict_kwargs["device"] = holder.predict_device
+    results = holder.model.predict(pil_img, **predict_kwargs)
     if not results:
         return []
 
