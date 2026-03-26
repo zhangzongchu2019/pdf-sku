@@ -8,6 +8,7 @@ import StatusBadge from "../components/common/StatusBadge";
 import Pagination from "../components/common/Pagination";
 import Loading from "../components/common/Loading";
 import EmptyState from "../components/common/EmptyState";
+import EditableSkuGrid from "../components/tasks/EditableSkuGrid";
 import { formatDate } from "../utils/format";
 import type { HumanTask } from "../types/models";
 
@@ -154,7 +155,7 @@ export default function TaskListPage() {
                   />
                 </th>
                 <th>Task ID</th><th>Job ID</th><th>页码</th><th>类型</th>
-                <th>状态</th><th>优先级</th><th>分配</th><th>超时</th><th>创建</th><th>操作</th>
+                <th>SKU 信息</th><th>状态</th><th>优先级</th><th>分配</th><th>超时</th><th>创建</th><th>操作</th>
               </tr>
             </thead>
             <tbody>
@@ -171,6 +172,9 @@ export default function TaskListPage() {
                   <td className="td-mono">{t.job_id.slice(0, 8)}...</td>
                   <td>{t.page_number}</td>
                   <td>{t.task_type}</td>
+                  <td className="task-sku-cell">
+                    <EditableSkuGrid task={t} />
+                  </td>
                   <td><StatusBadge status={t.status} /></td>
                   <td><span className={`priority priority-${t.priority.toLowerCase()}`}>{t.priority}</span></td>
                   <td>{t.assigned_to || "-"}</td>

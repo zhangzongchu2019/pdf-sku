@@ -48,27 +48,46 @@ class ReconciliationPoller:
         result = await db.execute(
             select(Page).where(Page.import_confirmation == "imported_assumed")
         )
-        assumed_pages = result.scalars().all()
+        assumed_pages = [
+            {
+                "id": page.id,
+                "job_id": str(page.job_id),
+                "page_number": page.page_number,
+                "claimed_at": page.claimed_at,
+            }
+            for page in result.scalars().all()
+        ]
         now = datetime.now(timezone.utc)
+        pending_confirmation_updates: list[int] = []
+        auto_confirmation_updates: list[int] = []
+
+        # 读取完候选页后先结束读事务，避免在外部 HTTP 对账期间占用连接。
+        await db.rollback()
 
         for page in assumed_pages:
             confirmed = await self._adapter.check_status(
-                str(page.job_id), page.page_number)
+                page["job_id"], page["page_number"])
             if confirmed is True:
-                await db.execute(
-                    update(Page).where(Page.id == page.id)
-                    .values(import_confirmation="imported_confirmed")
-                )
-                stats["confirmed"] += 1
+                pending_confirmation_updates.append(page["id"])
             elif confirmed is None:
                 # I5 降级: 超 24h 自动确认
-                age = (now - (page.claimed_at or now)).total_seconds()
+                age = (now - (page["claimed_at"] or now)).total_seconds()
                 if age > ASSUMED_AUTO_CONFIRM_SEC:
-                    await db.execute(
-                        update(Page).where(Page.id == page.id)
-                        .values(import_confirmation="imported_confirmed")
-                    )
-                    stats["auto_confirmed"] += 1
+                    auto_confirmation_updates.append(page["id"])
+
+        for page_id in pending_confirmation_updates:
+            await db.execute(
+                update(Page).where(Page.id == page_id)
+                .values(import_confirmation="imported_confirmed")
+            )
+            stats["confirmed"] += 1
+
+        for page_id in auto_confirmation_updates:
+            await db.execute(
+                update(Page).where(Page.id == page_id)
+                .values(import_confirmation="imported_confirmed")
+            )
+            stats["auto_confirmed"] += 1
 
         # 2. IMPORT_FAILED 滞留 → 标记
         cutoff = now - timedelta(seconds=FAILED_STALE_THRESHOLD)
@@ -97,7 +116,7 @@ class ReconciliationPoller:
         """检查活跃 Job 是否可以标记为 FULL_IMPORTED。"""
         result = await db.execute(
             select(PDFJob).where(
-                PDFJob.internal_status.in_([
+                PDFJob.status.in_([
                     JobInternalStatus.PROCESSING.value,
                     JobInternalStatus.PARTIAL_FAILED.value,
                 ])
@@ -133,20 +152,21 @@ class ReconciliationPoller:
             elif failed > 0 and done == 0:
                 continue  # 全失败, 保持 PARTIAL_FAILED
             elif done >= total_valid and total_valid > 0:
-                # 条件 UPDATE (并发保护)
-                r = await db.execute(
-                    update(PDFJob).where(
-                        PDFJob.job_id == job.job_id,
-                        PDFJob.internal_status != JobInternalStatus.FULL_IMPORTED.value,
-                    ).values(
-                        internal_status=JobInternalStatus.FULL_IMPORTED.value,
-                        completion_snapshot=self._build_snapshot(status_counts, job),
-                    )
+                if job.status == JobInternalStatus.FULL_IMPORTED.value:
+                    continue
+
+                updated_job = await update_job_status(
+                    db,
+                    str(job.job_id),
+                    JobInternalStatus.FULL_IMPORTED.value,
+                    trigger="reconcile_finalize",
                 )
-                if r.rowcount > 0:
-                    finalized += 1
-                    logger.info("job_finalized",
-                                job_id=str(job.job_id), status="FULL_IMPORTED")
+                trace = dict(updated_job.processing_trace or {})
+                trace["completion_snapshot"] = self._build_snapshot(status_counts, job)
+                updated_job.processing_trace = trace
+                finalized += 1
+                logger.info("job_finalized",
+                            job_id=str(job.job_id), status="FULL_IMPORTED")
 
         return finalized
 

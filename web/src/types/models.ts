@@ -147,6 +147,8 @@ export interface HumanTask {
   rework_count: number;
   created_at: string;
   completed_at?: string | null;
+  context?: Record<string, unknown> | null;
+  result?: Record<string, unknown> | null;
 }
 
 export interface TaskDetail extends HumanTask {

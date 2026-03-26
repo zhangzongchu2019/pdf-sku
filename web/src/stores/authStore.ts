@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { persist } from "zustand/middleware";
+import { createJSONStorage, persist } from "zustand/middleware";
 
 interface AuthState {
   userId: string;
@@ -10,6 +10,7 @@ interface AuthState {
   token: string | null;
   merchantId: string | null;
   isLoggedIn: boolean;
+  hydrated: boolean;
   setAuth: (auth: {
     userId: string;
     username: string;
@@ -18,6 +19,7 @@ interface AuthState {
     token: string;
     merchantId?: string | null;
   }) => void;
+  setHydrated: (hydrated: boolean) => void;
   logout: () => void;
 }
 
@@ -32,6 +34,7 @@ export const useAuthStore = create<AuthState>()(
       token: null,
       merchantId: null,
       isLoggedIn: false,
+      hydrated: false,
       setAuth: (auth) =>
         set({
           userId: auth.userId,
@@ -43,6 +46,7 @@ export const useAuthStore = create<AuthState>()(
           merchantId: auth.merchantId ?? null,
           isLoggedIn: true,
         }),
+      setHydrated: (hydrated) => set({ hydrated }),
       logout: () =>
         set({
           userId: "",
@@ -57,13 +61,19 @@ export const useAuthStore = create<AuthState>()(
     }),
     {
       name: "pdf-sku-auth",
-      storage: {
-        getItem: (k) => {
-          const v = localStorage.getItem(k);
-          return v ? JSON.parse(v) : null;
-        },
-        setItem: (k, v) => localStorage.setItem(k, JSON.stringify(v)),
-        removeItem: (k) => localStorage.removeItem(k),
+      storage: createJSONStorage(() => localStorage),
+      partialize: (state) => ({
+        userId: state.userId,
+        username: state.username,
+        displayName: state.displayName,
+        role: state.role,
+        annotatorId: state.annotatorId,
+        token: state.token,
+        merchantId: state.merchantId,
+        isLoggedIn: state.isLoggedIn,
+      }),
+      onRehydrateStorage: () => (state) => {
+        state?.setHydrated(true);
       },
     },
   ),

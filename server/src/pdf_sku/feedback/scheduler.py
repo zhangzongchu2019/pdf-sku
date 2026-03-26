@@ -96,8 +96,8 @@ class ScheduledTaskRunner:
                 await asyncio.sleep(1800)
                 if self._reconciler and self._db_factory:
                     async with self._db_factory() as db:
-                        async with db.begin():
-                            await self._reconciler.reconcile(db)
+                        await self._reconciler.reconcile(db)
+                        await db.commit()
             except asyncio.CancelledError:
                 break
             except Exception as e:

@@ -105,6 +105,9 @@ class EvaluatorService:
         thresholds = profile.get("thresholds", {"A": 0.85, "B": 0.45})
         weights = profile.get("confidence_weights")
 
+        # 配置读取完成后尽早释放连接，避免后续截图渲染 / LLM 调用长时间占用连接池。
+        await db.commit()
+
         # [P0-5] Prescan Guard: all_blank 直接降级
         if prescan_data.get("blank_rate", 0) == 1.0 or prescan_data.get("all_blank"):
             return await self._create_degraded(

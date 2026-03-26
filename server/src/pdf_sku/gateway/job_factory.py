@@ -87,6 +87,9 @@ class JobFactory:
             raise FileHashDuplicateError(
                 f"Duplicate file detected for merchant {merchant_id}")
 
+        # duplicate check 完成后先释放连接，避免后续 prescan / 文件移动期间占用连接。
+        await db.rollback()
+
         # === Step 4: 冻结配置版本 ===
         config_version = "default"  # 初始默认, 运行时由 ConfigProvider 返回活跃版本
 

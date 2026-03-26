@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://pdfsku:pdfsku@localhost:5432/pdfsku"
     db_pool_size: int = 10
     db_max_overflow: int = 20
+    db_pool_timeout: int = 30
+    db_pool_pre_ping: bool = True
     sql_echo: bool = False
 
     @property
@@ -26,6 +28,25 @@ class Settings(BaseSettings):
     @property
     def database_max_overflow(self) -> int:
         return self.db_max_overflow
+
+    @property
+    def database_pool_timeout(self) -> int:
+        return self.db_pool_timeout
+
+    @property
+    def database_pool_pre_ping(self) -> bool:
+        return self.db_pool_pre_ping
+
+    # === Workload control ===
+    process_pool_workers: int = max(2, min(4, os.cpu_count() or 2))
+    evaluation_job_concurrency: int = 2
+    evaluation_queue_size: int = 100
+    pipeline_job_concurrency: int = 2
+    pipeline_queue_size: int = 100
+    pipeline_page_concurrency: int = 3
+    global_page_concurrency: int = 8
+    output_job_concurrency: int = 2
+    output_queue_size: int = 200
 
     # === Redis ===
     redis_url: str = "redis://localhost:6379/0"

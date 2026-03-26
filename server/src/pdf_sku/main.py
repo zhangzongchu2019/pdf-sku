@@ -212,6 +212,8 @@ async def lifespan(app: FastAPI):
             settings.database_url,
             pool_size=settings.db_pool_size,
             max_overflow=settings.db_max_overflow,
+            pool_timeout=settings.db_pool_timeout,
+            pool_pre_ping=settings.db_pool_pre_ping,
             echo=settings.sql_echo,
         )
         # Test connection
@@ -250,7 +252,7 @@ async def lifespan(app: FastAPI):
         log.error("minio_connection_failed", error=str(e))
         app.state.storage = None
 
-    process_pool = ProcessPoolExecutor(max_workers=2)
+    process_pool = ProcessPoolExecutor(max_workers=settings.process_pool_workers)
     bg_tasks: list[asyncio.Task] = []
 
     # ─── 4. Component assembly (only if DB + Redis ready) ───

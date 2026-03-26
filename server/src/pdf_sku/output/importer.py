@@ -57,6 +57,22 @@ class IncrementalImporter:
         if not valid_skus:
             return True  # 无 valid SKU, 视为成功
 
+        dedup_pairs = [
+            (sku, f"{job_id}:{page_number}:{sku.sku_id}:{attempt_no}")
+            for sku in valid_skus
+        ]
+        existing_dedup_keys: set[str] = set()
+        if dedup_pairs:
+            dedup_result = await db.execute(
+                select(ImportDedup.dedup_key).where(
+                    ImportDedup.dedup_key.in_([dedup_key for _, dedup_key in dedup_pairs])
+                )
+            )
+            existing_dedup_keys = set(dedup_result.scalars().all())
+
+        # 结束读事务，避免在后续 HTTP / 退避等待期间持续占用连接。
+        await db.rollback()
+
         # [P1-O2] 背压检查
         if self._bp.is_throttled(job_id):
             logger.warning("import_throttled",
@@ -65,11 +81,10 @@ class IncrementalImporter:
             await asyncio.sleep(self._bp.delay_seconds)
 
         success_count = 0
-        for sku in valid_skus:
-            # [C3] 幂等去重检查
-            dedup_key = f"{job_id}:{page_number}:{sku.sku_id}:{attempt_no}"
-            is_dup = await self._check_dedup(db, dedup_key)
-            if is_dup:
+        dedup_records: list[tuple[str, str]] = []
+        fatal_error: Exception | None = None
+        for sku, dedup_key in dedup_pairs:
+            if dedup_key in existing_dedup_keys:
                 logger.debug("import_dedup_skip", dedup_key=dedup_key)
                 success_count += 1
                 continue
@@ -80,9 +95,9 @@ class IncrementalImporter:
                     payload, revision=attempt_no)
 
                 # 记录去重
-                await self._record_dedup(
-                    db, dedup_key, UUID(job_id), page_number,
-                    "CONFIRMED" if import_result.confirmed else "ASSUMED")
+                dedup_records.append(
+                    (dedup_key, "CONFIRMED" if import_result.confirmed else "ASSUMED")
+                )
                 success_count += 1
                 self._bp.on_success(job_id)
 
@@ -90,25 +105,32 @@ class IncrementalImporter:
                 logger.error("import_data_error",
                              sku_id=sku.sku_id, error=str(e))
                 self._bp.on_failure(job_id)
-                await self._record_dedup(
-                    db, dedup_key, UUID(job_id), page_number, "FAILED")
+                dedup_records.append((dedup_key, "FAILED"))
 
             except Exception as e:
                 logger.error("import_failed",
                              sku_id=sku.sku_id, error=str(e))
                 self._bp.on_failure(job_id)
-                raise  # 上层重试
+                fatal_error = e
+                break
 
-        # 更新 Page 状态
-        if success_count == len(valid_skus):
-            await db.execute(
-                update(Page).where(
-                    Page.job_id == UUID(job_id),
-                    Page.page_number == page_number,
-                ).values(import_confirmation="imported_assumed")
-            )
-            return True
-        return False
+        if dedup_records or success_count == len(valid_skus):
+            async with db.begin():
+                for dedup_key, status in dedup_records:
+                    await self._record_dedup(
+                        db, dedup_key, UUID(job_id), page_number, status)
+
+                if success_count == len(valid_skus):
+                    await db.execute(
+                        update(Page).where(
+                            Page.job_id == UUID(job_id),
+                            Page.page_number == page_number,
+                        ).values(import_confirmation="imported_assumed")
+                    )
+
+        if fatal_error is not None:
+            raise fatal_error
+        return success_count == len(valid_skus)
 
     async def on_cross_page_correction(
         self,
@@ -127,11 +149,19 @@ class IncrementalImporter:
                 SKU.validity == "valid",
             )
         )
-        skus = result.scalars().all()
+        sku_snapshots = [
+            {
+                "sku_id": sku_orm.sku_id,
+                "attributes": dict(sku_orm.attributes or {}),
+                "revision": sku_orm.revision or 1,
+            }
+            for sku_orm in result.scalars().all()
+        ]
+        await db.rollback()
         upserted = 0
 
-        for sku_orm in skus:
-            attrs = sku_orm.attributes or {}
+        for sku_snapshot in sku_snapshots:
+            attrs = dict(sku_snapshot["attributes"])
             needs_update = False
             for key, new_val in corrected_attrs.items():
                 if attrs.get(key) != new_val:
@@ -140,16 +170,16 @@ class IncrementalImporter:
 
             if needs_update:
                 payload = {
-                    "sku_id": sku_orm.sku_id,
+                    "sku_id": sku_snapshot["sku_id"],
                     "attributes": attrs,
                 }
                 try:
                     await self._adapter.upsert_sku(
-                        payload, revision=(sku_orm.revision or 1) + 1)
+                        payload, revision=sku_snapshot["revision"] + 1)
                     upserted += 1
                 except Exception as e:
                     logger.error("upsert_failed",
-                                 sku_id=sku_orm.sku_id, error=str(e))
+                                 sku_id=sku_snapshot["sku_id"], error=str(e))
 
         logger.info("cross_page_correction",
                      job_id=job_id, upserted=upserted)

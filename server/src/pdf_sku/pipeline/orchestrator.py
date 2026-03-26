@@ -25,6 +25,7 @@ from pdf_sku.gateway.user_status import update_job_status, refresh_job_page_stat
 from pdf_sku.pipeline.ir import PageResult, SKUResult
 from pdf_sku.pipeline.page_processor import PageProcessor
 from pdf_sku.pipeline.catalog_profiler import scan_catalog, CatalogProfile
+from pdf_sku.settings import settings
 from pdf_sku.pipeline.extractor.sku_dedup import (
     cross_page_dedup,
     dedup_by_model_variant,
@@ -34,7 +35,12 @@ import structlog
 
 logger = structlog.get_logger()
 
-PIPELINE_CONCURRENCY = int(os.environ.get("PIPELINE_CONCURRENCY", "5"))
+PIPELINE_CONCURRENCY = int(
+    os.environ.get("PIPELINE_CONCURRENCY", str(settings.pipeline_page_concurrency))
+)
+GLOBAL_PAGE_CONCURRENCY = int(
+    os.environ.get("GLOBAL_PAGE_CONCURRENCY", str(settings.global_page_concurrency))
+)
 
 
 class Orchestrator:
@@ -48,6 +54,7 @@ class Orchestrator:
     ) -> None:
         self._pp = page_processor
         self._db_factory = db_session_factory
+        self._global_page_slots = asyncio.Semaphore(max(1, GLOBAL_PAGE_CONCURRENCY))
 
     async def process_job(
         self,
@@ -122,7 +129,7 @@ class Orchestrator:
         semaphore = asyncio.Semaphore(PIPELINE_CONCURRENCY)
 
         async def process_one(page_no: int):
-            async with semaphore:
+            async with semaphore, self._global_page_slots:
                 async with self._db_factory() as page_db:
                     result = await self._process_single_page(
                         page_db, job, page_no, file_path,

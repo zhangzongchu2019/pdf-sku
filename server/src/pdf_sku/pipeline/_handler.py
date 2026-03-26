@@ -14,6 +14,7 @@ from pdf_sku.common.enums import JobInternalStatus, HumanTaskType
 from pdf_sku.collaboration.annotation_service import TaskManager
 from pdf_sku.gateway.user_status import update_job_status, refresh_job_page_stats
 from pdf_sku.gateway.event_bus import event_bus
+from pdf_sku.settings import settings
 import structlog
 
 logger = structlog.get_logger()
@@ -21,29 +22,100 @@ logger = structlog.get_logger()
 _orchestrator = None
 _db_session_factory = None
 _task_manager: TaskManager | None = None
+_pipeline_queue: asyncio.Queue[tuple[str, dict]] | None = None
+_pipeline_worker_tasks: list[asyncio.Task] = []
 
 
 def init_handler(orchestrator, session_factory, task_manager: TaskManager | None = None) -> None:
     """初始化并注册事件监听。"""
-    global _orchestrator, _db_session_factory, _task_manager
+    global _orchestrator, _db_session_factory, _task_manager, _pipeline_queue, _pipeline_worker_tasks
     _orchestrator = orchestrator
     _db_session_factory = session_factory
     _task_manager = task_manager or TaskManager()
     event_bus.subscribe("EvaluationCompleted", _on_evaluation_completed)
+    if _pipeline_queue is None:
+        _pipeline_queue = asyncio.Queue(maxsize=settings.pipeline_queue_size)
+    if not _pipeline_worker_tasks:
+        try:
+            loop = asyncio.get_running_loop()
+            for idx in range(max(1, settings.pipeline_job_concurrency)):
+                _pipeline_worker_tasks.append(
+                    loop.create_task(_pipeline_worker(idx + 1))
+                )
+        except RuntimeError:
+            logger.warning("pipeline_workers_not_started_no_loop")
     logger.info("pipeline_handler_registered")
 
 
 async def _on_evaluation_completed(data: dict) -> None:
     """处理 EvaluationCompleted → 启动 Pipeline。"""
     job_id = data.get("job_id", "")
-    route = data.get("route", "HUMAN_ALL")
-
-    # HUMAN_ALL → 不走 Pipeline, 直接进人工
-    if route == "HUMAN_ALL":
-        asyncio.create_task(_run_human_all(job_id, data))
+    if not _pipeline_queue:
+        route = data.get("route", "HUMAN_ALL")
+        if route == "HUMAN_ALL":
+            asyncio.create_task(_run_human_all(job_id, data))
+            return
+        asyncio.create_task(_run_pipeline(job_id, data))
         return
 
-    asyncio.create_task(_run_pipeline(job_id, data))
+    _enqueue_pipeline(job_id, data)
+
+
+def _enqueue_pipeline(job_id: str, eval_data: dict) -> None:
+    """优先无阻塞入队；队列满时后台等待，避免卡住评估完成链路。"""
+    if not _pipeline_queue:
+        route = eval_data.get("route", "HUMAN_ALL")
+        if route == "HUMAN_ALL":
+            asyncio.create_task(_run_human_all(job_id, eval_data))
+        else:
+            asyncio.create_task(_run_pipeline(job_id, eval_data))
+        return
+
+    try:
+        _pipeline_queue.put_nowait((job_id, eval_data))
+        logger.info(
+            "pipeline_enqueued",
+            job_id=job_id,
+            route=eval_data.get("route"),
+            queue_size=_pipeline_queue.qsize(),
+        )
+    except asyncio.QueueFull:
+        logger.warning("pipeline_queue_full_waiting", job_id=job_id)
+        asyncio.create_task(_wait_enqueue_pipeline(job_id, eval_data))
+
+
+async def _wait_enqueue_pipeline(job_id: str, eval_data: dict) -> None:
+    if not _pipeline_queue:
+        return
+    await _pipeline_queue.put((job_id, eval_data))
+    logger.info(
+        "pipeline_enqueued_delayed",
+        job_id=job_id,
+        route=eval_data.get("route"),
+        queue_size=_pipeline_queue.qsize(),
+    )
+
+
+async def _pipeline_worker(worker_no: int) -> None:
+    """有界 worker 池，避免大量 job 同时进入 Pipeline。"""
+    if not _pipeline_queue:
+        return
+
+    logger.info("pipeline_worker_started", worker_no=worker_no)
+    while True:
+        job_id, eval_data = await _pipeline_queue.get()
+        try:
+            route = eval_data.get("route", "HUMAN_ALL")
+            if route == "HUMAN_ALL":
+                await _run_human_all(job_id, eval_data)
+            else:
+                await _run_pipeline(job_id, eval_data)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("pipeline_worker_error", worker_no=worker_no, job_id=job_id)
+        finally:
+            _pipeline_queue.task_done()
 
 
 async def _run_human_all(job_id: str, eval_data: dict) -> None:

@@ -5,6 +5,7 @@ Feedback 事件处理器。
   TaskCompleted → FewShotSyncer.sync_from_task
 """
 from __future__ import annotations
+import asyncio
 
 from pdf_sku.gateway.event_bus import event_bus
 from pdf_sku.feedback.fewshot_sync import FewShotSyncer
@@ -29,12 +30,20 @@ def init_feedback_handler(
 
 
 async def _on_task_completed(event: dict) -> None:
-    """人工任务完成 → 同步 Few-shot 样本。"""
+    """人工任务完成 → 后台同步 Few-shot 样本。"""
     if not _syncer or not _session_factory:
         return
 
     task_id = event.get("task_id", "")
     if not task_id:
+        return
+
+    asyncio.create_task(_sync_task_completed(task_id))
+
+
+async def _sync_task_completed(task_id: str) -> None:
+    """避免阻塞 TaskCompleted 事件链路。"""
+    if not _syncer or not _session_factory:
         return
 
     try:
@@ -54,6 +63,7 @@ async def _on_task_completed(event: dict) -> None:
             annotations = list(ann_result.scalars().all())
 
             if annotations:
+                await db.commit()
                 async with db.begin():
                     synced = await _syncer.sync_from_task(db, task, annotations)
                 if synced > 0:

@@ -1,5 +1,6 @@
 import { Navigate, useLocation } from "react-router-dom";
 import { useAuthStore } from "../../stores/authStore";
+import Loading from "./Loading";
 
 /**
  * 路由守卫 — 未登录跳转 /login，角色不匹配显示 403。
@@ -12,8 +13,12 @@ export function RequireAuth({
   children: React.ReactNode;
   roles?: string[];
 }) {
-  const { isLoggedIn, role } = useAuthStore();
+  const { hydrated, isLoggedIn, role } = useAuthStore();
   const location = useLocation();
+
+  if (!hydrated) {
+    return <Loading text="正在恢复登录状态..." />;
+  }
 
   if (!isLoggedIn) {
     return <Navigate to="/login" state={{ from: location }} replace />;
