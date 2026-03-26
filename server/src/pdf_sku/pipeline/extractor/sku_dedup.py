@@ -921,16 +921,11 @@ def cross_page_dedup(
     if len(all_skus) <= 1:
         return all_skus
     before = len(all_skus)
-    is_one_per_page = catalog_profile and catalog_profile.is_one_product_per_page
-
     result = dedup_by_model(all_skus)                      # 型号去重
     result = _merge_variant_size(result)                    # 同型号尺寸变体合并
-    if not is_one_per_page:
-        # 纯图每页一产品目录: 不同页面是不同产品，通用名称("休闲椅")
-        # 相似但不代表是同一产品，跳过名称相似度去重和无型号合并
-        result = _merge_no_model_into_model_bearing(result)     # 无型号→有型号合并
-        result = _dedup_cross_page_by_name_similarity(result)   # 名称相似度去重
-        result = _dedup_no_model_safe(result, catalog_profile)  # 高频重名去重
+    result = _merge_no_model_into_model_bearing(result)     # 无型号→有型号合并
+    result = _dedup_cross_page_by_name_similarity(result)   # 名称相似度去重
+    result = _dedup_no_model_safe(result, catalog_profile)  # 高频重名去重
     result = _filter_cross_page_props(result, catalog_profile)  # 跨页道具清理
     # 注意: expand_color_variants 不在此调用 —— 由 runner 在 dict 层执行，
     # 确保展开结果能正确写入 pages 缓存 (此处 SKUResult 对象层展开会被 runner 丢弃)

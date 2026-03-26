@@ -471,7 +471,6 @@ def score_and_filter(
     removed = 0
     is_combo = catalog_profile and catalog_profile.is_combo_catalog
     is_pure_img = catalog_profile and catalog_profile.is_pure_image_catalog
-    is_one_per_page = catalog_profile and catalog_profile.is_one_product_per_page
 
     for sku in skus:
         name = (sku.attributes.get("product_name") or "").strip()
@@ -657,14 +656,6 @@ def score_and_filter(
                          llm_conf=round(s_llm, 3), catalog=round(s_catalog, 2))
 
         final_score = max(0.0, min(1.0, raw_score + penalty))
-
-        # 每页一产品纯图目录: 几乎不可能有型号/价格/OCR 信号,
-        # 只要 LLM 识别出产品名就应保留, 使用极低阈值
-        if is_one_per_page and pure_visual and final_score < SCORE_THRESHOLD:
-            if name and s_name > 0.0:
-                final_score = max(final_score, SCORE_THRESHOLD)
-                logger.debug("one_product_per_page_rescue",
-                             name=name[:60], score=round(final_score, 3))
 
         if final_score >= SCORE_THRESHOLD:
             # 将综合分数调制回写 confidence
