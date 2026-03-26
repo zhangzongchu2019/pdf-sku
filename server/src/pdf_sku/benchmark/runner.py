@@ -144,6 +144,9 @@ def _save_page_images(
 
     # 建立 sku_id → 文件名列表 映射
     sku_images: dict[str, list[str]] = {}
+    bound_image_ids: set[str] = set()
+
+    # Step 1: 使用 binding 结果精准关联
     if result.bindings:
         for binding in result.bindings:
             if binding.is_ambiguous or not binding.image_id:
@@ -151,6 +154,31 @@ def _save_page_images(
             fname = saved_files.get(binding.image_id)
             if fname:
                 sku_images.setdefault(binding.sku_id, []).append(fname)
+                bound_image_ids.add(binding.image_id)
+
+    # Step 2: 页面级兜底 — 对未绑定的 SKU 按页面规则补充关联
+    if saved_files and result.skus:
+        all_fnames = list(saved_files.values())
+        unbound_fnames = [
+            fname for img_id, fname in saved_files.items()
+            if img_id not in bound_image_ids
+        ]
+        unbound_sku_ids = [
+            s.sku_id for s in result.skus
+            if s.sku_id not in sku_images
+        ]
+
+        if len(result.skus) == 1:
+            # 单 SKU 页面: 所有图片归该 SKU
+            sku_images[result.skus[0].sku_id] = all_fnames
+        elif unbound_sku_ids and unbound_fnames:
+            # 多 SKU 页面: 未绑定的 SKU 共享未绑定的图片
+            for sid in unbound_sku_ids:
+                sku_images[sid] = list(unbound_fnames)
+        elif unbound_sku_ids and not unbound_fnames and all_fnames:
+            # 所有图片都已绑定，但有 SKU 没图 → 共享所有图片
+            for sid in unbound_sku_ids:
+                sku_images[sid] = list(all_fnames)
 
     return sku_images
 
@@ -299,6 +327,13 @@ class BenchmarkRunner:
                     page_dict = _page_result_to_dict(result, page_no)
 
                     # 将图片相对 URL 写入 SKU
+                    # 判断页面是否有文字 SKU 信息
+                    has_text_sku = any(
+                        (s.get("attributes", {}).get("model_number") or "").strip()
+                        or (s.get("attributes", {}).get("price") or "").strip()
+                        for s in page_dict["skus"]
+                    )
+
                     for sku_dict in page_dict["skus"]:
                         sid = sku_dict.get("sku_id", "")
                         raw_paths = sku_image_map.get(sid, [])
@@ -306,6 +341,16 @@ class BenchmarkRunner:
                             f"/images/benchmark/{safe_name}/{fname}"
                             for fname in raw_paths
                         ]
+                        # 标记信息来源
+                        attrs = sku_dict.get("attributes", {})
+                        has_model = bool((attrs.get("model_number") or "").strip())
+                        has_price = bool((attrs.get("price") or "").strip())
+                        if has_model or has_price:
+                            sku_dict["extraction_source"] = "text+image"
+                        elif has_text_sku:
+                            sku_dict["extraction_source"] = "text+image"
+                        else:
+                            sku_dict["extraction_source"] = "image_only"
 
                     results[page_no] = page_dict
                     logger.info(
