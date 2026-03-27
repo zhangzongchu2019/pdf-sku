@@ -471,7 +471,8 @@ class BenchmarkRunner:
         return None
 
     async def run_dataset(
-        self, ds: ReferenceDataset, *, force: bool = False
+        self, ds: ReferenceDataset, *, force: bool = False,
+        run_id: str = "",
     ) -> dict:
         """运行单个数据集，返回结果 dict。"""
         if not ds.pdf_path or not ds.pdf_path.exists():
@@ -499,10 +500,14 @@ class BenchmarkRunner:
         # 图册级预扫描
         catalog_profile = scan_catalog(pdf_path)
 
-        # 图片输出目录（独立于工程源代码）
+        # 图片输出目录: /data/benchmark_images/{run_id_prefix}/{dataset_name}/
         safe_name = ds.name.replace("/", "_").replace(" ", "_")
-        image_dir = _get_image_dir() / safe_name
+        run_id_prefix = str(run_id)[:8] if run_id else "default"
+        base_image_dir = _get_image_dir() / run_id_prefix
+        image_dir = base_image_dir / safe_name
         image_dir.mkdir(parents=True, exist_ok=True)
+        # URL 路径中包含 run_id 前缀
+        safe_name = f"{run_id_prefix}/{safe_name}"
 
         logger.info("run_start", dataset=ds.name, pages=total_pages,
                      concurrency=PAGE_CONCURRENCY)
