@@ -94,6 +94,22 @@ def _file_hash(path: Path) -> str:
     return h.hexdigest()[:12]
 
 
+def _is_blank_image(data: bytes, threshold: float = 240) -> bool:
+    """检测纯白/纯色空白占位图（PDF排版用，无实际产品内容）。"""
+    try:
+        from PIL import Image
+        import numpy as np
+        import io
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        arr = np.array(img)
+        if arr.mean() <= threshold:
+            return False
+        white_ratio = (arr > threshold).all(axis=2).sum() / (arr.shape[0] * arr.shape[1])
+        return white_ratio > 0.95
+    except Exception:
+        return False
+
+
 def _page_result_to_dict(pr: PageResult, page_no: int) -> dict[str, Any]:
     return {
         "page_no": page_no,
@@ -130,17 +146,22 @@ def _save_page_images(
     if not img_map:
         return {}
 
-    # 保存所有有数据的 search_eligible 图片到磁盘
+    # 保存所有有数据的 search_eligible 图片到磁盘（过滤碎片和空白图）
     saved_files: dict[str, str] = {}  # image_id → filename
     for img in result.images:
-        if img.data and img.search_eligible:
-            # image_id 可能已包含页码前缀 (如 p1_img0)，避免重复
-            img_id = img.image_id or f"p{page_no}_img"
-            fname = f"{img_id}.jpg" if img_id.startswith("p") else f"p{page_no}_{img_id}.jpg"
-            fpath = image_dir / fname
-            if not fpath.exists():
-                fpath.write_bytes(img.data)
-            saved_files[img.image_id] = fname
+        if not img.data or not img.search_eligible:
+            continue
+        if img.is_fragmented:  # 跳过瓦片碎片，只保留 composite 合成图
+            continue
+        if _is_blank_image(img.data):  # 跳过纯白/纯色空白占位图
+            continue
+        # image_id 可能已包含页码前缀 (如 p1_img0)，避免重复
+        img_id = img.image_id or f"p{page_no}_img"
+        fname = f"{img_id}.jpg" if img_id.startswith("p") else f"p{page_no}_{img_id}.jpg"
+        fpath = image_dir / fname
+        if not fpath.exists():
+            fpath.write_bytes(img.data)
+        saved_files[img.image_id] = fname
 
     # 建立 sku_id → 文件名列表 映射
     sku_images: dict[str, list[str]] = {}
