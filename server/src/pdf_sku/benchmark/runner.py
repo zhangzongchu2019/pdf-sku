@@ -190,10 +190,15 @@ def _is_blank_image(data: bytes, threshold: float = 240) -> bool:
         import io
         img = Image.open(io.BytesIO(data)).convert("RGB")
         arr = np.array(img)
-        if arr.mean() <= threshold:
-            return False
-        white_ratio = (arr > threshold).all(axis=2).sum() / (arr.shape[0] * arr.shape[1])
-        return white_ratio > 0.95
+        avg = arr.mean()
+        white_ratio = (arr > 230).all(axis=2).sum() / (arr.shape[0] * arr.shape[1])
+        # 空白背景层: 平均亮度高 + 大面积白色/浅色
+        if avg > 200 and white_ratio > 0.70:
+            return True
+        # 纯白页面
+        if avg > 240 and white_ratio > 0.50:
+            return True
+        return False
     except Exception:
         return False
 
