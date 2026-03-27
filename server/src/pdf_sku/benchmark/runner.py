@@ -94,6 +94,94 @@ def _file_hash(path: Path) -> str:
     return h.hexdigest()[:12]
 
 
+def _crop_product_regions(
+    page_screenshot: bytes | None,
+    skus: list,
+    saved_files: dict[str, str],
+    image_dir: Path,
+    page_no: int,
+    safe_name: str,
+) -> dict[str, list[str]]:
+    """从整页截图中检测并裁剪产品区域。
+
+    触发条件: 页面有多个SKU但只有<=1张eligible图片。
+    用 YOLO 检测产品图区域，裁剪后关联到对应 SKU。
+    """
+    if not page_screenshot or len(skus) <= 1:
+        return {}
+
+    try:
+        from pdf_sku.pipeline.layout_detector import detect_figures_on_image
+        from PIL import Image
+        import io
+
+        figures = detect_figures_on_image(page_screenshot)
+        if len(figures) < 2:
+            return {}
+
+        pil_img = Image.open(io.BytesIO(page_screenshot))
+        img_w, img_h = pil_img.size
+
+        # 按 Y 坐标排序 figure 区域
+        figures_sorted = sorted(figures, key=lambda b: b[1])
+
+        # 裁剪每个 figure 区域
+        cropped_files: list[str] = []
+        for idx, (x0, y0, x1, y1) in enumerate(figures_sorted):
+            # 确保坐标在图片范围内
+            cx0 = max(0, int(x0))
+            cy0 = max(0, int(y0))
+            cx1 = min(img_w, int(x1))
+            cy1 = min(img_h, int(y1))
+            if cx1 - cx0 < 50 or cy1 - cy0 < 50:
+                continue
+
+            cropped = pil_img.crop((cx0, cy0, cx1, cy1))
+            fname = f"p{page_no}_crop_{idx}.jpg"
+            fpath = image_dir / fname
+            if not fpath.exists():
+                buf = io.BytesIO()
+                cropped.save(buf, format="JPEG", quality=85)
+                fpath.write_bytes(buf.getvalue())
+            cropped_files.append(fname)
+
+        if not cropped_files:
+            return {}
+
+        # 关联裁剪图到 SKU
+        sku_images: dict[str, list[str]] = {}
+        url_prefix = f"/images/benchmark/{safe_name}"
+
+        if len(cropped_files) == len(skus):
+            # figure数 == SKU数 → 按Y坐标一一对应
+            for sku, fname in zip(skus, cropped_files):
+                sid = sku.get("sku_id", "")
+                sku_images[sid] = [f"{url_prefix}/{fname}"]
+        elif len(cropped_files) >= len(skus):
+            # figure数 > SKU数 → 均分归组
+            per_sku = max(1, len(cropped_files) // len(skus))
+            for i, sku in enumerate(skus):
+                sid = sku.get("sku_id", "")
+                start = i * per_sku
+                end = start + per_sku if i < len(skus) - 1 else len(cropped_files)
+                sku_images[sid] = [f"{url_prefix}/{f}" for f in cropped_files[start:end]]
+        else:
+            # figure数 < SKU数 → 每个SKU共享所有裁剪图
+            all_urls = [f"{url_prefix}/{f}" for f in cropped_files]
+            for sku in skus:
+                sid = sku.get("sku_id", "")
+                sku_images[sid] = list(all_urls)
+
+        logger.info("crop_product_regions",
+                     page=page_no, figures=len(figures_sorted),
+                     cropped=len(cropped_files), skus=len(skus))
+        return sku_images
+
+    except Exception as e:
+        logger.warning("crop_product_regions_failed", page=page_no, error=str(e))
+        return {}
+
+
 def _is_blank_image(data: bytes, threshold: float = 240) -> bool:
     """检测纯白/纯色空白占位图（PDF排版用，无实际产品内容）。"""
     try:
@@ -108,6 +196,70 @@ def _is_blank_image(data: bytes, threshold: float = 240) -> bool:
         return white_ratio > 0.95
     except Exception:
         return False
+
+
+def _normalize_model(model: str) -> str:
+    """型号标准化: 去#号, 统一大小写, 去空格。"""
+    return model.strip().upper().rstrip("#").replace(" ", "")
+
+
+def _aggregate_cross_page_images(pages: list[dict]) -> None:
+    """跨页图片聚合: 连续页面同一产品的图片合并。
+
+    规则:
+    1. 纯图页面(image_only)紧跟有文字页面 → 图片追加到上一页的所有SKU
+    2. 当前页SKU型号与上一页相同(标准化后) → 图片合并
+    """
+    if len(pages) < 2:
+        return
+
+    transferred = 0
+    for i in range(1, len(pages)):
+        curr = pages[i]
+        prev = pages[i - 1]
+        curr_skus = curr.get("skus", [])
+        prev_skus = prev.get("skus", [])
+        if not curr_skus or not prev_skus:
+            continue
+
+        # 规则1: 纯图页面追加到上一页
+        all_image_only = all(
+            s.get("extraction_source") == "image_only" for s in curr_skus
+        )
+        if all_image_only:
+            for cs in curr_skus:
+                curr_imgs = cs.get("image_paths", [])
+                if curr_imgs:
+                    for ps in prev_skus:
+                        existing = ps.get("image_paths", [])
+                        for img in curr_imgs:
+                            if img not in existing:
+                                existing.append(img)
+                                transferred += 1
+                        ps["image_paths"] = existing
+            continue
+
+        # 规则2: 同型号跨页合并图片
+        prev_models = {}
+        for ps in prev_skus:
+            m = _normalize_model(ps.get("attributes", {}).get("model_number", ""))
+            if m:
+                prev_models[m] = ps
+
+        for cs in curr_skus:
+            m = _normalize_model(cs.get("attributes", {}).get("model_number", ""))
+            if m and m in prev_models:
+                curr_imgs = cs.get("image_paths", [])
+                target = prev_models[m]
+                existing = target.get("image_paths", [])
+                for img in curr_imgs:
+                    if img not in existing:
+                        existing.append(img)
+                        transferred += 1
+                target["image_paths"] = existing
+
+    if transferred:
+        logger.info("cross_page_images_aggregated", transferred=transferred)
 
 
 def _page_result_to_dict(pr: PageResult, page_no: int) -> dict[str, Any]:
@@ -135,12 +287,14 @@ def _page_result_to_dict(pr: PageResult, page_no: int) -> dict[str, Any]:
 
 def _save_page_images(
     result: PageResult, page_no: int, image_dir: Path,
+    safe_name: str = "",
 ) -> dict[str, list[str]]:
     """保存页面图片，返回 sku_id → 图片文件名列表映射。
 
     包括：
     - 通过 binding 关联到 SKU 的图片
     - search_eligible 的 composite 合成图（瓦片拼合后的完整产品图）
+    - YOLO 检测裁剪的产品区域图（单图多产品页面）
     """
     img_map = {img.image_id: img for img in result.images if img.data}
     if not img_map:
@@ -192,6 +346,30 @@ def _save_page_images(
         if len(result.skus) == 1:
             # 单 SKU 页面: 所有图片归该 SKU
             sku_images[result.skus[0].sku_id] = all_fnames
+        elif len(saved_files) <= 1 and len(result.skus) > 1:
+            # 多 SKU 但只有 <=1 张图 → 尝试 YOLO 裁剪产品区域
+            # 找整页截图数据（取第一张 eligible 图片的数据）
+            screenshot_data = None
+            for img in result.images:
+                if img.data and img.search_eligible and not img.is_fragmented:
+                    screenshot_data = img.data
+                    break
+            if screenshot_data:
+                sku_dicts = [{"sku_id": s.sku_id, "attributes": s.attributes}
+                             for s in result.skus]
+                crop_result = _crop_product_regions(
+                    screenshot_data, sku_dicts, saved_files,
+                    image_dir, page_no, safe_name)
+                if crop_result:
+                    sku_images.update(crop_result)
+            # 裁剪失败则回退到共享
+            unbound_after_crop = [
+                s.sku_id for s in result.skus
+                if s.sku_id not in sku_images
+            ]
+            if unbound_after_crop and all_fnames:
+                for sid in unbound_after_crop:
+                    sku_images[sid] = list(all_fnames)
         elif unbound_sku_ids and unbound_fnames:
             # 多 SKU 页面: 未绑定的 SKU 共享未绑定的图片
             for sid in unbound_sku_ids:
@@ -343,7 +521,7 @@ class BenchmarkRunner:
                         catalog_profile=catalog_profile,
                     )
                     # 保存图片并建立 sku_id → image_paths 映射
-                    sku_image_map = _save_page_images(result, page_no, image_dir)
+                    sku_image_map = _save_page_images(result, page_no, image_dir, safe_name)
 
                     page_dict = _page_result_to_dict(result, page_no)
 
@@ -463,6 +641,9 @@ class BenchmarkRunner:
             if deduped_total < len(all_skus_flat):
                 logger.info("combo_model_dedup_done",
                             before=len(all_skus_flat), after=deduped_total)
+
+        # ═══ 跨页图片聚合 ═══
+        _aggregate_cross_page_images(pages)
 
         total_skus = sum(len(p.get("skus", [])) for p in pages)
 
