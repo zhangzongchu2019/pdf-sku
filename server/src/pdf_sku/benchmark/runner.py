@@ -303,6 +303,10 @@ def _save_page_images(
     - search_eligible 的 composite 合成图（瓦片拼合后的完整产品图）
     - YOLO 检测裁剪的产品区域图（单图多产品页面）
     """
+    # 无 SKU 的页面不保存图片（公司介绍/宣传/封面等非产品页）
+    if not result.skus:
+        return {}
+
     img_map = {img.image_id: img for img in result.images if img.data}
     if not img_map:
         return {}
