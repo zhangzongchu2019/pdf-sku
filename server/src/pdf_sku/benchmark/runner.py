@@ -198,8 +198,10 @@ def _is_blank_image(data: bytes, threshold: float = 240) -> bool:
         return False
 
 
-def _normalize_model(model: str) -> str:
+def _normalize_model(model: str | None) -> str:
     """型号标准化: 去#号, 统一大小写, 去空格。"""
+    if not model:
+        return ""
     return model.strip().upper().rstrip("#").replace(" ", "")
 
 
