@@ -1047,7 +1047,7 @@ class PageProcessor:
                 skus, hash_prefix, page_no, raw.metadata.page_height)
 
             # ═══ Phase 8: 绑定 ═══
-            bindings = self._binder.bind(skus, raw.images, cls_result)
+            bindings = self._binder.bind(skus, raw.images, cls_result, page_plan=plan)
 
             # Composite 图片: 从截图裁剪生成实际图片数据
             if screenshot:
