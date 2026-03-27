@@ -43,11 +43,12 @@ def create_llm_service(redis=None):
             api_base=settings.gemini_api_base,
         ))
     if settings.qwen_api_key:
-        from pdf_sku.llm_adapter.client.qwen import QwenClient
-        register_client("qwen", QwenClient(
+        from pdf_sku.llm_adapter.client.openrouter import OpenRouterClient
+        register_client("qwen", OpenRouterClient(
             api_key=settings.qwen_api_key,
             model=settings.qwen_model,
             timeout=settings.llm_timeout_seconds,
+            api_base=settings.qwen_api_base,
         ))
     # 多 key 轮询: OPENROUTER_API_KEYS 优先，否则回退单 key
     openrouter_keys: list[str] = []
@@ -129,9 +130,9 @@ def create_llm_service(redis=None):
         else:
             default_client = "openrouter"
 
-    # Fallback 链: 按优先级排序 — openrouter_1 > openrouter > apiyi > gemini > 万界 > qwen
-    _priority_order = ["openrouter_1", "openrouter", "openrouter_apiyi",
-                       "gemini", "openrouter_wanjie", "openrouter_gptproto", "qwen"]
+    # Fallback 链: qwen 优先，openrouter 作为 fallback
+    _priority_order = ["qwen", "openrouter_1", "openrouter", "openrouter_apiyi",
+                       "gemini", "openrouter_wanjie", "openrouter_gptproto"]
     _all_names = set(openrouter_names)
     if settings.gemini_api_key:
         _all_names.add("gemini")
@@ -143,14 +144,14 @@ def create_llm_service(redis=None):
         if n not in fallback_chain:
             fallback_chain.append(n)
 
-    # 加权轮询: openrouter_1×2, openrouter×2, apiyi×1, gemini×1, 万界×1, qwen×1
+    # 加权轮询: qwen 主力×3, openrouter 作为 fallback
     provider_weights: dict[str, int] = {
+        "qwen": 3,
         "openrouter_1": 2,
         "openrouter": 2,
         "openrouter_apiyi": 1,
         "gemini": 1,
         "openrouter_wanjie": 1,
-        "qwen": 1,
     }
 
     logger.info("llm_providers_configured",

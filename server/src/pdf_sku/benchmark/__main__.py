@@ -245,6 +245,12 @@ async def _async_full_db(args: argparse.Namespace) -> None:
     datasets = _filter_datasets(datasets, args.filter)
     datasets = [ds for ds in datasets if ds.pdf_path and ds.excel_path]
 
+    # --dataset-list: 只保留 JSON 列表中指定的数据集
+    if hasattr(args, 'dataset_list') and args.dataset_list:
+        import json as _json
+        allowed = set(_json.loads(Path(args.dataset_list).read_text()))
+        datasets = [ds for ds in datasets if ds.name in allowed]
+
     if not datasets:
         print("没有匹配的数据集")
         return
@@ -545,6 +551,7 @@ def main():
     # full-db
     p_fdb = sub.add_parser("full-db", help="全流程 + 逐个写入数据库")
     p_fdb.add_argument("--filter", default=None, help="文件名模式")
+    p_fdb.add_argument("--dataset-list", default=None, help="JSON文件，包含数据集名称列表")
     p_fdb.add_argument("--force", action="store_true", help="强制重新运行")
     p_fdb.add_argument("--tag", default="", help="运行标签")
     p_fdb.add_argument("--desc", default="", help="本轮修改说明")
