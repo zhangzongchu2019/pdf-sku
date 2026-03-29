@@ -94,6 +94,53 @@ def _file_hash(path: Path) -> str:
     return h.hexdigest()[:12]
 
 
+def _split_by_contours(pil_img: "Image.Image") -> list["Image.Image"]:
+    """用 OpenCV 连通域分析拆分白底产品图面板。
+
+    适用于: 多个产品图排列在白色背景上（如产品展示面板），
+    YOLO 无法检测到单个产品图时的兜底方案。
+    """
+    import cv2
+    import numpy as np
+
+    arr = np.array(pil_img.convert("RGB"))
+    h, w = arr.shape[:2]
+
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    _, binary = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY_INV)
+
+    # 形态学闭合，合并同一产品的相邻像素
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 30))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # 过滤: 面积 >= 2% 且宽高 >= 100px，且宽高比合理（非细长条）
+    min_area = w * h * 0.02
+    boxes = []
+    for c in contours:
+        x, y, bw, bh = cv2.boundingRect(c)
+        if bw * bh < min_area or bw < 100 or bh < 100:
+            continue
+        aspect = max(bw, bh) / min(bw, bh)
+        if aspect > 6:  # 过窄的条状区域（如标签栏）跳过
+            continue
+        boxes.append((x, y, x + bw, y + bh))
+
+    if len(boxes) < 2:
+        return []
+
+    # 按 x 坐标排序（从左到右）
+    boxes.sort(key=lambda b: b[0])
+
+    results = []
+    for (x0, y0, x1, y1) in boxes:
+        crop = pil_img.crop((x0, y0, x1, y1))
+        results.append(crop)
+
+    return results
+
+
 def _crop_product_regions(
     page_screenshot: bytes | None,
     skus: list,
@@ -102,10 +149,13 @@ def _crop_product_regions(
     page_no: int,
     safe_name: str,
 ) -> dict[str, list[str]]:
-    """从整页截图中检测并裁剪产品区域。
+    """从整页截图中检测并裁剪产品区域（含二级裁剪）。
 
     触发条件: 页面有多个SKU但只有<=1张eligible图片。
     用 YOLO 检测产品图区域，裁剪后关联到对应 SKU。
+
+    二级裁剪: 如果一级裁剪区域内包含多个子产品图（如右侧面板有多个SKU小图），
+    对该区域再跑一次 YOLO 检测，拆出单个产品图。
     """
     if not page_screenshot or len(skus) <= 1:
         return {}
@@ -125,10 +175,10 @@ def _crop_product_regions(
         # 按 Y 坐标排序 figure 区域
         figures_sorted = sorted(figures, key=lambda b: b[1])
 
-        # 裁剪每个 figure 区域
+        # 裁剪每个 figure 区域（含二级裁剪）
         cropped_files: list[str] = []
-        for idx, (x0, y0, x1, y1) in enumerate(figures_sorted):
-            # 确保坐标在图片范围内
+        crop_idx = 0
+        for (x0, y0, x1, y1) in figures_sorted:
             cx0 = max(0, int(x0))
             cy0 = max(0, int(y0))
             cx1 = min(img_w, int(x1))
@@ -137,40 +187,80 @@ def _crop_product_regions(
                 continue
 
             cropped = pil_img.crop((cx0, cy0, cx1, cy1))
-            fname = f"p{page_no}_crop_{idx}.jpg"
-            fpath = image_dir / fname
-            if not fpath.exists():
-                buf = io.BytesIO()
-                cropped.save(buf, format="JPEG", quality=85)
-                fpath.write_bytes(buf.getvalue())
-            cropped_files.append(fname)
+
+            # ── 二级裁剪: 对大区域再检测子产品图 ──
+            sub_buf = io.BytesIO()
+            cropped.save(sub_buf, format="JPEG", quality=90)
+            sub_data = sub_buf.getvalue()
+            sub_figures = detect_figures_on_image(sub_data)
+
+            if len(sub_figures) >= 2:
+                # YOLO 检测到多个子区域 → 拆分保存
+                cw, ch = cropped.size
+                sub_sorted = sorted(sub_figures, key=lambda b: (b[1], b[0]))
+                for si, (sx0, sy0, sx1, sy1) in enumerate(sub_sorted):
+                    scx0 = max(0, int(sx0))
+                    scy0 = max(0, int(sy0))
+                    scx1 = min(cw, int(sx1))
+                    scy1 = min(ch, int(sy1))
+                    if scx1 - scx0 < 30 or scy1 - scy0 < 30:
+                        continue
+                    sub_crop = cropped.crop((scx0, scy0, scx1, scy1))
+                    fname = f"p{page_no}_crop_{crop_idx}.jpg"
+                    fpath = image_dir / fname
+                    if not fpath.exists():
+                        sbuf = io.BytesIO()
+                        sub_crop.save(sbuf, format="JPEG", quality=85)
+                        fpath.write_bytes(sbuf.getvalue())
+                    cropped_files.append(fname)
+                    crop_idx += 1
+                logger.info("secondary_crop_yolo", page=page_no,
+                            sub_figures=len(sub_sorted))
+            else:
+                # YOLO 无法拆分 → 用 OpenCV 连通域分析兜底
+                sub_regions = _split_by_contours(cropped)
+                if len(sub_regions) >= 2:
+                    for sr in sub_regions:
+                        fname = f"p{page_no}_crop_{crop_idx}.jpg"
+                        fpath = image_dir / fname
+                        if not fpath.exists():
+                            sbuf = io.BytesIO()
+                            sr.save(sbuf, format="JPEG", quality=85)
+                            fpath.write_bytes(sbuf.getvalue())
+                        cropped_files.append(fname)
+                        crop_idx += 1
+                    logger.info("secondary_crop_contour", page=page_no,
+                                sub_regions=len(sub_regions))
+                else:
+                    # 无法拆分 → 保留原始裁剪
+                    fname = f"p{page_no}_crop_{crop_idx}.jpg"
+                    fpath = image_dir / fname
+                    if not fpath.exists():
+                        fpath.write_bytes(sub_data)
+                    cropped_files.append(fname)
+                    crop_idx += 1
 
         if not cropped_files:
             return {}
 
-        # 关联裁剪图到 SKU
+        # 关联裁剪图到 SKU（返回纯文件名，由调用方统一加 URL 前缀）
         sku_images: dict[str, list[str]] = {}
-        url_prefix = f"/images/benchmark/{safe_name}"
 
         if len(cropped_files) == len(skus):
-            # figure数 == SKU数 → 按Y坐标一一对应
             for sku, fname in zip(skus, cropped_files):
                 sid = sku.get("sku_id", "")
-                sku_images[sid] = [f"{url_prefix}/{fname}"]
+                sku_images[sid] = [fname]
         elif len(cropped_files) >= len(skus):
-            # figure数 > SKU数 → 均分归组
             per_sku = max(1, len(cropped_files) // len(skus))
             for i, sku in enumerate(skus):
                 sid = sku.get("sku_id", "")
                 start = i * per_sku
                 end = start + per_sku if i < len(skus) - 1 else len(cropped_files)
-                sku_images[sid] = [f"{url_prefix}/{f}" for f in cropped_files[start:end]]
+                sku_images[sid] = list(cropped_files[start:end])
         else:
-            # figure数 < SKU数 → 每个SKU共享所有裁剪图
-            all_urls = [f"{url_prefix}/{f}" for f in cropped_files]
             for sku in skus:
                 sid = sku.get("sku_id", "")
-                sku_images[sid] = list(all_urls)
+                sku_images[sid] = list(cropped_files)
 
         logger.info("crop_product_regions",
                      page=page_no, figures=len(figures_sorted),
@@ -313,12 +403,18 @@ def _save_page_images(
 
     # 保存所有有数据的 search_eligible 图片到磁盘（过滤碎片和空白图）
     saved_files: dict[str, str] = {}  # image_id → filename
+    # 统计可用图片数量，单图页面不做 blank 过滤（该图就是页面内容本身）
+    eligible_count = sum(
+        1 for img in result.images
+        if img.data and img.search_eligible and not img.is_fragmented
+    )
     for img in result.images:
         if not img.data or not img.search_eligible:
             continue
         if img.is_fragmented:  # 跳过瓦片碎片，只保留 composite 合成图
             continue
-        if _is_blank_image(img.data):  # 跳过纯白/纯色空白占位图
+        # 多图页面才做 blank 过滤（区分背景层 vs 产品图）
+        if eligible_count > 1 and _is_blank_image(img.data):
             continue
         # image_id 可能已包含页码前缀 (如 p1_img0)，避免重复
         img_id = img.image_id or f"p{page_no}_img"
@@ -610,7 +706,25 @@ class BenchmarkRunner:
                 )
                 for s in all_skus_flat
             ]
-            deduped = cross_page_dedup(sku_results, catalog_profile=catalog_profile)
+            # 全部页面无文字的纯图目录：跳过跨页去重
+            # 理由：每页=一个产品，同名不同款是正常的，不应因名称相同而去重
+            # 判断依据：catalog_profile.is_pure_image_catalog 且无型号SKU占绝大多数
+            no_model_count = sum(
+                1 for sr in sku_results
+                if not (sr.attributes.get("model_number") or "").strip()
+            )
+            is_fully_pure_img = (
+                catalog_profile
+                and catalog_profile.is_pure_image_catalog
+                and no_model_count > len(sku_results) * 0.7
+            )
+            if is_fully_pure_img:
+                deduped = sku_results
+                logger.info("skip_cross_page_dedup_pure_img",
+                            total=len(sku_results),
+                            no_model_ratio=f"{no_model_count}/{len(sku_results)}")
+            else:
+                deduped = cross_page_dedup(sku_results, catalog_profile=catalog_profile)
             deduped = dedup_by_model_variant(deduped)
             deduped = dedup_material_variants(deduped)
             # 找出保留的 SKU (通过 id 匹配)

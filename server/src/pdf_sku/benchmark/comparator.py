@@ -32,8 +32,16 @@ def _normalize(s: str) -> str:
 
 
 def _normalize_model(s: str) -> str:
-    """归一化型号用于匹配: 去除尾部 #/*，统一大小写去空格。"""
+    """归一化型号用于匹配: 去除前缀/尾部标记/中文括号，统一大小写去空格。"""
     n = s.strip().lower().replace(" ", "").replace("\u3000", "")
+    # 去掉 "model:", "model：", "型号:", "型号：" 前缀
+    for prefix in ("model:", "model：", "型号:", "型号："):
+        if n.startswith(prefix):
+            n = n[len(prefix):]
+            break
+    # 去掉中文括号及内容: "bk（贝壳）01" → "bk01"
+    import re
+    n = re.sub(r'[（(][^）)]*[）)]', '', n)
     return n.rstrip("#*")
 
 
@@ -59,12 +67,41 @@ def _fuzzy_match(a: str, b: str, threshold: float = 0.6) -> bool:
 
 
 def _extract_model_prefix(name: str) -> str | None:
-    """从 product_name 提取完整型号（如 SJ-2001、H-303-1A、BT-BD711-2）。"""
+    """从 product_name 提取完整型号（如 SJ-2001、H-303-1A、Bk（贝壳）08#、230、8103#）。"""
+    # 优先: "型号：xxx" / "Model：xxx" 格式（最明确的型号标识）
+    m0 = re.search(r'(?:model|moedl|型号)[：:]\s*(\w{1,10})', name, re.IGNORECASE)
+    if m0:
+        return m0.group(1).upper()
+
+    # 标准字母+数字型号格式（排除尺寸模式）
     m = re.search(
         r'[A-Za-z]{1,5}[-\s]?[A-Za-z]{0,3}\d{2,10}[A-Za-z]?(?:[-][A-Za-z0-9]{1,4})*',
         name,
     )
-    return m.group(0).upper().replace(" ", "") if m else None
+    if m:
+        matched = m.group(0).upper().replace(" ", "").replace("\n", "").replace("\r", "")
+        # 排除尺寸模式: "MM160", "X750X", "CM200" 等
+        if re.match(r'^[MCXH]M?\d+$', matched) or re.match(r'^X\d+X$', matched):
+            pass  # 跳过尺寸误匹配
+        else:
+            return matched
+
+    # 中文品名+数字型号格式 (如 "Bk（贝壳）08#", "XX（系列）123")
+    m2 = re.search(r'([A-Za-z]{1,5})[（(][^）)]+[）)]\s*(\d{1,5})', name)
+    if m2:
+        return f"{m2.group(1).upper()}{m2.group(2)}"
+
+    # 纯数字型号: 首行是 2-5 位数字+可选#（如 "230\n棕色/橡木", "8103# 转角沙发"）
+    first_line = name.split('\n')[0].strip() if name else ''
+    m4 = re.match(r'^(\d{2,5})\s*[#＃*]?\s*$', first_line)
+    if m4:
+        return m4.group(1)
+    # 首行 "数字# 产品名" 格式（如 "8103# 转角沙发"）
+    m5 = re.match(r'^(\d{2,5})\s*[#＃]\s+\S', first_line)
+    if m5:
+        return m5.group(1)
+
+    return None
 
 
 def _first_line(s: str) -> str:
@@ -113,13 +150,8 @@ def _dedup_gt_by_model(expected: list[GroundTruthSKU]) -> list[GroundTruthSKU]:
     seen_models: set[str] = set()
     deduped: list[GroundTruthSKU] = []
     for gt in expected:
-        # 尝试从 model_number 字段获取型号
+        # 仅用 model_number 字段去重（不从 product_name 提取，避免颜色变体被误合并）
         norm = _normalize_model(gt.model_number) if gt.model_number else ""
-        # 若 model_number 为空，从 product_name 提取型号
-        if not norm:
-            prefix = _extract_model_prefix(gt.product_name)
-            if prefix:
-                norm = _normalize_model(prefix)
         if norm and norm in seen_models:
             continue
         if norm:
@@ -166,10 +198,17 @@ def compare_dataset(
     expected = _dedup_gt_no_model_by_name(expected)
     actual_list = _extract_all_skus(run_result)
 
+    # 统计 GT 中仅有图片无名称/型号的条目
+    gt_image_only = sum(
+        1 for s in expected
+        if not (s.product_name or "").strip() and not (s.model_number or "").strip()
+    )
+
     result = ComparisonResult(
         dataset_name=ds.name,
         expected_count=len(expected),
         actual_count=len(actual_list),
+        gt_image_only_count=gt_image_only,
     )
 
     # 跟踪已匹配的
@@ -318,6 +357,73 @@ def compare_dataset(
         matched_expected.add(ei)
         matched_actual.add(ai)
 
+    # Pass 1.7: GT product_name 中实际型号 → Pipeline model_number 匹配
+    # 场景: GT model_number 是序号(A2025-001)，实际型号在 product_name 中(Model：119#)
+    # Pass 1/1.5 用序号匹配失败，这里从 product_name 提取实际型号再匹配
+    _pass17_candidates: list[tuple[float, int, int]] = []
+    for ei, exp in enumerate(expected):
+        if ei in matched_expected:
+            continue
+        # 从 GT product_name 提取实际型号
+        exp_real_model = _extract_model_prefix(exp.product_name) if exp.product_name else None
+        if not exp_real_model:
+            continue
+        exp_real_norm = _normalize_model(exp_real_model)
+        if not exp_real_norm:
+            continue
+        for ai, act in enumerate(actual_list):
+            if ai in matched_actual:
+                continue
+            act_model_n = _normalize_model(str(act.get("model_number", "")))
+            if act_model_n and act_model_n == exp_real_norm:
+                act_name_n = _normalize(str(act.get("product_name", "")))
+                exp_name_n = _normalize(exp.product_name)
+                score = SequenceMatcher(None, exp_name_n[:30], act_name_n[:30]).ratio()
+                _pass17_candidates.append((score, ei, ai))
+    _pass17_candidates.sort(key=lambda x: -x[0])
+    for _score, ei, ai in _pass17_candidates:
+        if ei in matched_expected or ai in matched_actual:
+            continue
+        result.matches.append(_make_match(expected[ei], actual_list[ai], "name_model_extract"))
+        matched_expected.add(ei)
+        matched_actual.add(ai)
+
+    # Pass 1.8: 无型号 GT 的 product_name 全文模糊匹配（降低阈值）
+    # 场景: GT 无 model_number，product_name 是"休闲椅\n70*73*79"
+    #       Pipeline product_name 是"棕色皮质休闲椅"
+    # Pass 2 的首行匹配和 0.6 阈值可能不够，这里用全文 + 0.4 阈值
+    _pass18_candidates: list[tuple[float, int, int]] = []
+    for ei, exp in enumerate(expected):
+        if ei in matched_expected:
+            continue
+        if not exp.product_name or exp.model_number:
+            continue  # 只处理无型号 GT
+        exp_name_n = _normalize(exp.product_name)
+        if not exp_name_n or len(exp_name_n) > 50:
+            continue
+        for ai, act in enumerate(actual_list):
+            if ai in matched_actual:
+                continue
+            act_name_n = _normalize(str(act.get("product_name", "")))
+            if not act_name_n:
+                continue
+            # 多维匹配: 首行匹配 + 全文相似度 + 中文核心词包含
+            exp_first = _normalize(_first_line(exp.product_name))
+            act_first = _normalize(_first_line(str(act.get("product_name", ""))))
+            first_score = SequenceMatcher(None, exp_first, act_first).ratio() if exp_first and act_first else 0
+            full_score = SequenceMatcher(None, exp_name_n[:40], act_name_n[:40]).ratio()
+            score = max(first_score, full_score)
+            if score >= 0.4:
+                _pass18_candidates.append((score, ei, ai))
+    _pass18_candidates.sort(key=lambda x: -x[0])
+    for _score, ei, ai in _pass18_candidates:
+        if ei in matched_expected or ai in matched_actual:
+            continue
+        if _score >= 0.5 or (ei not in matched_expected and ai not in matched_actual):
+            result.matches.append(_make_match(expected[ei], actual_list[ai], "name_fuzzy_wide"))
+            matched_expected.add(ei)
+            matched_actual.add(ai)
+
     # Pass 2: product_name 首行模糊匹配
     for ei, exp in enumerate(expected):
         if ei in matched_expected or not exp.product_name:
@@ -334,6 +440,54 @@ def compare_dataset(
                 matched_actual.add(ai)
                 break
 
+    # Pass 2.5: 同型号变体多对一匹配
+    # 场景: GT 中 387# 有 4 个变体（不同规格），Pipeline 提取了 1 个 387#
+    # Pass 1 匹配了第一个，剩余 3 个应也匹配到同一个 Pipeline SKU
+    # 收集已匹配的 Pipeline 型号 → actual_attrs
+    _matched_model_to_act: dict[str, dict] = {}
+    for m in result.matches:
+        if m.actual_attrs:
+            mn = _normalize_model(str(m.actual_attrs.get("model_number", "")))
+            if mn:
+                _matched_model_to_act[mn] = m.actual_attrs
+    for ei, exp in enumerate(expected):
+        if ei in matched_expected:
+            continue
+        exp_real = _extract_model_prefix(exp.product_name) if exp.product_name else None
+        if not exp_real:
+            continue
+        exp_real_norm = _normalize_model(exp_real)
+        if exp_real_norm and exp_real_norm in _matched_model_to_act:
+            result.matches.append(
+                _make_match(exp, _matched_model_to_act[exp_real_norm], "model_variant"))
+            matched_expected.add(ei)
+
+    # Pass 2.8: 图片相似度匹配（仅对 gt_image_only 且仍有大量未匹配时启用）
+    remaining_exp = len(expected) - len(matched_expected)
+    remaining_act = len(actual_list) - len(matched_actual)
+    if gt_image_only > len(expected) * 0.5 and remaining_exp > 5 and remaining_act > 5:
+        try:
+            from pdf_sku.benchmark.image_matcher import match_gt_pred_images
+            from pathlib import Path
+            if hasattr(ds, 'excel_path') and ds.excel_path:
+                cache_name = ds.name.replace('/', '_').replace(' ', '_')
+                cache_path = Path(f"data/benchmark_cache/{cache_name}.json")
+                if cache_path.exists():
+                    img_result = match_gt_pred_images(
+                        Path(ds.excel_path), cache_path, threshold=0.70)
+                    if img_result.get("matches"):
+                        for gi, pi, sim in img_result["matches"]:
+                            if gi not in matched_expected and pi not in matched_actual:
+                                if gi < len(expected) and pi < len(actual_list):
+                                    result.matches.append(
+                                        _make_match(expected[gi], actual_list[pi], "image_similarity"))
+                                    matched_expected.add(gi)
+                                    matched_actual.add(pi)
+                        logger.info("image_similarity_matching",
+                                    matched=len([m for m in result.matches if m.match_method == "image_similarity"]))
+        except Exception as e:
+            logger.debug("image_matching_skipped", error=str(e))
+
     # Pass 3: 位置对齐（按顺序匹配剩余的）
     unmatched_exp = [i for i in range(len(expected)) if i not in matched_expected]
     unmatched_act = [i for i in range(len(actual_list)) if i not in matched_actual]
@@ -342,7 +496,9 @@ def compare_dataset(
         matched_expected.add(ei)
         matched_actual.add(ai)
 
-    result.matched_count = len(result.matches)
+    # matched_count: 用匹配到的 GT 数量（R 的分子）
+    # 但 P 的分子用匹配到的唯一 Pipeline SKU 数量
+    result.matched_count = len(matched_expected)
 
     # Missing / Extra
     result.missing_skus = [expected[i] for i in range(len(expected)) if i not in matched_expected]

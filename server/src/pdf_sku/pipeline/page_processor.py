@@ -734,12 +734,13 @@ class PageProcessor:
                                         page=page_no, total=len(skus))
 
             # ═══ Phase 6.46: 通用高密度不足检测 ═══
-            # SINGLE_LARGE/SINGLE_TALL 有 SKU 但远低于预期 → rescue 补充
+            # 有 SKU 但远低于预期 → rescue 补充
             if (plan.page_class in (SINGLE_LARGE, SINGLE_TALL, MULTI_SPARSE, IMG_LABEL, MIXED_OTHER)
-                    and len(skus) >= 2
+                    and len(skus) >= 1
                     and effective_screenshot):
                 expected_min = plan.expected_sku_range[0] or 4
-                if len(skus) < expected_min * 0.7:
+                # 降低触发阈值：当前SKU数 < 预期最小值的 85%（原来是 70%）
+                if len(skus) < expected_min * 0.85:
                     logger.info("high_density_undercount_rescue",
                                 page=page_no,
                                 current_skus=len(skus),
@@ -913,6 +914,34 @@ class PageProcessor:
                                             page=page_no, found=len(skus))
                 except Exception as e:
                     logger.warning("pure_visual_rescue_failed",
+                                   page=page_no, error=str(e))
+
+            # ═══ Phase 6.586: 混合型PDF无文字页面兜底 ═══
+            # 非纯图目录，但当前页面无文字+有图片+零SKU → 可能是产品展示页
+            # 用 pure_visual 模式尝试提取
+            if (not skus
+                    and not (catalog_profile and catalog_profile.is_pure_image_catalog)
+                    and not (raw.raw_text or "").strip()
+                    and screenshot
+                    and plan.page_class != BLANK):
+                logger.info("mixed_pdf_no_text_rescue", page=page_no,
+                            page_class=plan.page_class)
+                try:
+                    rescue_skus = await self._single_stage.extract_rescue(
+                        raw, screenshot=screenshot, scene_filter=False)
+                    if rescue_skus:
+                        rescue_skus = score_and_filter(
+                            rescue_skus, ocr_text="",
+                            catalog_profile=catalog_profile,
+                            scene_filter=False,
+                            pure_visual=True)
+                        if rescue_skus:
+                            skus = rescue_skus
+                            extraction_method = "mixed_pdf_no_text_rescue"
+                            logger.info("mixed_pdf_no_text_rescue_done",
+                                        page=page_no, found=len(skus))
+                except Exception as e:
+                    logger.warning("mixed_pdf_no_text_rescue_failed",
                                    page=page_no, error=str(e))
 
             # ═══ Phase 6.59: IMG_DENSE figure rescue ═══
