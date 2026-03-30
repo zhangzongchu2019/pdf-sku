@@ -27,8 +27,19 @@ logger = structlog.get_logger()
 
 MAX_RETRIES_PER_PROVIDER = 3  # 每个 provider 的重试次数
 EVAL_BATCH_SIZE = 5
-# 全局 LLM 并发上限，防止 API 429。通过环境变量 LLM_MAX_CONCURRENCY 可调。
+# 全局 LLM 并发上限，防止 API 429。通过环境变量 LLM_MAX_CONCURRENCY 热更新。
 LLM_MAX_CONCURRENCY = int(os.environ.get("LLM_MAX_CONCURRENCY", "120"))
+
+
+def _get_llm_concurrency() -> int:
+    """每次调用时从环境变量读取并发上限，支持运行时热更新。"""
+    try:
+        v = int(os.environ.get("LLM_MAX_CONCURRENCY", "120"))
+        if 1 <= v <= 65536:
+            return v
+    except (ValueError, TypeError):
+        pass
+    return 120
 # 连续超时阈值: 连续 N 次超时后自动禁用 provider
 CONSECUTIVE_ERROR_LIMIT = int(os.environ.get("LLM_ERROR_SKIP_THRESHOLD", "3"))
 PROVIDER_COOLDOWN_SECONDS = int(os.environ.get("LLM_PROVIDER_COOLDOWN", "600"))  # 10 minutes
@@ -64,6 +75,7 @@ class LLMService:
         self._default_client = default_client_name
         self._fallback_chain = fallback_chain or []
         self._llm_semaphore = asyncio.Semaphore(LLM_MAX_CONCURRENCY)
+        self._llm_semaphore_limit = LLM_MAX_CONCURRENCY
 
         # 加权轮询: 按并发权重重复 provider 名称
         # provider_weights: {"openrouter": 4, "openrouter_1": 4, "openrouter_nebula": 2, ...}
@@ -224,6 +236,18 @@ class LLMService:
         核心调用链: semaphore → circuit → rate_limit → budget → client.complete → record。
         带重试 + Provider Fallback 链。
         """
+        # 热更新并发上限: 从环境变量读取，动态扩/缩 Semaphore
+        new_limit = _get_llm_concurrency()
+        if new_limit != self._llm_semaphore_limit:
+            old_limit = self._llm_semaphore_limit
+            diff = new_limit - old_limit
+            if diff > 0:
+                for _ in range(diff):
+                    self._llm_semaphore.release()
+            # 缩容不主动 acquire（避免死锁），而是让现有请求自然消化
+            self._llm_semaphore_limit = new_limit
+            logger.info("llm_concurrency_hot_update", old=old_limit, new=new_limit)
+
         async with self._llm_semaphore:
             return await self._call_llm_inner(
                 operation, prompt, images, client_name, timeout)
