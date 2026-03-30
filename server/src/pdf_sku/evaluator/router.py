@@ -32,6 +32,7 @@ from pdf_sku.evaluator.scorer import Scorer, PageScore
 from pdf_sku.evaluator.router_logic import RouteDecider
 from pdf_sku.evaluator.variance_detector import VarianceDetector
 from pdf_sku.evaluator.eval_cache import EvalCache
+from pdf_sku.llm_adapter.client.request_utils import format_exception_for_reason
 from pdf_sku.config.service import ConfigProvider
 from pdf_sku.common.exceptions import EvalFailedError
 import structlog
@@ -141,7 +142,7 @@ class EvaluatorService:
                 result = await self._create_degraded(
                     db, job, prescan_data, profile,
                     route="HUMAN_ALL",
-                    reason=f"eval_failed:{type(e).__name__}")
+                    reason=f"eval_failed:{format_exception_for_reason(e)}")
 
         elapsed = time.monotonic() - start_time
         logger.info("evaluation_complete",

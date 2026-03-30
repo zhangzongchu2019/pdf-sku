@@ -12,10 +12,16 @@ import httpx
 import structlog
 
 from pdf_sku.llm_adapter.client.base import BaseLLMClient, LLMResponse
+from pdf_sku.llm_adapter.client.request_utils import (
+    prepare_request,
+    raise_for_status_with_context,
+    wrap_transport_error,
+)
 
 logger = structlog.get_logger()
 
 DEFAULT_GEMINI_API_BASE = "https://generativelanguage.googleapis.com"
+GEMINI_API_BASE = DEFAULT_GEMINI_API_BASE
 
 
 class GeminiClient(BaseLLMClient):
@@ -44,15 +50,26 @@ class GeminiClient(BaseLLMClient):
         json_mode: bool = False,
         images: list[bytes] | None = None,
     ) -> LLMResponse:
+        endpoint = f"{self._api_base}/{self._model}:generateContent"
+        prepared_images, request_metrics = prepare_request(
+            provider=self.provider,
+            model=self._model,
+            endpoint=endpoint,
+            prompt=prompt,
+            images=images,
+            json_mode=json_mode,
+            max_tokens=max_tokens,
+            use_data_url=False,
+        )
         parts = []
 
         # 图片 (vision)
-        if images:
-            for img_bytes in images:
-                b64 = base64.b64encode(img_bytes).decode()
+        if prepared_images:
+            for prepared in prepared_images:
+                b64 = base64.b64encode(prepared.data).decode()
                 parts.append({
                     "inline_data": {
-                        "mime_type": "image/jpeg",
+                        "mime_type": prepared.mime_type,
                         "data": b64,
                     }
                 })
@@ -73,9 +90,24 @@ class GeminiClient(BaseLLMClient):
 
         url = f"{self._api_base}/{self._model}:generateContent?key={self._api_key}"
         start = time.monotonic()
-        resp = await self._client.post(url, json=body)
+        try:
+            resp = await self._client.post(url, json=body)
+        except httpx.HTTPError as exc:
+            raise wrap_transport_error(
+                exc,
+                provider=self.provider,
+                model=self._model,
+                endpoint=endpoint,
+                request_metrics=request_metrics,
+            ) from exc
         latency = (time.monotonic() - start) * 1000
-        resp.raise_for_status()
+        raise_for_status_with_context(
+            resp,
+            provider=self.provider,
+            model=self._model,
+            endpoint=endpoint,
+            request_metrics=request_metrics,
+        )
         data = resp.json()
 
         candidates = data.get("candidates", [])

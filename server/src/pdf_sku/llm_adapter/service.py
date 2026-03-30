@@ -14,6 +14,10 @@ import os
 import time
 from pdf_sku.llm_adapter.client.base import BaseLLMClient, LLMResponse
 from pdf_sku.llm_adapter.client.registry import get_client
+from pdf_sku.llm_adapter.client.request_utils import (
+    LLMClientRequestError,
+    estimate_inline_bytes,
+)
 from pdf_sku.llm_adapter.prompt.engine import PromptEngine
 from pdf_sku.llm_adapter.parser.response_parser import ResponseParser, ParseResult
 from pdf_sku.llm_adapter.resilience.circuit_breaker import CircuitBreaker
@@ -21,6 +25,7 @@ from pdf_sku.llm_adapter.resilience.budget_guard import BudgetGuard
 from pdf_sku.llm_adapter.resilience.rate_limiter import RateLimiter
 from pdf_sku.evaluator.scorer import PageScore
 from pdf_sku.common.exceptions import LLMCircuitOpenError, RetryableError
+from pdf_sku.settings import settings
 import structlog
 
 logger = structlog.get_logger()
@@ -36,6 +41,47 @@ PROVIDER_COOLDOWN_SECONDS = int(os.environ.get("LLM_PROVIDER_COOLDOWN", "600")) 
 DEFAULT_TIMEOUT = float(os.environ.get("LLM_TIMEOUT_SECONDS", "300"))  # 5 minutes
 # 连续超时致命阈值: 连续 N 次超时后程序退出
 CONSECUTIVE_TIMEOUT_FATAL = int(os.environ.get("LLM_CONSECUTIVE_TIMEOUT_FATAL", "3"))
+
+
+def _estimate_image_inline_bytes(image_bytes: bytes) -> int:
+    """评估批次切分时的保守估算，宁可偏大。"""
+    return estimate_inline_bytes(len(image_bytes), "image/png", data_url=True)
+
+
+def _build_eval_batches(
+    screenshots: list[bytes],
+    pages: list[int],
+) -> list[tuple[list[bytes], list[int]]]:
+    max_images = max(1, min(EVAL_BATCH_SIZE, settings.llm_max_images_per_request))
+    max_inline_bytes = max(1, settings.llm_request_max_inline_bytes)
+
+    batches: list[tuple[list[bytes], list[int]]] = []
+    current_images: list[bytes] = []
+    current_pages: list[int] = []
+    current_inline_bytes = 0
+
+    for page_no, screenshot in zip(pages, screenshots):
+        est = _estimate_image_inline_bytes(screenshot)
+        should_flush = (
+            current_images
+            and (
+                len(current_images) >= max_images
+                or current_inline_bytes + est > max_inline_bytes
+            )
+        )
+        if should_flush:
+            batches.append((current_images, current_pages))
+            current_images = []
+            current_pages = []
+            current_inline_bytes = 0
+
+        current_images.append(screenshot)
+        current_pages.append(page_no)
+        current_inline_bytes += est
+
+    if current_images:
+        batches.append((current_images, current_pages))
+    return batches
 
 
 class LLMService:
@@ -137,16 +183,17 @@ class LLMService:
         pages = sample_pages or list(range(1, len(screenshots) + 1))
         page_scores: list[PageScore] = []
 
-        # 分批发送图片，每批最多 EVAL_BATCH_SIZE 张
-        for batch_start in range(0, len(screenshots), EVAL_BATCH_SIZE):
-            batch_end = batch_start + EVAL_BATCH_SIZE
-            batch_images = screenshots[batch_start:batch_end]
-            batch_pages = pages[batch_start:batch_end]
+        eval_batches = _build_eval_batches(screenshots, pages)
+        processed_pages = 0
+        for batch_index, (batch_images, batch_pages) in enumerate(eval_batches):
+            batch_start = processed_pages
 
             logger.info("eval_document_batch",
                         batch_start=batch_start,
                         batch_size=len(batch_images),
-                        total=len(screenshots))
+                        total=len(screenshots),
+                        batch_index=batch_index,
+                        batch_count=len(eval_batches))
 
             llm_response = await self._call_llm(
                 operation="evaluate_document",
@@ -183,6 +230,7 @@ class LLMService:
                         tokens_in=llm_response.usage.get("input_tokens", 0),
                         tokens_out=llm_response.usage.get("output_tokens", 0),
                         latency_ms=llm_response.latency_ms)
+            processed_pages += len(batch_images)
 
         logger.info("eval_document_complete",
                      pages=len(page_scores),
@@ -344,6 +392,31 @@ class LLMService:
                     self._record_error(provider_name)
                     break
 
+                except LLMClientRequestError as e:
+                    last_error = e
+                    total_attempts += 1
+                    self._consecutive_timeouts_global = 0
+                    if e.retryable:
+                        self._circuit.record_failure()
+                    log_payload = e.to_log_dict()
+                    log_payload.update(
+                        operation=operation,
+                        provider=provider_name,
+                        attempt=attempt + 1,
+                    )
+                    if e.retryable and attempt < MAX_RETRIES_PER_PROVIDER - 1:
+                        logger.warning("llm_call_retry", **log_payload)
+                        continue
+                    if e.retryable:
+                        self._record_error(provider_name)
+                        logger.warning("llm_provider_exhausted", **log_payload)
+                        break
+
+                    logger.warning("llm_invalid_request", **log_payload)
+                    if not e.allow_fallback or provider_name == providers[-1]:
+                        raise
+                    break
+
                 except Exception as e:
                     self._circuit.record_failure()
                     last_error = e
@@ -363,6 +436,9 @@ class LLMService:
                                     provider=provider_name, error=repr(e),
                                     operation=operation)
                     break
+
+        if isinstance(last_error, LLMClientRequestError) and not last_error.retryable:
+            raise last_error
 
         raise RetryableError(
             f"LLM call failed after {total_attempts} attempts "

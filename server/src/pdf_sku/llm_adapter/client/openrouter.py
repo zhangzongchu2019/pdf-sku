@@ -13,6 +13,11 @@ import httpx
 import structlog
 
 from pdf_sku.llm_adapter.client.base import BaseLLMClient, LLMResponse
+from pdf_sku.llm_adapter.client.request_utils import (
+    prepare_request,
+    raise_for_status_with_context,
+    wrap_transport_error,
+)
 
 logger = structlog.get_logger()
 
@@ -45,18 +50,28 @@ class OpenRouterClient(BaseLLMClient):
         json_mode: bool = False,
         images: list[bytes] | None = None,
     ) -> LLMResponse:
+        prepared_images, request_metrics = prepare_request(
+            provider=self.provider,
+            model=self._model,
+            endpoint=self._api_url,
+            prompt=prompt,
+            images=images,
+            json_mode=json_mode,
+            max_tokens=max_tokens,
+            use_data_url=True,
+        )
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
 
         # 构建 user message content
-        if images:
+        if prepared_images:
             content_parts = []
-            for img_bytes in images:
-                b64 = base64.b64encode(img_bytes).decode()
+            for prepared in prepared_images:
+                b64 = base64.b64encode(prepared.data).decode()
                 content_parts.append({
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                    "image_url": {"url": f"data:{prepared.mime_type};base64,{b64}"},
                 })
             content_parts.append({"type": "text", "text": prompt})
             messages.append({"role": "user", "content": content_parts})
@@ -78,9 +93,24 @@ class OpenRouterClient(BaseLLMClient):
         }
 
         start = time.monotonic()
-        resp = await self._client.post(self._api_url, json=body, headers=headers)
+        try:
+            resp = await self._client.post(self._api_url, json=body, headers=headers)
+        except httpx.HTTPError as exc:
+            raise wrap_transport_error(
+                exc,
+                provider=self.provider,
+                model=self._model,
+                endpoint=self._api_url,
+                request_metrics=request_metrics,
+            ) from exc
         latency = (time.monotonic() - start) * 1000
-        resp.raise_for_status()
+        raise_for_status_with_context(
+            resp,
+            provider=self.provider,
+            model=self._model,
+            endpoint=self._api_url,
+            request_metrics=request_metrics,
+        )
         data = resp.json()
 
         choices = data.get("choices", [])

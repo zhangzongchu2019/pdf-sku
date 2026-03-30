@@ -88,6 +88,16 @@ class Settings(BaseSettings):
     default_llm_client: str = ""
     llm_daily_budget_usd: float = 50.0
     llm_timeout_seconds: int = 60
+    llm_prompt_max_chars: int = 20000
+    llm_max_images_per_request: int = 5
+    llm_image_max_inline_bytes: int = 9437184  # 9 MiB, 留出 provider data-uri 余量
+    llm_request_max_inline_bytes: int = 18874368  # 18 MiB
+    llm_image_max_long_edge: int = 2400
+    llm_image_jpeg_quality_start: int = 85
+    llm_image_jpeg_quality_min: int = 55
+    llm_image_resize_ratio: float = 0.85
+    llm_image_min_edge: int = 512
+    llm_error_body_max_chars: int = 4000
 
     # === Collaboration ===
     wecom_webhook_url: str = ""

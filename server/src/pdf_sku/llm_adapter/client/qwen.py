@@ -11,6 +11,11 @@ import httpx
 import structlog
 
 from pdf_sku.llm_adapter.client.base import BaseLLMClient, LLMResponse
+from pdf_sku.llm_adapter.client.request_utils import (
+    prepare_request,
+    raise_for_status_with_context,
+    wrap_transport_error,
+)
 
 logger = structlog.get_logger()
 
@@ -42,18 +47,29 @@ class QwenClient(BaseLLMClient):
         images: list[bytes] | None = None,
     ) -> LLMResponse:
         is_vl = "vl" in self._model.lower()
+        api_url = QWEN_VL_BASE if is_vl else QWEN_API_BASE
+        prepared_images, request_metrics = prepare_request(
+            provider=self.provider,
+            model=self._model,
+            endpoint=api_url,
+            prompt=prompt,
+            images=images,
+            json_mode=json_mode,
+            max_tokens=max_tokens,
+            use_data_url=True,
+        )
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
 
-        if is_vl and images:
+        if is_vl and prepared_images:
             # Qwen-VL multimodal format (with images)
             import base64
             content_parts = []
-            for img_bytes in images:
-                b64 = base64.b64encode(img_bytes).decode()
+            for prepared in prepared_images:
+                b64 = base64.b64encode(prepared.data).decode()
                 content_parts.append({
-                    "image": f"data:image/jpeg;base64,{b64}",
+                    "image": f"data:{prepared.mime_type};base64,{b64}",
                 })
             content_parts.append({"text": prompt})
             messages.append({"role": "user", "content": content_parts})
@@ -80,11 +96,25 @@ class QwenClient(BaseLLMClient):
             "Content-Type": "application/json",
         }
 
-        api_url = QWEN_VL_BASE if is_vl else QWEN_API_BASE
         start = time.monotonic()
-        resp = await self._client.post(api_url, json=params, headers=headers)
+        try:
+            resp = await self._client.post(api_url, json=params, headers=headers)
+        except httpx.HTTPError as exc:
+            raise wrap_transport_error(
+                exc,
+                provider=self.provider,
+                model=self._model,
+                endpoint=api_url,
+                request_metrics=request_metrics,
+            ) from exc
         latency = (time.monotonic() - start) * 1000
-        resp.raise_for_status()
+        raise_for_status_with_context(
+            resp,
+            provider=self.provider,
+            model=self._model,
+            endpoint=api_url,
+            request_metrics=request_metrics,
+        )
         data = resp.json()
 
         output = data.get("output", {})
