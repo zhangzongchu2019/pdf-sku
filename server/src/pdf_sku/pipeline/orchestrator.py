@@ -18,6 +18,7 @@ from uuid import UUID
 from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from pdf_sku.common.media_variants import precompute_image_variants, precompute_page_variants
 from pdf_sku.common.models import PDFJob, Page
 from pdf_sku.common.enums import JobInternalStatus, PageStatus
 from pdf_sku.gateway.event_bus import event_bus
@@ -220,6 +221,20 @@ class Orchestrator:
             )
         )
 
+        if result.status != "AI_FAILED":
+            job_dir = Path(os.environ.get("JOB_DATA_DIR", "/data/jobs")) / str(job.job_id)
+            source_pdf = Path(self._resolve_file_path(job))
+            if source_pdf.exists():
+                try:
+                    precompute_page_variants(job_dir, source_pdf, page_no)
+                except Exception as e:
+                    logger.warning(
+                        "page_variants_precompute_failed",
+                        job_id=str(job.job_id),
+                        page_no=page_no,
+                        error=str(e),
+                    )
+
         # 持久化 SKU + Image + Binding
         if result.skus:
             await self._persist_skus(db, job.job_id, page_no, result)
@@ -274,6 +289,16 @@ class Orchestrator:
                 file_abs = job_dir / file_rel
                 if img.data:
                     file_abs.write_bytes(img.data)
+                    try:
+                        precompute_image_variants(job_dir, file_rel, image_id)
+                    except Exception as e:
+                        logger.warning(
+                            "image_variants_precompute_failed",
+                            job_id=str(job_id),
+                            page_no=page_no,
+                            image_id=image_id,
+                            error=str(e),
+                        )
 
                 bbox = [int(v) for v in img.bbox] if img.bbox else None
                 resolution = [int(img.width), int(img.height)] if img.width and img.height else None

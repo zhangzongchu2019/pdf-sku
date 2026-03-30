@@ -13,28 +13,34 @@ import { SKUList } from "../components/dashboard/SKUList";
 import { TimelineDrawer } from "../components/dashboard/TimelineDrawer";
 import { formatDate, formatPercent } from "../utils/format";
 import type { PageHeatmapCell } from "../components/dashboard/PageHeatmap";
-import type { PageDetailSKU } from "../api/jobs";
+import type { PageDetailSKU, SKUBindingImage, PageDetailImage } from "../api/jobs";
 
-function buildSkuImageUrls(
+function buildSkuThumbnailEntries(
   sku: Pick<PageDetailSKU, "images" | "image_paths">,
-  fallbackImageUrl: (imageId: string) => string,
+  thumbnailUrl: (imageId: string) => string,
+  originalUrl: (imageId: string) => string,
 ) {
-  const urls: string[] = [];
+  const entries: Array<{ imageId: string; thumbUrl: string; originalUrl: string }> = [];
 
   for (const img of sku.images || []) {
-    const url = img.image_url || fallbackImageUrl(img.image_id);
-    if (url && !urls.includes(url)) {
-      urls.push(url);
+    const url = img.thumbnail_url || thumbnailUrl(img.image_id);
+    if (url && !entries.some((entry) => entry.thumbUrl === url)) {
+      entries.push({
+        imageId: img.image_id,
+        thumbUrl: url,
+        originalUrl: img.image_url || originalUrl(img.image_id),
+      });
     }
   }
 
-  for (const url of sku.image_paths || []) {
-    if (url && !urls.includes(url)) {
-      urls.push(url);
-    }
-  }
+  return entries;
+}
 
-  return urls;
+function resolveOriginalImageUrl(
+  img: Pick<SKUBindingImage, "image_id" | "image_url"> | Pick<PageDetailImage, "image_id" | "image_url">,
+  fallbackUrl: (imageId: string) => string,
+) {
+  return img.image_url || fallbackUrl(img.image_id);
 }
 
 function skuPrimaryText(sku: Pick<PageDetailSKU, "sku_id" | "attributes">) {
@@ -93,13 +99,16 @@ export default function JobDetailPage() {
     }
   }, [jobId, selectedPage, tab]);
 
-  const apiBase = import.meta.env.VITE_API_BASE || "/api/v1";
-  const screenshotUrl = (pageNo: number) =>
-    `${apiBase}/jobs/${jobId}/pages/${pageNo}/screenshot`;
-  const imageUrl = (imageId: string) =>
+  const pageThumbnailUrl = (pageNo: number) =>
+    jobsApi.getPageThumbnailUrl(jobId!, pageNo);
+  const pagePreviewUrl = (pageNo: number) =>
+    jobsApi.getPagePreviewUrl(jobId!, pageNo);
+  const pageOriginalUrl = (pageNo: number) =>
+    jobsApi.getPageScreenshotUrl(jobId!, pageNo);
+  const imageThumbnailUrl = (imageId: string) =>
+    jobsApi.getImageThumbnailUrl(jobId!, imageId);
+  const imageOriginalUrl = (imageId: string) =>
     jobsApi.getImageUrl(jobId!, imageId);
-  const resolveImageUrl = (img: { image_id: string; image_url?: string }) =>
-    img.image_url || imageUrl(img.image_id);
 
   const toggleExpand = async (pageNo: number) => {
     if (expandedPage === pageNo) {
@@ -194,7 +203,7 @@ export default function JobDetailPage() {
                     style={{ cursor: "pointer" }}>
                   <td>
                     <img
-                      src={screenshotUrl(p.page_number)}
+                      src={pageThumbnailUrl(p.page_number)}
                       loading="lazy"
                       alt={`p${p.page_number}`}
                       style={{ width: 60, height: 80, objectFit: "cover", borderRadius: 3, border: "1px solid #2D3548" }}
@@ -215,10 +224,10 @@ export default function JobDetailPage() {
                         {/* Left: large screenshot */}
                         <div style={{ flexShrink: 0 }}>
                           <img
-                            src={screenshotUrl(p.page_number)}
+                            src={pagePreviewUrl(p.page_number)}
                             alt={`page-${p.page_number}`}
                             style={{ width: 300, borderRadius: 4, border: "1px solid #2D3548", cursor: "pointer" }}
-                            onClick={() => setLightboxImg(screenshotUrl(p.page_number))}
+                            onClick={() => setLightboxImg(pageOriginalUrl(p.page_number))}
                           />
                         </div>
                         {/* Right: SKUs with images */}
@@ -227,7 +236,7 @@ export default function JobDetailPage() {
                             页面 SKU ({pageDetail?.skus.length ?? 0})
                           </h4>
                           {pageDetail?.skus.map((sku) => {
-                            const skuImages = buildSkuImageUrls(sku, imageUrl);
+                            const skuImages = buildSkuThumbnailEntries(sku, imageThumbnailUrl, imageOriginalUrl);
                             return (
                               <div key={sku.sku_id} style={{ marginBottom: 10, padding: 10, backgroundColor: "#1B2233", borderRadius: 6, border: "1px solid #2D3548" }}>
                                 <div style={{ display: "flex", justifyContent: "space-between", gap: 12, fontSize: 12, marginBottom: 8 }}>
@@ -244,12 +253,15 @@ export default function JobDetailPage() {
                                 </div>
                                 {skuImages.length > 0 ? (
                                   <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                                    {skuImages.slice(0, 4).map((url) => (
+                                    {skuImages.slice(0, 4).map((item) => (
                                       <img
-                                        key={url}
-                                        src={url}
+                                        key={item.thumbUrl}
+                                        src={item.thumbUrl}
                                         style={{ width: 56, height: 56, objectFit: "cover", borderRadius: 3, border: "1px solid #2D3548", cursor: "pointer" }}
-                                        onClick={(e) => { e.stopPropagation(); setLightboxImg(url); }}
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setLightboxImg(item.originalUrl || imageOriginalUrl(item.imageId));
+                                        }}
                                       />
                                     ))}
                                     {skuImages.length > 4 && (
@@ -276,9 +288,9 @@ export default function JobDetailPage() {
                                 {pageDetail.images.map((img) => (
                                   <img
                                     key={img.image_id}
-                                    src={resolveImageUrl(img)}
+                                    src={img.thumbnail_url || imageThumbnailUrl(img.image_id)}
                                     style={{ width: 48, height: 48, objectFit: "cover", borderRadius: 3, border: "1px solid #2D3548", cursor: "pointer" }}
-                                    onClick={() => setLightboxImg(resolveImageUrl(img))}
+                                    onClick={() => setLightboxImg(resolveOriginalImageUrl(img, imageOriginalUrl))}
                                   />
                                 ))}
                               </div>

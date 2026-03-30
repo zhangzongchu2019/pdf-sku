@@ -15,10 +15,8 @@ export function usePrefetch(
     const timer = setTimeout(async () => {
       const nextPage = adjacentPages[0];
       try {
-        // Preload screenshot image
         const img = new Image();
-        img.src = `/api/v1/jobs/${currentJobId}/pages/${nextPage}/screenshot`;
-        // Preload page data
+        img.src = jobsApi.getPagePreviewUrl(currentJobId, nextPage);
         await jobsApi.getPage(currentJobId, nextPage);
       } catch {
         // Silent fail for prefetch

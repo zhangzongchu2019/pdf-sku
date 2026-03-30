@@ -22,6 +22,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
 from pdf_sku.common.dependencies import DBSession, RedisClient
+from pdf_sku.common.media_variants import (
+    IMAGE_VARIANTS,
+    PAGE_VARIANTS,
+    derived_cache_headers,
+    ensure_image_variant,
+    ensure_page_variant,
+    original_cache_headers,
+)
 from pdf_sku.common.models import (
     PDFJob,
     Page,
@@ -109,12 +117,41 @@ async def _build_sku_image_maps(
             "confidence": binding.binding_confidence,
             "rank": binding.rank,
             "image_url": image_url,
+            "thumbnail_url": f"{image_url}/thumbnail",
+            "preview_url": f"{image_url}/preview",
             "extracted_path": image_obj.extracted_path if image_obj else None,
         })
         if image_url not in image_paths_map[binding.sku_id]:
             image_paths_map[binding.sku_id].append(image_url)
 
     return bindings_map, image_paths_map
+
+
+async def _load_job_page(
+    db: AsyncSession,
+    job_id: uuid.UUID,
+    page_number: int,
+) -> tuple[PDFJob, Page | None]:
+    job_result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
+    job = job_result.scalar_one_or_none()
+    if not job:
+        raise JobNotFoundError(f"Job {job_id} not found")
+
+    page_result = await db.execute(
+        select(Page).where(Page.job_id == job_id, Page.page_number == page_number)
+    )
+    return job, page_result.scalar_one_or_none()
+
+
+async def _load_job_image(
+    db: AsyncSession,
+    job_id: uuid.UUID,
+    image_id: str,
+) -> Image | None:
+    result = await db.execute(
+        select(Image).where(Image.job_id == job_id, Image.image_id == image_id)
+    )
+    return result.scalar_one_or_none()
 
 
 # ───────────────────────── TUS 端点 ─────────────────────────
@@ -463,15 +500,7 @@ async def get_page_screenshot(
 ):
     """返回指定页面的截图 (PNG)。"""
 
-    job_result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
-    job = job_result.scalar_one_or_none()
-    if not job:
-        raise JobNotFoundError(f"Job {job_id} not found")
-
-    page_result = await db.execute(
-        select(Page).where(Page.job_id == job_id, Page.page_number == page_number)
-    )
-    page = page_result.scalar_one_or_none()
+    _, page = await _load_job_page(db, job_id, page_number)
     if not page:
         return JSONResponse(status_code=404, content={
             "error_code": "PAGE_NOT_FOUND",
@@ -483,7 +512,7 @@ async def get_page_screenshot(
 
     # 优先返回已缓存的截图
     if cache_path.exists():
-        return FileResponse(str(cache_path), media_type="image/png")
+        return FileResponse(str(cache_path), media_type="image/png", headers=original_cache_headers())
 
     # 显式指定的截图路径
     if page.screenshot_path:
@@ -491,7 +520,7 @@ async def get_page_screenshot(
         if not explicit.is_absolute():
             explicit = job_dir / explicit
         if explicit.exists():
-            return FileResponse(str(explicit), media_type="image/png")
+            return FileResponse(str(explicit), media_type="image/png", headers=original_cache_headers())
 
     source_pdf = job_dir / "source.pdf"
     if not source_pdf.exists():
@@ -539,7 +568,93 @@ async def get_page_screenshot(
             error=str(e),
         )
 
-    return Response(content=png_bytes, media_type="image/png")
+    return Response(content=png_bytes, media_type="image/png", headers=original_cache_headers())
+
+
+@router.get("/jobs/{job_id}/pages/{page_number}/thumbnail")
+async def get_page_thumbnail(
+    job_id: uuid.UUID,
+    db: DBSession,
+    page_number: int = PathParam(..., ge=1),
+):
+    """返回页面缩略图。"""
+    _, page = await _load_job_page(db, job_id, page_number)
+    if not page:
+        return JSONResponse(status_code=404, content={
+            "error_code": "PAGE_NOT_FOUND",
+            "message": f"Page {page_number} not found for job {job_id}",
+        })
+
+    job_dir = Path(settings.job_data_dir) / str(job_id)
+    source_pdf = job_dir / "source.pdf"
+    if not source_pdf.exists():
+        return JSONResponse(status_code=404, content={
+            "error_code": "SOURCE_PDF_MISSING",
+            "message": f"Source PDF not found for job {job_id}",
+        })
+
+    try:
+        thumb_path = ensure_page_variant(job_dir, source_pdf, page_number, "thumbnail")
+    except Exception as e:
+        logger.exception(
+            "page_thumbnail_failed",
+            job_id=str(job_id),
+            page_number=page_number,
+            error=str(e),
+        )
+        return JSONResponse(status_code=500, content={
+            "error_code": "THUMBNAIL_RENDER_FAILED",
+            "message": "Failed to render page thumbnail",
+        })
+
+    return FileResponse(
+        str(thumb_path),
+        media_type=PAGE_VARIANTS["thumbnail"].media_type,
+        headers=derived_cache_headers(),
+    )
+
+
+@router.get("/jobs/{job_id}/pages/{page_number}/preview")
+async def get_page_preview(
+    job_id: uuid.UUID,
+    db: DBSession,
+    page_number: int = PathParam(..., ge=1),
+):
+    """返回页面预览图。"""
+    _, page = await _load_job_page(db, job_id, page_number)
+    if not page:
+        return JSONResponse(status_code=404, content={
+            "error_code": "PAGE_NOT_FOUND",
+            "message": f"Page {page_number} not found for job {job_id}",
+        })
+
+    job_dir = Path(settings.job_data_dir) / str(job_id)
+    source_pdf = job_dir / "source.pdf"
+    if not source_pdf.exists():
+        return JSONResponse(status_code=404, content={
+            "error_code": "SOURCE_PDF_MISSING",
+            "message": f"Source PDF not found for job {job_id}",
+        })
+
+    try:
+        preview_path = ensure_page_variant(job_dir, source_pdf, page_number, "preview")
+    except Exception as e:
+        logger.exception(
+            "page_preview_failed",
+            job_id=str(job_id),
+            page_number=page_number,
+            error=str(e),
+        )
+        return JSONResponse(status_code=500, content={
+            "error_code": "PREVIEW_RENDER_FAILED",
+            "message": "Failed to render page preview",
+        })
+
+    return FileResponse(
+        str(preview_path),
+        media_type=PAGE_VARIANTS["preview"].media_type,
+        headers=derived_cache_headers(),
+    )
 
 
 @router.get("/jobs/{job_id}/images/{image_id}")
@@ -549,10 +664,7 @@ async def get_job_image(
     db: DBSession,
 ):
     """返回 Job 中提取的图片文件。"""
-    result = await db.execute(
-        select(Image).where(Image.job_id == job_id, Image.image_id == image_id)
-    )
-    img = result.scalar_one_or_none()
+    img = await _load_job_image(db, job_id, image_id)
     if not img or not img.extracted_path:
         return JSONResponse(status_code=404, content={
             "error_code": "IMAGE_NOT_FOUND",
@@ -568,7 +680,89 @@ async def get_job_image(
         })
 
     media = "image/jpeg" if img.format == "jpg" else f"image/{img.format or 'jpeg'}"
-    return FileResponse(str(file_path), media_type=media)
+    return FileResponse(str(file_path), media_type=media, headers=original_cache_headers())
+
+
+@router.get("/jobs/{job_id}/images/{image_id}/thumbnail")
+async def get_job_image_thumbnail(
+    job_id: uuid.UUID,
+    image_id: str,
+    db: DBSession,
+):
+    """返回提取图片的缩略图。"""
+    img = await _load_job_image(db, job_id, image_id)
+    if not img or not img.extracted_path:
+        return JSONResponse(status_code=404, content={
+            "error_code": "IMAGE_NOT_FOUND",
+            "message": f"Image {image_id} not found",
+        })
+
+    job_dir = Path(settings.job_data_dir) / str(job_id)
+    try:
+        thumb_path = ensure_image_variant(job_dir, img.extracted_path, image_id, "thumbnail")
+    except FileNotFoundError:
+        return JSONResponse(status_code=404, content={
+            "error_code": "IMAGE_FILE_MISSING",
+            "message": "Image file not found on disk",
+        })
+    except Exception as e:
+        logger.exception(
+            "image_thumbnail_failed",
+            job_id=str(job_id),
+            image_id=image_id,
+            error=str(e),
+        )
+        return JSONResponse(status_code=500, content={
+            "error_code": "THUMBNAIL_RENDER_FAILED",
+            "message": "Failed to render image thumbnail",
+        })
+
+    return FileResponse(
+        str(thumb_path),
+        media_type=IMAGE_VARIANTS["thumbnail"].media_type,
+        headers=derived_cache_headers(),
+    )
+
+
+@router.get("/jobs/{job_id}/images/{image_id}/preview")
+async def get_job_image_preview(
+    job_id: uuid.UUID,
+    image_id: str,
+    db: DBSession,
+):
+    """返回提取图片的预览图。"""
+    img = await _load_job_image(db, job_id, image_id)
+    if not img or not img.extracted_path:
+        return JSONResponse(status_code=404, content={
+            "error_code": "IMAGE_NOT_FOUND",
+            "message": f"Image {image_id} not found",
+        })
+
+    job_dir = Path(settings.job_data_dir) / str(job_id)
+    try:
+        preview_path = ensure_image_variant(job_dir, img.extracted_path, image_id, "preview")
+    except FileNotFoundError:
+        return JSONResponse(status_code=404, content={
+            "error_code": "IMAGE_FILE_MISSING",
+            "message": "Image file not found on disk",
+        })
+    except Exception as e:
+        logger.exception(
+            "image_preview_failed",
+            job_id=str(job_id),
+            image_id=image_id,
+            error=str(e),
+        )
+        return JSONResponse(status_code=500, content={
+            "error_code": "PREVIEW_RENDER_FAILED",
+            "message": "Failed to render image preview",
+        })
+
+    return FileResponse(
+        str(preview_path),
+        media_type=IMAGE_VARIANTS["preview"].media_type,
+        headers=derived_cache_headers(),
+    )
 
 
 @router.get("/jobs/{job_id}/pages/{page_number}/detail")
@@ -625,6 +819,8 @@ async def get_page_detail(
             "bbox": img.bbox,
             "extracted_path": img.extracted_path,
             "image_url": _job_image_url(job_id, img.image_id),
+            "thumbnail_url": f"{_job_image_url(job_id, img.image_id)}/thumbnail",
+            "preview_url": f"{_job_image_url(job_id, img.image_id)}/preview",
             "resolution": img.resolution,
             "short_edge": img.short_edge,
             "search_eligible": img.search_eligible,

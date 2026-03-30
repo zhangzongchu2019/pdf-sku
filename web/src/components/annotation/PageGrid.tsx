@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { jobsApi } from "../../api/jobs";
 
 /**
  * 页面缩略图网格 — 左面板 [§7.4]
@@ -97,7 +98,7 @@ function PageThumbnail({
     >
       {loaded ? (
         <img
-          src={`/api/v1/jobs/${jobId}/pages/${page.page_no}/screenshot?w=120`}
+          src={jobsApi.getPageThumbnailUrl(jobId, page.page_no)}
           alt={`第 ${page.page_no} 页`}
           style={{ width: "100%", height: 80, objectFit: "cover" }}
           loading="lazy"

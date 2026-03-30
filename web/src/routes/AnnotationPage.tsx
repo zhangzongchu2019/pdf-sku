@@ -4,6 +4,7 @@ import { useAnnotationStore } from "../stores/annotationStore";
 import { useJobStore } from "../stores/jobStore";
 import { useNotificationStore } from "../stores/notificationStore";
 import { useSettingsStore } from "../stores/settingsStore";
+import { jobsApi } from "../api/jobs";
 import StatusBadge from "../components/common/StatusBadge";
 import CanvasEngine from "../components/canvas/CanvasEngine";
 import GroupPanel from "../components/annotation/GroupPanel";
@@ -43,8 +44,7 @@ export default function AnnotationPage() {
     fetchSkus(currentTask.job_id, currentTask.page_number).then(() => {
       setSkus(useJobStore.getState().skus);
     });
-    // Page screenshot URL
-    setPageImageUrl(`/api/v1/jobs/${currentTask.job_id}/pages/${currentTask.page_number}/screenshot`);
+    setPageImageUrl(jobsApi.getPageScreenshotUrl(currentTask.job_id, currentTask.page_number));
 
     return () => reset();
   }, [currentTask?.task_id]);

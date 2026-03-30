@@ -7,6 +7,8 @@ export interface SKUBindingImage {
   confidence: number;
   rank: number;
   image_url?: string;
+  thumbnail_url?: string;
+  preview_url?: string;
   extracted_path?: string;
 }
 
@@ -31,6 +33,8 @@ export interface PageDetailImage {
   bbox: number[] | null;
   extracted_path: string;
   image_url?: string;
+  thumbnail_url?: string;
+  preview_url?: string;
   resolution: number[] | null;
   short_edge: number;
   search_eligible: boolean;
@@ -96,9 +100,34 @@ export const jobsApi = {
   getPageDetail: (jobId: string, pageNo: number) =>
     api.get<PageDetail>(`/jobs/${jobId}/pages/${pageNo}/detail`),
 
+  getPageThumbnailUrl: (jobId: string, pageNo: number) => {
+    const base = import.meta.env.VITE_API_BASE || "/api/v1";
+    return `${base}/jobs/${jobId}/pages/${pageNo}/thumbnail`;
+  },
+
+  getPagePreviewUrl: (jobId: string, pageNo: number) => {
+    const base = import.meta.env.VITE_API_BASE || "/api/v1";
+    return `${base}/jobs/${jobId}/pages/${pageNo}/preview`;
+  },
+
+  getPageScreenshotUrl: (jobId: string, pageNo: number) => {
+    const base = import.meta.env.VITE_API_BASE || "/api/v1";
+    return `${base}/jobs/${jobId}/pages/${pageNo}/screenshot`;
+  },
+
   getImageUrl: (jobId: string, imageId: string) => {
     const base = import.meta.env.VITE_API_BASE || "/api/v1";
     return `${base}/jobs/${jobId}/images/${imageId}`;
+  },
+
+  getImageThumbnailUrl: (jobId: string, imageId: string) => {
+    const base = import.meta.env.VITE_API_BASE || "/api/v1";
+    return `${base}/jobs/${jobId}/images/${imageId}/thumbnail`;
+  },
+
+  getImagePreviewUrl: (jobId: string, imageId: string) => {
+    const base = import.meta.env.VITE_API_BASE || "/api/v1";
+    return `${base}/jobs/${jobId}/images/${imageId}/preview`;
   },
 
   dashboard: () => api.get<DashboardMetrics>("/dashboard/metrics"),

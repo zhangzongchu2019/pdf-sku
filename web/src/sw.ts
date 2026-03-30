@@ -1,12 +1,12 @@
 /**
- * Service Worker for screenshot caching
- * 缓存截图到 Cache API，减少重复下载
+ * Cache derived preview assets locally.
+ * 只缓存缩略图/预览图，不缓存原始大图。
  */
 /// <reference lib="webworker" />
 declare const self: ServiceWorkerGlobalScope;
 
-const CACHE_NAME = "pdf-sku-screenshots-v1";
-const SCREENSHOT_PATTERN = /\/api\/v1\/jobs\/[^/]+\/pages\/\d+\/screenshot/;
+const CACHE_NAME = "pdf-sku-derived-images-v2";
+const DERIVED_ASSET_PATTERN = /\/api\/v1\/jobs\/[^/]+\/(?:pages\/\d+\/(?:thumbnail|preview)|images\/[^/]+\/(?:thumbnail|preview))/;
 
 /* Install */
 self.addEventListener("install", (_event) => {
@@ -27,12 +27,11 @@ self.addEventListener("activate", (event) => {
   self.clients.claim();
 });
 
-/* Fetch — cache-first for screenshots */
+/* Fetch — cache-first for derived images */
 self.addEventListener("fetch", (event) => {
   const { request } = event;
 
-  // Only cache screenshot requests
-  if (!SCREENSHOT_PATTERN.test(request.url)) return;
+  if (!DERIVED_ASSET_PATTERN.test(request.url)) return;
 
   event.respondWith(
     caches.open(CACHE_NAME).then(async (cache) => {
@@ -64,7 +63,7 @@ self.addEventListener("message", (event) => {
 
   if (event.data?.type === "PREFETCH_SCREENSHOT") {
     const url = event.data.url as string;
-    if (url && SCREENSHOT_PATTERN.test(url)) {
+    if (url && DERIVED_ASSET_PATTERN.test(url)) {
       caches.open(CACHE_NAME).then(async (cache) => {
         const existing = await cache.match(url);
         if (!existing) {
