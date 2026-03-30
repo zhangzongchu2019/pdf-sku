@@ -7,11 +7,26 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 from jose import jwt, JWTError
+from pdf_sku.settings import settings
 
 # ── 配置 ──
-SECRET_KEY = os.environ.get("JWT_SECRET_KEY", secrets.token_urlsafe(48))
+DEV_JWT_SECRET_KEY = "pdf-sku-dev-jwt-secret"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("JWT_EXPIRE_MINUTES", "480"))  # 8h
+
+
+def resolve_jwt_secret_key(app_env: str, configured_secret: str | None) -> str:
+    secret = (configured_secret or "").strip()
+    if secret:
+        return secret
+
+    if app_env.strip().lower() in {"development", "dev", "test", "testing"}:
+        return DEV_JWT_SECRET_KEY
+
+    return secrets.token_urlsafe(48)
+
+
+SECRET_KEY = resolve_jwt_secret_key(settings.app_env, settings.jwt_secret_key)
+ACCESS_TOKEN_EXPIRE_MINUTES = settings.jwt_expire_minutes
 
 
 # ────────────────── 密码哈希 (sha256 + salt, 无需额外依赖) ──────────────────
