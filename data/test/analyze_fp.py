@@ -3,7 +3,7 @@ import json
 import os
 from collections import Counter, defaultdict
 
-CACHE_DIR = "/home/zzc/pdf-sku/server/data/benchmark_cache"
+CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "server", "data", "benchmark_cache")
 
 DATASETS = [
     "2025相约餐饮家具",

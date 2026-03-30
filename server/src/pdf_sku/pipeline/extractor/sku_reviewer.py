@@ -29,6 +29,8 @@ REVIEW_PROMPT = """你是一个商品数据审核员。请对照 PDF 页面截�
 - 实际是页面标题、分类标题、品牌介绍等非商品信息
 - 同一商品被重复提取（保留信息最完整的那条）
 - 实际是产品变体/规格描述（如"床垫尺寸"、"外径尺寸"、"常规款/宽屏款"），而非独立产品
+- 尺寸标注被当成产品: model_number 是纯尺寸（如"192/222cm"、"90cm"、"165/195cm"）且 product_name 是"床垫"或尺寸数字 → 这是主产品的规格参数页，不是独立商品，必须丢弃
+- 场景装饰物: product_name 是吊灯、装饰画、地毯、绿植、花瓶、靠枕、窗帘、书籍、遥控器收纳盒、床单等 → 除非有明确型号+价格标注，否则丢弃
 - 颜色/材质描述被误当作产品名称（如"高级灰"、"胡桃色"）
 - 品牌来源/参考文字（如"EDRA STANDARD BED"、"MINOTTI LAWRENCE BED"）— 这些是设计参考来源而非在售商品名称
 - 如果同一页面已有对应的中文产品名称（如"花瓣床"），英文品牌来源描述应丢弃
@@ -112,9 +114,9 @@ class SKUReviewer:
                                    original=len(skus),
                                    msg="Reviewer discarded all SKUs, keeping originals")
                     return skus
-                # 场景页允许 Reviewer 丢弃更多（场景图册大多数是装饰品，应该丢弃）
-                # 非场景页: 丢弃数 > 保留数 → 回退
-                discard_ratio = 5 if scene_filter else 1
+                # Reviewer 基于截图对照审核，可信度较高
+                # 仅在全部丢弃时回退（上面已处理），其他情况信任 Reviewer
+                discard_ratio = 100
                 if discarded_count > len(reviewed) * discard_ratio:
                     logger.warning("sku_review_too_aggressive_fallback",
                                    original=len(skus), kept=len(reviewed),

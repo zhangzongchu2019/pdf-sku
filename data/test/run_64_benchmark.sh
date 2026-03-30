@@ -1,7 +1,7 @@
 #!/bin/bash
 # 64个样本全量测试: 原34基线 + 30新增
 # 先归档旧缓存，然后逐个运行
-cd /home/zzc/pdf-sku/server
+cd "$(dirname "$0")/../../server"
 
 # ── 原 34 基线数据集 ──
 BASELINE=(

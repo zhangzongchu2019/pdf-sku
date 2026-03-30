@@ -1,6 +1,7 @@
 """SKUImageBinder 测试。"""
 from pdf_sku.pipeline.ir import SKUResult, ImageInfo, ClassifyResult
 from pdf_sku.pipeline.binder.binder import SKUImageBinder
+from pdf_sku.pipeline.classifier.fitz_classifier import PagePlan
 
 
 def test_bind_single_match():
@@ -40,6 +41,26 @@ def test_bind_ambiguous():
     if results[0].is_ambiguous:
         assert results[0].image_id is None
         assert len(results[0].candidates) >= 2
+
+
+def test_bind_single_sku_page_plan_all_to_one():
+    binder = SKUImageBinder()
+    skus = [SKUResult(sku_id="s1", source_bbox=(100, 100, 200, 200))]
+    images = [
+        ImageInfo(image_id="i1", bbox=(800, 800, 900, 900)),
+        ImageInfo(image_id="i2", bbox=(50, 50, 100, 100)),
+    ]
+
+    results = binder.bind(
+        skus,
+        images,
+        ClassifyResult(layout_type="freeform"),
+        page_plan=PagePlan(page_class="SINGLE_STD"),
+    )
+
+    assert len(results) == 2
+    assert [result.image_id for result in results] == ["i1", "i2"]
+    assert all(result.method == "all_to_one" for result in results)
 
 
 def test_bind_empty_skus():

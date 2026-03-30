@@ -3,8 +3,9 @@ import json
 import os
 from collections import Counter
 
-CACHE_DIR = "/home/zzc/pdf-sku/server/data/benchmark_cache"
-EXCEL_DIR = "/home/zzc/pdf-sku/server/data/benchmark_excel"
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CACHE_DIR = os.path.join(_PROJECT_ROOT, "server", "data", "benchmark_cache")
+EXCEL_DIR = os.path.join(_PROJECT_ROOT, "server", "data", "benchmark_excel")
 
 DATASETS = [
     ("2025相约餐饮家具", 29, 318),
@@ -44,7 +45,7 @@ DATASETS = [
 def load_gt_models(name):
     """Try to load ground truth models from Excel benchmark data."""
     # Check if there's a benchmark config
-    config_path = "/home/zzc/pdf-sku/server/data/benchmark_datasets.json"
+    config_path = os.path.join(_PROJECT_ROOT, "server", "data", "benchmark_datasets.json")
     if os.path.exists(config_path):
         with open(config_path) as f:
             configs = json.load(f)

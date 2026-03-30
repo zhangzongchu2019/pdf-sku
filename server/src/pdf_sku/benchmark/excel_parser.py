@@ -112,8 +112,10 @@ def parse_excel(excel_path: Path) -> list[GroundTruthSKU]:
         name = _get("product_name")
         model = _get("model_number")
         tag = _get("tag")
-        # 跳过无名称、无货号且无标签的空行
-        if not name and not model and not tag:
+        source = _get("source")
+        # 跳过无名称、无货号、无标签且无来源的空行
+        # 保留有 source 的行（纯图片产品目录，商家只提供图片无文字）
+        if not name and not model and not tag and not source:
             continue
 
         skus.append(GroundTruthSKU(

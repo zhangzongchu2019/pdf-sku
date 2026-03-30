@@ -471,14 +471,17 @@ def score_and_filter(
     removed = 0
     is_combo = catalog_profile and catalog_profile.is_combo_catalog
     is_pure_img = catalog_profile and catalog_profile.is_pure_image_catalog
-    is_one_per_page = catalog_profile and catalog_profile.is_one_product_per_page
 
     for sku in skus:
         name = (sku.attributes.get("product_name") or "").strip()
-        # 空名 → 直接丢弃
+        # 空名: 纯图目录中保留（产品可以只有图片没有文字），其他丢弃
         if not name:
-            removed += 1
-            continue
+            if is_pure_img or pure_visual:
+                name = "产品图片"
+                sku.attributes["product_name"] = name
+            else:
+                removed += 1
+                continue
 
         # 计算 6 维分数
         s_model = _score_has_model(sku)
@@ -640,8 +643,7 @@ def score_and_filter(
 
         # ── B4: 无型号+低conf+无价格 快速过滤 ──
         # conf < 0.35 + 无有效型号 + 无价格 → 直接 invalid
-        # 精准命中: 凯跃营销文案(0.27), 万日红低conf配件(0.25-0.30)
-        if s_model == 0.0 and s_price == 0.0 and s_llm < 0.25:
+        if s_model == 0.0 and s_price == 0.0 and s_llm < 0.30 and not (is_pure_img or pure_visual):
             removed += 1
             logger.debug("low_conf_no_model_price_filtered",
                          name=name[:60], llm_conf=round(s_llm, 3))
@@ -658,16 +660,9 @@ def score_and_filter(
 
         final_score = max(0.0, min(1.0, raw_score + penalty))
 
-        # 每页一产品纯图目录: 几乎不可能有型号/价格/OCR 信号,
-        # 只要 LLM 识别出产品名就应保留, 使用极低阈值
-        if is_one_per_page and pure_visual and final_score < SCORE_THRESHOLD:
-            if name and s_name > 0.0:
-                final_score = max(final_score, SCORE_THRESHOLD)
-                logger.debug("one_product_per_page_rescue",
-                             name=name[:60], score=round(final_score, 3))
-
-        if final_score >= SCORE_THRESHOLD:
-            # 将综合分数调制回写 confidence
+        # 纯图目录/纯图页面: 降低阈值，产品图片本身就是有效输出
+        threshold = SCORE_THRESHOLD * 0.5 if (is_pure_img or pure_visual) else SCORE_THRESHOLD
+        if final_score >= threshold:
             sku.confidence = round(final_score, 3)
             kept.append(sku)
         else:

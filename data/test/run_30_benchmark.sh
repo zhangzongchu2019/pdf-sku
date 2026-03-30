@@ -1,6 +1,6 @@
 #!/bin/bash
 # 30个样本按页数升序逐个运行 benchmark
-cd /home/zzc/pdf-sku/server
+cd "$(dirname "$0")/../../server"
 
 DATASETS=(
   "数字版-外贸铁线餐桌椅*"

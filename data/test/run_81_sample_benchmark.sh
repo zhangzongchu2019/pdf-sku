@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-cd /home/zzc/pdf-sku/server
+cd "$(dirname "$0")/../../server"
 
 DATASETS=(
   "2025年办公空间产品手册removed_136-138"

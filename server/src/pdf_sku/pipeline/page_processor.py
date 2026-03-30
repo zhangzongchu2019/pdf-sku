@@ -305,15 +305,6 @@ class PageProcessor:
             # 纯图产品目录：禁用场景过滤（产品无文字标注是正常的）
             if catalog_profile and catalog_profile.is_pure_image_catalog:
                 plan.scene_filter = False
-            # 每页一产品目录：即使图片覆盖率低 (白底产品图)，
-            # 也标记 pure_visual，确保评分和 rescue 逻辑生效
-            if (catalog_profile and catalog_profile.is_one_product_per_page
-                    and not plan.pure_visual
-                    and fitz_meta.text_len <= 30
-                    and plan.page_class in (MULTI_SPARSE, SINGLE_STD,
-                                            SINGLE_LARGE, SINGLE_TALL)):
-                plan.pure_visual = True
-                plan.scene_filter = False
             logger.info("fitz_classify", page=page_no,
                         page_class=plan.page_class,
                         legacy=plan.legacy_type,
@@ -463,29 +454,8 @@ class PageProcessor:
                     fitz_page_class=plan.page_class,
                     classification_confidence=0.90)
 
-            skip_extraction = False
-
-            # ═══ Phase 5.9: 纯图每页一产品快速路径 ═══
-            # 纯图目录 + 无文字页: 跳过复杂提取流程，用轻量 prompt 直接识别产品
-            if (catalog_profile
-                    and catalog_profile.is_one_product_per_page
-                    and plan.pure_visual
-                    and screenshot
-                    and fitz_meta.text_len <= 30):
-                identify_skus = await self._single_stage.extract_pure_visual(
-                    screenshot=screenshot)
-                if identify_skus:
-                    skus = identify_skus
-                    extraction_method = "pure_visual_identify"
-                    logger.info("pure_visual_identify_done",
-                                page=page_no, found=len(skus),
-                                names=[s.attributes.get("product_name", "")[:20]
-                                       for s in skus])
-                    # 跳过后续提取/rescue/companion 流程，直接进入去重和导出
-                    skip_extraction = True
-
             # ═══ Phase 6: SKU 提取 (策略路由) ═══
-            if plan.slices and screenshots and not skip_extraction:
+            if plan.slices and screenshots:
                 # 切片模式: 每片独立送 LLM，合并去重
                 _ocr_text_for_sliced = OcrEngine.blocks_to_text(ocr_blocks) if ocr_blocks else ""
                 skus = await self._extract_sliced(raw, plan, screenshots,
@@ -566,7 +536,7 @@ class PageProcessor:
                         scene_filter=plan.scene_filter, plan=plan)
                     if skus:
                         extraction_method = "ocr_guided"
-            elif not skip_extraction:
+            else:
                 # 整页模式: 原有三路策略
                 skus = await self._extract_skus(
                     raw, page_type, screenshot, features,
@@ -578,8 +548,7 @@ class PageProcessor:
 
             # ═══ Phase 6.3: 低提取二次 Pass (rescue) ═══
             effective_screenshot = screenshot or (screenshots[0] if screenshots else b"")
-            if (not skip_extraction
-                    and len(skus) <= 1
+            if (len(skus) <= 1
                     and page_type in ("A", "B", "C")
                     and effective_screenshot):
                 retry_screenshot = effective_screenshot
@@ -765,12 +734,13 @@ class PageProcessor:
                                         page=page_no, total=len(skus))
 
             # ═══ Phase 6.46: 通用高密度不足检测 ═══
-            # SINGLE_LARGE/SINGLE_TALL 有 SKU 但远低于预期 → rescue 补充
+            # 有 SKU 但远低于预期 → rescue 补充
             if (plan.page_class in (SINGLE_LARGE, SINGLE_TALL, MULTI_SPARSE, IMG_LABEL, MIXED_OTHER)
-                    and len(skus) >= 2
+                    and len(skus) >= 1
                     and effective_screenshot):
                 expected_min = plan.expected_sku_range[0] or 4
-                if len(skus) < expected_min * 0.7:
+                # 降低触发阈值：当前SKU数 < 预期最小值的 85%（原来是 70%）
+                if len(skus) < expected_min * 0.85:
                     logger.info("high_density_undercount_rescue",
                                 page=page_no,
                                 current_skus=len(skus),
@@ -810,18 +780,6 @@ class PageProcessor:
                 if not is_image_catalog:
                     skus = dedup_by_similarity(skus)
 
-                # 每页一产品目录 (多视图): MULTI_SPARSE 页面上多个
-                # 提取结果实际是同一产品的不同角度照片，合并为 1 个 SKU
-                if (catalog_profile
-                        and catalog_profile.is_one_product_per_page
-                        and plan.page_class == MULTI_SPARSE
-                        and len(skus) > 1):
-                    best = max(skus, key=lambda s: s.confidence)
-                    logger.info("multi_view_merge",
-                                page=page_no, before=len(skus),
-                                kept=best.attributes.get("product_name", "")[:40])
-                    skus = [best]
-
                 if len(skus) < before:
                     logger.info("dedup_chain_applied",
                                 page=page_no, before=before, after=len(skus))
@@ -846,8 +804,7 @@ class PageProcessor:
 
             # ═══ Phase 6.55: Companion Rescue (配套产品补提取) ═══
             # Companion SKU 经过 scorer 过滤后再加入
-            if (not skip_extraction
-                    and 1 <= len(skus) <= 2
+            if (1 <= len(skus) <= 2
                     and plan.page_class in (SINGLE_LARGE, SINGLE_TALL, IMG_LABEL,
                                             "MULTI_SPARSE", IMG_DENSE)
                     and effective_screenshot):
@@ -959,33 +916,33 @@ class PageProcessor:
                     logger.warning("pure_visual_rescue_failed",
                                    page=page_no, error=str(e))
 
-            # ═══ Phase 6.586: 纯图页面产品识别兜底 ═══
-            # 纯图目录中 single_stage 返回空 → 用轻量 prompt 只识别产品名
+            # ═══ Phase 6.586: 混合型PDF无文字页面兜底 ═══
+            # 非纯图目录，但当前页面无文字+有图片+零SKU → 可能是产品展示页
+            # 用 pure_visual 模式尝试提取
             if (not skus
-                    and catalog_profile
-                    and catalog_profile.is_one_product_per_page
-                    and plan.pure_visual
-                    and effective_screenshot
-                    and fitz_meta.image_count >= 1):
+                    and not (catalog_profile and catalog_profile.is_pure_image_catalog)
+                    and not (raw.raw_text or "").strip()
+                    and screenshot
+                    and plan.page_class != BLANK):
+                logger.info("mixed_pdf_no_text_rescue", page=page_no,
+                            page_class=plan.page_class)
                 try:
-                    identify_skus = await self._single_stage.extract_pure_visual(
-                        screenshot=screenshot)
-                    if identify_skus:
-                        skus = identify_skus
-                        extraction_method = "pure_visual_identify"
-                        skip_extraction = True
-                        logger.info("pure_visual_identify_done",
-                                    page=page_no, found=len(skus),
-                                    names=[s.attributes.get("product_name", "")[:20]
-                                           for s in skus])
-                    else:
-                        logger.warning("pure_visual_identify_empty",
-                                       page=page_no)
-                        fallback_reason = "pure_visual_api_no_result"
+                    rescue_skus = await self._single_stage.extract_rescue(
+                        raw, screenshot=screenshot, scene_filter=False)
+                    if rescue_skus:
+                        rescue_skus = score_and_filter(
+                            rescue_skus, ocr_text="",
+                            catalog_profile=catalog_profile,
+                            scene_filter=False,
+                            pure_visual=True)
+                        if rescue_skus:
+                            skus = rescue_skus
+                            extraction_method = "mixed_pdf_no_text_rescue"
+                            logger.info("mixed_pdf_no_text_rescue_done",
+                                        page=page_no, found=len(skus))
                 except Exception as e:
-                    logger.warning("pure_visual_identify_failed",
+                    logger.warning("mixed_pdf_no_text_rescue_failed",
                                    page=page_no, error=str(e))
-                    fallback_reason = f"pure_visual_api_error: {e}"
 
             # ═══ Phase 6.59: IMG_DENSE figure rescue ═══
             # IMG_DENSE 零 SKU + YOLO 检测到 figure → 按区域裁剪让 LLM 识别产品
@@ -1119,7 +1076,7 @@ class PageProcessor:
                 skus, hash_prefix, page_no, raw.metadata.page_height)
 
             # ═══ Phase 8: 绑定 ═══
-            bindings = self._binder.bind(skus, raw.images, cls_result)
+            bindings = self._binder.bind(skus, raw.images, cls_result, page_plan=plan)
 
             # Composite 图片: 从截图裁剪生成实际图片数据
             if screenshot:

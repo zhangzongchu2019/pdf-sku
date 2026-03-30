@@ -118,6 +118,12 @@ def _is_scene_prop(name: str) -> bool:
     core = _strip_to_core(name)
     if core in SCENE_PROPS:
         return True
+    # 取首行（换行前），检查是否以黑名单词结尾或等于黑名单词
+    # 处理"原木色床头板"、"贝壳夏日系列床头板"等带修饰前缀的名称
+    first_line = name.split('\n')[0].strip()
+    for prop in SCENE_PROPS:
+        if first_line.endswith(prop) and len(first_line) <= len(prop) + 10:
+            return True
     # 名称包含黑名单词且名称较短（避免误杀如"茶几柜"类合法产品名）
     if len(name) <= 6:
         for prop in SCENE_PROPS:
@@ -208,6 +214,13 @@ def pre_filter(skus: list[SKUResult], *, scene_filter: bool = False) -> list[SKU
         has_model = bool(model) or bool(_MODEL_RE.search(name))
         has_price = bool(price) or bool(_PRICE_RE.search(name))
         if has_model or has_price:
+            # 即使有型号，如果名称核心词命中硬黑名单且无价格 → 仍过滤
+            # 场景: LLM 为床头板/装饰画等编造型号 (如 SHELL-BED01)
+            if _is_scene_prop(name) and not has_price:
+                removed += 1
+                logger.debug("sku_scene_prop_with_model_filtered",
+                             name=name[:60], model=model[:30])
+                continue
             kept.append(sku)
             continue
 
@@ -324,7 +337,8 @@ def _merge_variant_color(source: SKUResult, target: SKUResult) -> None:
 
 def dedup_by_model(skus: list[SKUResult]) -> list[SKUResult]:
     """
-    同 model_number 去重: 保留 confidence 最高的。
+    同 model_number 去重: 保留 confidence 最高的，聚合颜色/图片。
+    同型号不同规格（如1人位/3人位）是同一产品的变体，合并处理。
     """
     if not skus:
         return skus
@@ -338,7 +352,7 @@ def dedup_by_model(skus: list[SKUResult]) -> list[SKUResult]:
             no_model.append(sku)
             continue
         norm = normalize_model(model)
-        key = norm  # 同型号合并，颜色/尺寸作为规格 (用户确认: 同编号不同颜色尺寸=同一产品)
+        key = norm  # 同型号合并，颜色/尺寸作为规格
         existing = model_map.get(key)
         if existing is None:
             model_map[key] = sku
@@ -834,12 +848,12 @@ def _dedup_cross_page_by_name_similarity(
                 color_b = (sku_b.attributes.get("color") or "").strip().lower()
                 if color_a and color_b and color_a != color_b:
                     continue
-                # 豁免: 来自不同页面且都是 pure_visual 提取
-                page_a = getattr(sku_a, "page_no", None)
-                page_b = getattr(sku_b, "page_no", None)
-                if (page_a and page_b and page_a != page_b
-                        and getattr(sku_a, "extraction_method", "") in ("pure_visual_rescue", "img_dense_figure_rescue")
-                        and getattr(sku_b, "extraction_method", "") in ("pure_visual_rescue", "img_dense_figure_rescue")):
+                # 豁免: 来自不同页面的同名产品 → 大概率是不同款式，不去重
+                sid_a = sku_a.sku_id or ""
+                sid_b = sku_b.sku_id or ""
+                page_a_id = sid_a.split("_")[1] if len(sid_a.split("_")) >= 2 else ""
+                page_b_id = sid_b.split("_")[1] if len(sid_b.split("_")) >= 2 else ""
+                if page_a_id and page_b_id and page_a_id != page_b_id:
                     continue
                 # 保留 confidence 高的
                 if sku_b.confidence > sku_a.confidence:
@@ -921,16 +935,11 @@ def cross_page_dedup(
     if len(all_skus) <= 1:
         return all_skus
     before = len(all_skus)
-    is_one_per_page = catalog_profile and catalog_profile.is_one_product_per_page
-
     result = dedup_by_model(all_skus)                      # 型号去重
     result = _merge_variant_size(result)                    # 同型号尺寸变体合并
-    if not is_one_per_page:
-        # 纯图每页一产品目录: 不同页面是不同产品，通用名称("休闲椅")
-        # 相似但不代表是同一产品，跳过名称相似度去重和无型号合并
-        result = _merge_no_model_into_model_bearing(result)     # 无型号→有型号合并
-        result = _dedup_cross_page_by_name_similarity(result)   # 名称相似度去重
-        result = _dedup_no_model_safe(result, catalog_profile)  # 高频重名去重
+    result = _merge_no_model_into_model_bearing(result)     # 无型号→有型号合并
+    result = _dedup_cross_page_by_name_similarity(result)   # 名称相似度去重
+    result = _dedup_no_model_safe(result, catalog_profile)  # 高频重名去重
     result = _filter_cross_page_props(result, catalog_profile)  # 跨页道具清理
     # 注意: expand_color_variants 不在此调用 —— 由 runner 在 dict 层执行，
     # 确保展开结果能正确写入 pages 缓存 (此处 SKUResult 对象层展开会被 runner 丢弃)
@@ -982,15 +991,24 @@ def _dedup_no_model_safe(
     remove_indices: set[int] = set()
 
     # Pass A: 精确同名去重
+    # 只对完全一致（同名+同页面 或 同名+无任何区分属性+出现极多次）才去重
+    # 不同页面的同名产品很可能是不同款式，不应去重
     for name, indices in name_groups.items():
         count = len(indices)
         should_dedup = False
-        if count >= 3:
-            should_dedup = True
-        elif count >= 2:
-            # 短名称(≤4字) + 无区分属性(color/specs 均空) → 去重
-            cn_len = len(re.sub(r'[^\u4e00-\u9fff]', '', name))
-            if cn_len <= 4:
+        # 检查是否来自不同页面（通过 sku_id 前缀判断）
+        pages = set()
+        for i in indices:
+            sid = skus[i].sku_id or ""
+            # sku_id 格式: hash_pageNo_skuIdx
+            parts = sid.split("_")
+            if len(parts) >= 2:
+                pages.add(parts[1])
+        from_different_pages = len(pages) > 1
+
+        if from_different_pages:
+            # 不同页面的同名产品：只在出现极多次(>=8)且无任何区分属性时才去重
+            if count >= 8:
                 all_no_distinction = all(
                     not (skus[i].attributes.get("color") or "").strip()
                     and not (skus[i].attributes.get("specs") or "").strip()
@@ -998,6 +1016,20 @@ def _dedup_no_model_safe(
                 )
                 if all_no_distinction:
                     should_dedup = True
+        else:
+            # 同页面的同名产品：保持原有逻辑
+            if count >= 3:
+                should_dedup = True
+            elif count >= 2:
+                cn_len = len(re.sub(r'[^\u4e00-\u9fff]', '', name))
+                if cn_len <= 4:
+                    all_no_distinction = all(
+                        not (skus[i].attributes.get("color") or "").strip()
+                        and not (skus[i].attributes.get("specs") or "").strip()
+                        for i in indices
+                    )
+                    if all_no_distinction:
+                        should_dedup = True
             # 品牌名 → 去重
             if name in brand_lower:
                 should_dedup = True

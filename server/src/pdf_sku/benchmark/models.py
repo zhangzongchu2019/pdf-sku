@@ -59,18 +59,22 @@ class ComparisonResult:
     missing_skus: list[GroundTruthSKU] = field(default_factory=list)
     extra_skus: list[dict[str, Any]] = field(default_factory=list)
     matches: list[SKUMatch] = field(default_factory=list)
+    gt_image_only_count: int = 0  # GT 中仅有图片无名称/型号的条目数
 
     @property
     def precision(self) -> float:
         if self.actual_count == 0:
             return 0.0
-        return self.matched_count / self.actual_count
+        # P = 有效预测数 / 总预测数（多对一匹配时，用 actual - FP）
+        matched_actual = self.actual_count - len(self.extra_skus)
+        return matched_actual / self.actual_count
 
     @property
     def recall(self) -> float:
         if self.expected_count == 0:
             return 0.0
-        return self.matched_count / self.expected_count
+        # R = 匹配到的 GT 数 / 总 GT 数（多对一时 matched_count 可能 > actual_count）
+        return min(1.0, self.matched_count / self.expected_count)
 
     @property
     def f1(self) -> float:

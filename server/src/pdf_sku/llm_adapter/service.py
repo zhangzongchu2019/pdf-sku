@@ -28,10 +28,14 @@ logger = structlog.get_logger()
 MAX_RETRIES_PER_PROVIDER = 3  # 每个 provider 的重试次数
 EVAL_BATCH_SIZE = 5
 # 全局 LLM 并发上限，防止 API 429。通过环境变量 LLM_MAX_CONCURRENCY 可调。
-LLM_MAX_CONCURRENCY = int(os.environ.get("LLM_MAX_CONCURRENCY", "12"))
+LLM_MAX_CONCURRENCY = int(os.environ.get("LLM_MAX_CONCURRENCY", "120"))
 # 连续超时阈值: 连续 N 次超时后自动禁用 provider
 CONSECUTIVE_ERROR_LIMIT = int(os.environ.get("LLM_ERROR_SKIP_THRESHOLD", "3"))
 PROVIDER_COOLDOWN_SECONDS = int(os.environ.get("LLM_PROVIDER_COOLDOWN", "600"))  # 10 minutes
+# 默认请求超时 (秒): 通过环境变量 LLM_TIMEOUT_SECONDS 覆盖
+DEFAULT_TIMEOUT = float(os.environ.get("LLM_TIMEOUT_SECONDS", "300"))  # 5 minutes
+# 连续超时致命阈值: 连续 N 次超时后程序退出
+CONSECUTIVE_TIMEOUT_FATAL = int(os.environ.get("LLM_CONSECUTIVE_TIMEOUT_FATAL", "3"))
 
 
 class LLMService:
@@ -77,6 +81,8 @@ class LLMService:
         # 连续错误计数器 (per provider)
         self._consecutive_errors: dict[str, int] = {}
         self._disabled_until: dict[str, float] = {}  # provider → timestamp when re-enabled
+        # 全局连续超时计数 (跨 provider)
+        self._consecutive_timeouts_global: int = 0
 
     @property
     def current_model_name(self) -> str:
@@ -212,7 +218,7 @@ class LLMService:
         prompt: str,
         images: list[bytes] | None = None,
         client_name: str | None = None,
-        timeout: float = 60.0,
+        timeout: float = DEFAULT_TIMEOUT,
     ) -> LLMResponse:
         """
         核心调用链: semaphore → circuit → rate_limit → budget → client.complete → record。
@@ -228,7 +234,7 @@ class LLMService:
         prompt: str,
         images: list[bytes] | None = None,
         client_name: str | None = None,
-        timeout: float = 60.0,
+        timeout: float = DEFAULT_TIMEOUT,
     ) -> LLMResponse:
         """实际 LLM 调用（已在 Semaphore 内）。"""
         # 轮询选择 primary: 跳过已禁用的 provider
@@ -285,15 +291,19 @@ class LLMService:
                     await self._budget.check(operation)
 
                 try:
-                    resp = await client.complete(
-                        prompt=prompt,
-                        images=images,
-                        json_mode=True,
+                    resp = await asyncio.wait_for(
+                        client.complete(
+                            prompt=prompt,
+                            images=images,
+                            json_mode=True,
+                        ),
+                        timeout=timeout,
                     )
 
-                    # 成功
+                    # 成功 → 重置连续超时计数
                     self._circuit.record_success()
                     self._record_success(provider_name)
+                    self._consecutive_timeouts_global = 0
 
                     # 记录消耗
                     input_tokens = resp.usage.get("input_tokens", 0)
@@ -313,10 +323,33 @@ class LLMService:
 
                     return resp
 
+                except asyncio.TimeoutError:
+                    self._circuit.record_failure()
+                    last_error = TimeoutError(f"LLM request timed out after {timeout}s")
+                    total_attempts += 1
+                    self._consecutive_timeouts_global = getattr(
+                        self, '_consecutive_timeouts_global', 0) + 1
+                    logger.warning("llm_request_timeout",
+                                    timeout=timeout, attempt=attempt + 1,
+                                    operation=operation, provider=provider_name,
+                                    consecutive=self._consecutive_timeouts_global)
+                    # 连续超时达到致命阈值 → 抛出致命异常终止程序
+                    if self._consecutive_timeouts_global >= CONSECUTIVE_TIMEOUT_FATAL:
+                        msg = (f"连续 {self._consecutive_timeouts_global} 次请求超时，"
+                               f"程序退出。请检查 LLM 服务可用性。")
+                        logger.error("llm_consecutive_timeout_fatal", message=msg)
+                        raise SystemExit(msg)
+                    if attempt < MAX_RETRIES_PER_PROVIDER - 1:
+                        continue
+                    self._record_error(provider_name)
+                    break
+
                 except Exception as e:
                     self._circuit.record_failure()
                     last_error = e
                     total_attempts += 1
+                    # 非超时错误重置连续超时计数
+                    self._consecutive_timeouts_global = 0
 
                     if attempt < MAX_RETRIES_PER_PROVIDER - 1:
                         logger.warning("llm_call_retry",

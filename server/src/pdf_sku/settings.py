@@ -67,6 +67,7 @@ class Settings(BaseSettings):
     gemini_api_base: str = "https://generativelanguage.googleapis.com"
     gemini_model: str = "gemini-2.0-flash"
     qwen_api_key: str = ""
+    qwen_api_base: str = "https://dashscope.aliyuncs.com/compatible-mode"
     qwen_model: str = "qwen-vl-max"
     openrouter_api_key: str = ""
     openrouter_api_keys: str = ""  # 多 key 轮询: 逗号分隔 "key1,key2,key3"

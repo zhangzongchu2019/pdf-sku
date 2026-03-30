@@ -414,6 +414,62 @@ class CustomAttrUpgrade(Base):
     __table_args__ = (Index("idx_upgrades_status", "status"),)
 
 
+# ───────────────────────── Benchmark ─────────────────────────
+
+class BenchmarkRun(Base):
+    """一次 benchmark 运行（包含多个数据集）。"""
+    __tablename__ = "benchmark_runs"
+
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_tag: Mapped[str] = mapped_column(Text, nullable=False)
+    git_commit: Mapped[str | None] = mapped_column(String(40))
+    git_branch: Mapped[str | None] = mapped_column(String(200))
+    description: Mapped[str | None] = mapped_column(Text)
+    total_datasets: Mapped[int] = mapped_column(Integer, default=0)
+    avg_precision: Mapped[float | None] = mapped_column(Float)
+    avg_recall: Mapped[float | None] = mapped_column(Float)
+    avg_f1: Mapped[float | None] = mapped_column(Float)
+    config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    dataset_results: Mapped[list[BenchmarkDatasetResult]] = relationship(
+        back_populates="run", lazy="selectin", cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (Index("idx_benchmark_runs_tag", "run_tag"),)
+
+
+class BenchmarkDatasetResult(Base):
+    """一个数据集在某次 benchmark 运行中的结果。"""
+    __tablename__ = "benchmark_dataset_results"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("benchmark_runs.run_id"), nullable=False)
+    dataset_name: Mapped[str] = mapped_column(Text, nullable=False)
+    pdf_path: Mapped[str | None] = mapped_column(Text)
+    gt_count: Mapped[int] = mapped_column(Integer, default=0)
+    pred_count: Mapped[int] = mapped_column(Integer, default=0)
+    matched_count: Mapped[int] = mapped_column(Integer, default=0)
+    precision: Mapped[float] = mapped_column(Float, default=0.0)
+    recall: Mapped[float] = mapped_column(Float, default=0.0)
+    f1: Mapped[float] = mapped_column(Float, default=0.0)
+    fn_count: Mapped[int] = mapped_column(Integer, default=0)
+    fp_count: Mapped[int] = mapped_column(Integer, default=0)
+    elapsed_seconds: Mapped[float | None] = mapped_column(Float)
+    total_pages: Mapped[int | None] = mapped_column(Integer)
+    details: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    run: Mapped[BenchmarkRun] = relationship(back_populates="dataset_results")
+
+    __table_args__ = (
+        Index("idx_bm_ds_results_run", "run_id"),
+        Index("idx_bm_ds_results_name", "dataset_name"),
+    )
+
+
 class WorkerHeartbeat(Base):
     __tablename__ = "worker_heartbeats"
 

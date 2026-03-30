@@ -1,7 +1,7 @@
 #!/bin/bash
 # 测试 R<80% 或 P<80% 的数据集 (共35个)
 # 用于验证 FP-2/FP-11/FP-12 三项修复效果
-cd /home/zzc/pdf-sku/server
+cd "$(dirname "$0")/../../server"
 
 DATASETS=(
   # ── R<80% (4个) ──
