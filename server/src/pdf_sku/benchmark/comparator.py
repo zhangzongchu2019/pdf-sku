@@ -71,10 +71,15 @@ def _fuzzy_match(a: str, b: str, threshold: float = 0.6) -> bool:
 
 def _extract_model_prefix(name: str) -> str | None:
     """从 product_name 提取完整型号（如 SJ-2001、H-303-1A、Bk（贝壳）08#、230、8103#）。"""
-    # 优先: "型号：xxx" / "Model：xxx" 格式（最明确的型号标识）
-    m0 = re.search(r'(?:model|moedl|型号)[：:]\s*(\w{1,10})', name, re.IGNORECASE)
+    # 优先: "产品型号：xxx" / "型号：xxx" / "Model：xxx" 格式（最明确的型号标识）
+    m0 = re.search(r'(?:产品型号|model|moedl|型号)[：:]\s*([^\n,，]{1,30})', name, re.IGNORECASE)
     if m0:
-        return m0.group(1).upper()
+        val = m0.group(1).strip()
+        # 从值中提取核心型号部分（去掉中文描述后缀如"电动功能沙发"）
+        core = re.match(r'([A-Za-z]*\d+[A-Za-z0-9#\-]*)', val)
+        if core:
+            return core.group(1).upper().rstrip('#')
+        return val.split()[0].upper() if val else None
 
     # 标准字母+数字型号格式（排除尺寸模式）
     m = re.search(
@@ -513,8 +518,15 @@ def compare_dataset(
     for ei, exp in enumerate(expected):
         if ei in matched_expected:
             continue
-        # 检测 product_name 中的多个 XX# 型号
-        models_in_name = re.findall(r'(\d+)#', exp.product_name or '')
+        # 检测 product_name 中的多个型号（支持跨行、带尺寸的组合格式）
+        # 匹配: "601#", "12#", "8901#" 等纯数字+# 格式
+        models_in_name = re.findall(r'(\d+)\s*#', exp.product_name or '')
+        # 也匹配: "BS8560", "Bk01" 等字母+数字格式（无#）
+        if len(models_in_name) < 2:
+            models_in_name = re.findall(r'(?:^|[\s\n])([A-Za-z]+[-]?\d{2,}[A-Za-z]?)', exp.product_name or '')
+        # 也匹配: "数字-数字" 格式（如 "2001-1", "303-2A"）
+        if len(models_in_name) < 2:
+            models_in_name = re.findall(r'(\d{2,5}[-]\d{1,3}[A-Za-z]?)', exp.product_name or '')
         if len(models_in_name) >= 2:
             all_found = all(
                 _normalize_model(m) in _matched_act_models

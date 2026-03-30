@@ -337,6 +337,25 @@ class PageProcessor:
                 if img.data:
                     img.image_hash = hashlib.md5(img.data[:2048]).hexdigest()[:12]
 
+            # ═══ Phase 2a: 密集网格页布局感知 eligible ═══
+            # 如果页面有>=5个大小相似的非eligible图片，视为产品网格页，降低阈值
+            _not_eligible = [img for img in raw.images if not img.search_eligible
+                             and img.short_edge >= 40]
+            if len(_not_eligible) >= 5:
+                _sizes = [img.short_edge for img in _not_eligible]
+                _avg = sum(_sizes) / len(_sizes)
+                _variance = sum((s - _avg) ** 2 for s in _sizes) / len(_sizes)
+                # 大小相似(方差/均值² < 0.3) → 网格布局，降低阈值到80
+                if _avg > 0 and _variance / (_avg ** 2) < 0.3:
+                    for img in _not_eligible:
+                        if img.short_edge >= 80:
+                            img.search_eligible = True
+                    _newly = sum(1 for img in _not_eligible if img.search_eligible)
+                    if _newly:
+                        logger.info("grid_layout_eligible_relaxed",
+                                    page=page_no, relaxed=_newly,
+                                    avg_short_edge=int(_avg))
+
             # ═══ Phase 2b: 瓦片碎片聚类合并 ═══
             raw.images = self._merge_tile_fragments(raw.images, page_no)
 
@@ -602,6 +621,44 @@ class PageProcessor:
                     skus = dedup_by_similarity(skus)
                     extraction_method = "mixed_other_sliced"
                     logger.info("mixed_other_slice_rescue", page=page_no,
+                                found=len(skus))
+
+            # ═══ Phase 6.355: Type-A 零 SKU 切片回退 ═══
+            # ocr_guided/整页提取均失败的 Type-A 页面，用切片兜底
+            if (not skus
+                    and page_type == "A"
+                    and effective_screenshot
+                    and ocr_text_len > 50
+                    and fitz_meta.page_height > 0):
+                n_slices = 3
+                slice_h = fitz_meta.page_height / n_slices
+                page_w = fitz_meta.page_width
+                slice_bboxes = [
+                    (0, i * slice_h, page_w, (i + 1) * slice_h)
+                    for i in range(n_slices)
+                ]
+                slice_tasks = [
+                    loop.run_in_executor(
+                        None, render_slice, file_path, page_no, bbox, 300)
+                    for bbox in slice_bboxes
+                ]
+                slice_results = await asyncio.gather(
+                    *slice_tasks, return_exceptions=True)
+                for sr in slice_results:
+                    if isinstance(sr, Exception) or not sr:
+                        continue
+                    slice_skus = await self._single_stage.extract(
+                        raw, screenshot=sr,
+                        sku_count_hint=(1, 10),
+                        scene_filter=False,
+                        page_class=plan.page_class)
+                    if slice_skus:
+                        skus.extend(slice_skus)
+                if skus:
+                    skus = dedup_by_model(skus)
+                    skus = dedup_by_similarity(skus)
+                    extraction_method = "type_a_slice_rescue"
+                    logger.info("type_a_slice_rescue", page=page_no,
                                 found=len(skus))
 
             # ═══ Phase 6.36: IMG_LABEL 零 SKU 回退 ═══
@@ -1058,6 +1115,26 @@ class PageProcessor:
                                    after=len(skus),
                                    no_model_ratio=f"{no_model}/{before_halluc}",
                                    low_conf_ratio=f"{low_conf}/{before_halluc}")
+
+            # ═══ Phase 6.8: 页面级无型号密度过滤 ═══
+            # 条件: 页面SKU数>=5 且 无型号占比>80% → 只保留有型号或长名称(>5字)的SKU
+            # 目标: 缩略图/目录总览页的泛化名称FP (如30个"沙发")
+            if len(skus) >= 5:
+                _no_model_count = sum(
+                    1 for s in skus
+                    if not (s.attributes.get("model_number") or "").strip()
+                )
+                if _no_model_count > len(skus) * 0.8:
+                    before_density = len(skus)
+                    skus = [
+                        s for s in skus
+                        if (s.attributes.get("model_number") or "").strip()
+                        or len((s.attributes.get("product_name") or "").strip()) > 5
+                    ]
+                    if len(skus) < before_density:
+                        logger.info("no_model_density_filter",
+                                    page=page_no, before=before_density,
+                                    after=len(skus))
 
             # enforce validity
             profile_data = None
