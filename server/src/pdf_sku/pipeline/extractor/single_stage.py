@@ -5,6 +5,7 @@
 单 LLM 调用: 一次性提取所有 SKU + 属性。
 """
 from __future__ import annotations
+import re
 from pdf_sku.pipeline.ir import ParsedPageIR, SKUResult
 from pdf_sku.llm_adapter.parser.response_parser import ResponseParser
 import structlog

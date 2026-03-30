@@ -4,6 +4,9 @@ from __future__ import annotations
 import re
 from difflib import SequenceMatcher
 from typing import Any
+import structlog
+
+logger = structlog.get_logger()
 
 from .models import (
     ComparisonResult,
@@ -238,6 +241,11 @@ def compare_dataset(
             if not matched_prefix:
                 act_prefix = _extract_model_prefix(act_name)
                 if act_prefix and exp_norm_prefix == _normalize_model(act_prefix):
+                    matched_prefix = True
+            # 从 act_model 提取前缀再匹配（处理 MY-B-01 vs B-01 类前缀差异）
+            if not matched_prefix and act_model:
+                act_model_prefix = _extract_model_prefix(act_model)
+                if act_model_prefix and _normalize_model(act_model_prefix) == exp_norm_prefix:
                     matched_prefix = True
             if matched_prefix:
                 # 计算 product_name 亲和度作为排序依据
@@ -487,6 +495,33 @@ def compare_dataset(
                                     matched=len([m for m in result.matches if m.match_method == "image_similarity"]))
         except Exception as e:
             logger.debug("image_matching_skipped", error=str(e))
+
+    # Pass 2.9: 组合GT拆分匹配
+    # GT product_name 包含多个 XX# 型号（如 "601# 圆餐桌...12# 餐椅"）
+    # 如果拆分出的所有型号都已在 matched 的 Pipeline 预测中 → 标记该 GT 为已匹配
+    _matched_act_models = set()
+    for ai in matched_actual:
+        act = actual_list[ai]
+        m = str(act.get("model_number", "")).strip().rstrip("#")
+        if m:
+            _matched_act_models.add(_normalize_model(m))
+        # 也从 product_name 提取
+        ap = _extract_model_prefix(str(act.get("product_name", "")))
+        if ap:
+            _matched_act_models.add(_normalize_model(ap))
+
+    for ei, exp in enumerate(expected):
+        if ei in matched_expected:
+            continue
+        # 检测 product_name 中的多个 XX# 型号
+        models_in_name = re.findall(r'(\d+)#', exp.product_name or '')
+        if len(models_in_name) >= 2:
+            all_found = all(
+                _normalize_model(m) in _matched_act_models
+                for m in models_in_name
+            )
+            if all_found:
+                matched_expected.add(ei)
 
     # Pass 3: 位置对齐（按顺序匹配剩余的）
     unmatched_exp = [i for i in range(len(expected)) if i not in matched_expected]

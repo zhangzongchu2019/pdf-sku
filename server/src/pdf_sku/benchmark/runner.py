@@ -775,6 +775,25 @@ class BenchmarkRunner:
         # ═══ 跨页图片聚合 ═══
         _aggregate_cross_page_images(pages)
 
+        # ═══ 低置信度+无型号 后过滤 ═══
+        # 过滤 conf<0.3 且无 model_number 的 SKU（场景道具/装饰物）
+        low_conf_removed = 0
+        for page in pages:
+            original = page.get("skus", [])
+            filtered = []
+            for sku in original:
+                conf = sku.get("confidence", 1.0)
+                attrs = sku.get("attributes", {})
+                model = (attrs.get("model_number") or "").strip()
+                if conf < 0.3 and not model:
+                    low_conf_removed += 1
+                    continue
+                filtered.append(sku)
+            page["skus"] = filtered
+            page["sku_count"] = len(filtered)
+        if low_conf_removed:
+            logger.info("low_conf_no_model_filtered", removed=low_conf_removed)
+
         total_skus = sum(len(p.get("skus", [])) for p in pages)
 
         elapsed = time.time() - t0

@@ -112,9 +112,19 @@ class PDFExtractor:
                     img_data = pix.tobytes("png")
                     short_edge = min(pix.width, pix.height)
                     img_hash = hashlib.md5(img_data[:1024]).hexdigest()[:12] if img_data else ""
+                    # 获取图片在页面上的显示bbox（用于DPI缩放计算真实显示尺寸）
+                    bbox = (0, 0, 0, 0)
+                    try:
+                        rects = page.get_image_rects(img_info)
+                        if rects:
+                            r = rects[0]
+                            bbox = (r.x0, r.y0, r.x1, r.y1)
+                    except Exception:
+                        pass
                     images.append(ImageInfo(
                         image_id=f"p{page_no}_img{i}",
                         data=img_data,
+                        bbox=bbox,
                         width=pix.width,
                         height=pix.height,
                         short_edge=short_edge,
@@ -162,9 +172,19 @@ class PDFExtractor:
                     img_data = pix.tobytes("png")
                     short_edge = min(pix.width, pix.height)
                     img_hash = hashlib.md5(img_data[:2048]).hexdigest()[:12] if img_data else ""
+                    # 获取图片在页面上的显示bbox
+                    bbox = (0, 0, 0, 0)
+                    try:
+                        rects = page.get_image_rects(img_info)
+                        if rects:
+                            r = rects[0]
+                            bbox = (r.x0, r.y0, r.x1, r.y1)
+                    except Exception:
+                        pass
                     images.append(ImageInfo(
                         image_id=f"p{page_no}_img{i}",
                         data=img_data,
+                        bbox=bbox,
                         width=pix.width,
                         height=pix.height,
                         short_edge=short_edge,

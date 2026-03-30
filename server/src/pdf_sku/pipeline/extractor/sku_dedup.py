@@ -118,6 +118,12 @@ def _is_scene_prop(name: str) -> bool:
     core = _strip_to_core(name)
     if core in SCENE_PROPS:
         return True
+    # 取首行（换行前），检查是否以黑名单词结尾或等于黑名单词
+    # 处理"原木色床头板"、"贝壳夏日系列床头板"等带修饰前缀的名称
+    first_line = name.split('\n')[0].strip()
+    for prop in SCENE_PROPS:
+        if first_line.endswith(prop) and len(first_line) <= len(prop) + 10:
+            return True
     # 名称包含黑名单词且名称较短（避免误杀如"茶几柜"类合法产品名）
     if len(name) <= 6:
         for prop in SCENE_PROPS:
@@ -208,6 +214,13 @@ def pre_filter(skus: list[SKUResult], *, scene_filter: bool = False) -> list[SKU
         has_model = bool(model) or bool(_MODEL_RE.search(name))
         has_price = bool(price) or bool(_PRICE_RE.search(name))
         if has_model or has_price:
+            # 即使有型号，如果名称核心词命中硬黑名单且无价格 → 仍过滤
+            # 场景: LLM 为床头板/装饰画等编造型号 (如 SHELL-BED01)
+            if _is_scene_prop(name) and not has_price:
+                removed += 1
+                logger.debug("sku_scene_prop_with_model_filtered",
+                             name=name[:60], model=model[:30])
+                continue
             kept.append(sku)
             continue
 

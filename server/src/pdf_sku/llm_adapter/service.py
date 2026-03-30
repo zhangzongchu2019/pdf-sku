@@ -28,7 +28,7 @@ logger = structlog.get_logger()
 MAX_RETRIES_PER_PROVIDER = 3  # 每个 provider 的重试次数
 EVAL_BATCH_SIZE = 5
 # 全局 LLM 并发上限，防止 API 429。通过环境变量 LLM_MAX_CONCURRENCY 可调。
-LLM_MAX_CONCURRENCY = int(os.environ.get("LLM_MAX_CONCURRENCY", "12"))
+LLM_MAX_CONCURRENCY = int(os.environ.get("LLM_MAX_CONCURRENCY", "120"))
 # 连续超时阈值: 连续 N 次超时后自动禁用 provider
 CONSECUTIVE_ERROR_LIMIT = int(os.environ.get("LLM_ERROR_SKIP_THRESHOLD", "3"))
 PROVIDER_COOLDOWN_SECONDS = int(os.environ.get("LLM_PROVIDER_COOLDOWN", "600"))  # 10 minutes
