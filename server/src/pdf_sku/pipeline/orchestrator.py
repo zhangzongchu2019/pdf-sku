@@ -11,7 +11,9 @@ Orchestrator — Job 级处理编排。对齐: Pipeline 详设 §5.1
 """
 from __future__ import annotations
 import asyncio
+import json
 import os
+import time
 from pathlib import Path
 from uuid import UUID
 
@@ -93,6 +95,14 @@ class Orchestrator:
                 fresh_job = result.scalar_one()
                 await self._finalize_job(final_db, fresh_job)
                 await final_db.commit()
+
+            # 导出 result.json 供前端可视化
+            try:
+                async with self._db_factory() as export_db:
+                    await self._export_result_json(export_db, job_id, file_path)
+            except Exception as export_err:
+                logger.warning("result_json_export_failed",
+                               job_id=job_id, error=str(export_err))
 
         except Exception as e:
             logger.exception("pipeline_failed", job_id=job_id)
@@ -329,6 +339,88 @@ class Orchestrator:
                      job_id=str(job.job_id),
                      final_status=new_status,
                      completed=completed, failed=failed, human=human)
+
+    @staticmethod
+    async def _export_result_json(
+        db: AsyncSession, job_id: str, file_path: str,
+    ) -> None:
+        """将处理结果导出为 result.json，供前端可视化。"""
+        from pdf_sku.common.models import SKU, Image, SKUImageBinding
+
+        job_uuid = UUID(job_id)
+
+        # 查询所有页面
+        page_rows = (await db.execute(
+            select(Page).where(Page.job_id == job_uuid).order_by(Page.page_number)
+        )).scalars().all()
+
+        # 查询所有 SKU
+        sku_rows = (await db.execute(
+            select(SKU).where(SKU.job_id == job_uuid).order_by(SKU.page_number, SKU.sku_id)
+        )).scalars().all()
+
+        # 查询所有绑定
+        binding_rows = (await db.execute(
+            select(SKUImageBinding).where(SKUImageBinding.job_id == job_uuid)
+        )).scalars().all()
+
+        # 查询所有图片
+        image_rows = (await db.execute(
+            select(Image).where(Image.job_id == job_uuid)
+        )).scalars().all()
+
+        # 构建 sku_id → image_paths 映射
+        img_map = {img.image_id: img.extracted_path for img in image_rows}
+        sku_bindings: dict[str, list[str]] = {}
+        for b in binding_rows:
+            path = img_map.get(b.image_id)
+            if path:
+                sku_bindings.setdefault(b.sku_id, []).append(f"/images/jobs/{job_id}/{path}")
+
+        # 按页组织 SKU
+        skus_by_page: dict[int, list[dict]] = {}
+        for sku in sku_rows:
+            d = {
+                "sku_id": sku.sku_id,
+                "attributes": sku.attributes or {},
+                "confidence": 0.0,
+                "validity": sku.validity or "valid",
+                "extraction_method": sku.attribute_source or "",
+                "image_paths": sku_bindings.get(sku.sku_id, []),
+            }
+            skus_by_page.setdefault(sku.page_number, []).append(d)
+
+        pages = []
+        total_skus = 0
+        for p in page_rows:
+            page_skus = skus_by_page.get(p.page_number, [])
+            total_skus += len(page_skus)
+            pages.append({
+                "page_no": p.page_number,
+                "status": p.status or "",
+                "page_type": p.page_type,
+                "fitz_page_class": None,
+                "extraction_method": p.extraction_method,
+                "slice_count": 0,
+                "sku_count": len(page_skus),
+                "skus": page_skus,
+                "error": None,
+            })
+
+        output = {
+            "dataset": file_path.rsplit("/", 1)[-1] if "/" in file_path else file_path,
+            "pdf": file_path,
+            "total_pages": len(page_rows),
+            "total_skus": total_skus,
+            "elapsed_seconds": 0,
+            "pages": pages,
+        }
+
+        job_dir = Path(os.environ.get("JOB_DATA_DIR", "/data/jobs")) / job_id
+        result_path = job_dir / "result.json"
+        result_path.write_text(
+            json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("result_json_exported", job_id=job_id, path=str(result_path))
 
     @staticmethod
     def _resolve_file_path(job: PDFJob) -> str:

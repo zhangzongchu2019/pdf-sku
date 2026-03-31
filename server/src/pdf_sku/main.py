@@ -480,7 +480,17 @@ def create_app() -> FastAPI:
     app.include_router(collab_router)  # already has /api/v1 prefix
     app.include_router(feedback_router)  # already has /api/v1 prefix
 
-    # ─── 静态文件: 产品图片服务 ───
+    from pdf_sku.benchmark.viewer import router as benchmark_viewer_router
+    app.include_router(benchmark_viewer_router)
+
+    # ─── 根路径重定向到可视化页面 ───
+    from fastapi.responses import RedirectResponse
+
+    @app.get("/")
+    async def root_redirect():
+        return RedirectResponse("/benchmark/viewer")
+
+    # ─── 静态文件: 图片服务 ───
     from starlette.staticfiles import StaticFiles
     benchmark_img_dir = Path(settings.benchmark_image_dir)
     if benchmark_img_dir.exists():
@@ -488,6 +498,14 @@ def create_app() -> FastAPI:
             "/images/benchmark",
             StaticFiles(directory=str(benchmark_img_dir)),
             name="benchmark-images",
+        )
+
+    job_data_dir = Path(settings.job_data_dir)
+    if job_data_dir.exists():
+        app.mount(
+            "/images/jobs",
+            StaticFiles(directory=str(job_data_dir)),
+            name="job-images",
         )
 
     return app
