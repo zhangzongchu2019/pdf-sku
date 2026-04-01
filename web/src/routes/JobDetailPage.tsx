@@ -663,13 +663,66 @@ export default function JobDetailPage() {
 
   if (loading) return <Loading />;
 
+  const [exporting, setExporting] = useState(false);
+
+  const handleExportExcel = useCallback(async () => {
+    if (!jobId || exporting) return;
+    setExporting(true);
+    try {
+      const API_BASE = import.meta.env.VITE_API_BASE || "/api/v1";
+      const token = useAuthStore.getState().token;
+      const headers: Record<string, string> = {};
+      if (token) headers["Authorization"] = `Bearer ${token}`;
+      const res = await fetch(`${API_BASE}/jobs/${jobId}/export/excel`, { headers });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ message: "导出失败" }));
+        throw new Error(err.message || `HTTP ${res.status}`);
+      }
+      const blob = await res.blob();
+      const disposition = res.headers.get("content-disposition") || "";
+      const match = disposition.match(/filename\*?=(?:UTF-8''|"?)([^";]+)/i);
+      const filename = match ? decodeURIComponent(match[1]) : "export.xlsx";
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e: any) {
+      alert(e.message || "Excel 导出失败");
+    } finally {
+      setExporting(false);
+    }
+  }, [jobId, exporting]);
+
   return (
     <div className="page">
-      <div className="page-header">
+      <div className="page-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
         <div>
           <Link to="/jobs" className="back-link">← 返回列表</Link>
           <h2>{jobTitle}</h2>
         </div>
+        {result && (
+          <button
+            onClick={handleExportExcel}
+            disabled={exporting}
+            style={{
+              padding: "8px 20px", fontSize: 14, fontWeight: 600,
+              background: exporting ? "#d9d9d9" : "#52c41a", color: "#fff",
+              border: "none", borderRadius: 6, cursor: exporting ? "not-allowed" : "pointer",
+              display: "flex", alignItems: "center", gap: 8, whiteSpace: "nowrap",
+            }}
+          >
+            {exporting && (
+              <span style={{
+                display: "inline-block", width: 14, height: 14,
+                border: "2px solid #fff", borderTopColor: "transparent",
+                borderRadius: "50%", animation: "spin 0.8s linear infinite",
+              }} />
+            )}
+            {exporting ? "导出中..." : "导出 Excel"}
+          </button>
+        )}
       </div>
 
       {!result && resultError && jobId && <ProgressPanel jobId={jobId} />}

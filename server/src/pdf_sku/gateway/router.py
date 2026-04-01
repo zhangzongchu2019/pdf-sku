@@ -280,6 +280,43 @@ async def get_job(job_id: uuid.UUID, db: DBSession, user: AnyUser):
     return _job_to_dict(job, detail=True)
 
 
+@router.get("/jobs/{job_id}/export/excel")
+async def export_excel(job_id: uuid.UUID, db: DBSession, user: AnyUser):
+    """下载 Job 的 Excel 导出文件。如不存在则从 result.json 按需生成。"""
+    job = await _get_job_checked(db, job_id, user)
+
+    job_dir = Path(settings.job_data_dir) / str(job_id)
+    excel_path = job_dir / "result.xlsx"
+
+    if not excel_path.exists():
+        # 按需从 result.json 生成
+        result_path = job_dir / "result.json"
+        if not result_path.exists():
+            return JSONResponse(status_code=404, content={
+                "error_code": "NO_RESULT",
+                "message": "该任务尚无处理结果，无法导出",
+            })
+        import json as _json
+        from pdf_sku.pipeline.exporter.excel_exporter import export_job_excel
+        try:
+            result_data = _json.loads(result_path.read_text("utf-8"))
+            export_job_excel(result_data, job_dir, excel_path)
+        except Exception as e:
+            logger.exception("excel_export_on_demand_failed", job_id=str(job_id))
+            return JSONResponse(status_code=500, content={
+                "error_code": "EXPORT_FAILED",
+                "message": f"Excel 导出失败: {e}",
+            })
+
+    # 用真实文件名作为下载名
+    download_name = (job.source_file or "export").rsplit(".", 1)[0] + ".xlsx"
+    return FileResponse(
+        str(excel_path),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=download_name,
+    )
+
+
 @router.post("/jobs/{job_id}/cancel")
 async def cancel_job(job_id: uuid.UUID, db: DBSession, user: AnyUser):
     """取消 Job。非 admin 仅可取消自己 merchant 的 Job。"""

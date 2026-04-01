@@ -104,6 +104,13 @@ class Orchestrator:
                 logger.warning("result_json_export_failed",
                                job_id=job_id, error=str(export_err))
 
+            # 导出 Excel
+            try:
+                self._export_result_excel(job_id)
+            except Exception as excel_err:
+                logger.warning("excel_export_failed",
+                               job_id=job_id, error=str(excel_err))
+
         except Exception as e:
             logger.exception("pipeline_failed", job_id=job_id)
             async with self._db_factory() as err_db:
@@ -427,6 +434,20 @@ class Orchestrator:
         result_path.write_text(
             json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
         logger.info("result_json_exported", job_id=job_id, path=str(result_path))
+
+    @staticmethod
+    def _export_result_excel(job_id: str) -> None:
+        """从 result.json 生成 Excel 文件。"""
+        from pdf_sku.pipeline.exporter.excel_exporter import export_job_excel
+
+        job_dir = Path(os.environ.get("JOB_DATA_DIR", "/data/jobs")) / job_id
+        result_path = job_dir / "result.json"
+        if not result_path.exists():
+            logger.warning("excel_export_skip_no_json", job_id=job_id)
+            return
+        result_data = json.loads(result_path.read_text("utf-8"))
+        excel_path = job_dir / "result.xlsx"
+        export_job_excel(result_data, job_dir, excel_path)
 
     @staticmethod
     def _resolve_file_path(job: PDFJob) -> str:
