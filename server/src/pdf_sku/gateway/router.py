@@ -288,9 +288,15 @@ async def export_excel(job_id: uuid.UUID, db: DBSession, user: AnyUser):
     job_dir = Path(settings.job_data_dir) / str(job_id)
     excel_path = job_dir / "result.xlsx"
 
-    if not excel_path.exists():
-        # 按需从 result.json 生成
-        result_path = job_dir / "result.json"
+    result_path = job_dir / "result.json"
+
+    # 如果 Excel 不存在，或比 result.json 旧（需重新生成）
+    need_generate = not excel_path.exists()
+    if not need_generate and result_path.exists():
+        if excel_path.stat().st_mtime < result_path.stat().st_mtime:
+            need_generate = True
+
+    if need_generate:
         if not result_path.exists():
             return JSONResponse(status_code=404, content={
                 "error_code": "NO_RESULT",
@@ -300,7 +306,8 @@ async def export_excel(job_id: uuid.UUID, db: DBSession, user: AnyUser):
         from pdf_sku.pipeline.exporter.excel_exporter import export_job_excel
         try:
             result_data = _json.loads(result_path.read_text("utf-8"))
-            export_job_excel(result_data, job_dir, excel_path)
+            export_job_excel(result_data, job_dir, excel_path,
+                             source_name=job.source_file)
         except Exception as e:
             logger.exception("excel_export_on_demand_failed", job_id=str(job_id))
             return JSONResponse(status_code=500, content={

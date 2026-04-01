@@ -91,7 +91,12 @@ def _prepare_thumbnail(img_path: Path) -> bytes | None:
         return None
 
 
-def export_job_excel(result_json: dict, job_dir: Path, output_path: Path) -> None:
+def export_job_excel(
+    result_json: dict,
+    job_dir: Path,
+    output_path: Path,
+    source_name: str | None = None,
+) -> None:
     """
     从 result.json 结构导出带嵌入图片的 Excel。
 
@@ -99,8 +104,10 @@ def export_job_excel(result_json: dict, job_dir: Path, output_path: Path) -> Non
         result_json: result.json 的 dict 内容
         job_dir: /data/jobs/{job_id}/ 目录
         output_path: 输出 xlsx 路径
+        source_name: 原始文件名（覆盖 result_json 中的 dataset）
     """
-    source_name = result_json.get("dataset", "")
+    if source_name is None:
+        source_name = result_json.get("dataset", "")
 
     # ── 第一遍: 收集所有 SKU 数据，确定最大图片数 ──
     sku_rows: list[dict[str, Any]] = []
@@ -143,6 +150,9 @@ def export_job_excel(result_json: dict, job_dir: Path, output_path: Path) -> Non
     for ci in range(1, max_images + 1):
         ws.column_dimensions[get_column_letter(ci)].width = _IMG_COL_WIDTH
 
+    # 所有数据单元格的对齐方式：自动换行 + 垂直居中
+    data_align = Alignment(wrap_text=True, vertical="center")
+
     row_num = 2
     embedded_count = 0
 
@@ -173,6 +183,13 @@ def export_job_excel(result_json: dict, job_dir: Path, output_path: Path) -> Non
             except Exception as e:
                 logger.warning("embed_image_failed", error=str(e))
 
+        # ── 辅助：写单元格并设置对齐 ──
+        def _set(header: str, value: str) -> None:
+            col = fixed_col_map.get(header)
+            if col and value:
+                c = ws.cell(row=row_num, column=col, value=value)
+                c.alignment = data_align
+
         # ── 文本列 ──
         # 商品名称/描述
         pname = attrs.get("product_name", "")
@@ -183,46 +200,44 @@ def export_job_excel(result_json: dict, job_dir: Path, output_path: Path) -> Non
         # 去重: 如果 model == pname 则不重复
         if model and model == pname and len(desc_parts) > 1:
             desc_parts.remove(model)
-        desc_value = " ".join(desc_parts) if desc_parts else ""
-        if "商品名称/描述" in fixed_col_map:
-            ws.cell(row=row_num, column=fixed_col_map["商品名称/描述"], value=desc_value)
-
-        # 售价
-        if attrs.get("price") and "售价" in fixed_col_map:
-            ws.cell(row=row_num, column=fixed_col_map["售价"], value=str(attrs["price"]))
-
-        # 货号
-        if attrs.get("model_number") and "货号" in fixed_col_map:
-            ws.cell(row=row_num, column=fixed_col_map["货号"], value=str(attrs["model_number"]))
-
-        # 标签
-        if attrs.get("tag") and "标签" in fixed_col_map:
-            ws.cell(row=row_num, column=fixed_col_map["标签"], value=str(attrs["tag"]))
-
-        # 来源 = 传入文件的原名称
-        if source_name and "来源(仅自己可见)" in fixed_col_map:
-            ws.cell(row=row_num, column=fixed_col_map["来源(仅自己可见)"], value=source_name)
-
-        # 商品规格
-        spec_val = attrs.get("specs", "") or attrs.get("size", "")
-        if spec_val and "商品规格" in fixed_col_map:
-            ws.cell(row=row_num, column=fixed_col_map["商品规格"], value=str(spec_val))
-
-        # 颜色
-        if attrs.get("color") and "颜色" in fixed_col_map:
-            ws.cell(row=row_num, column=fixed_col_map["颜色"], value=str(attrs["color"]))
+        _set("商品名称/描述", " ".join(desc_parts))
+        _set("售价", str(attrs.get("price", "")))
+        _set("货号", str(attrs.get("model_number", "")))
+        _set("标签", str(attrs.get("tag", "")))
+        _set("来源(仅自己可见)", source_name)
+        _set("商品规格", str(attrs.get("specs", "") or attrs.get("size", "")))
+        _set("颜色", str(attrs.get("color", "")))
 
         row_num += 1
 
     # ── 列宽微调 ──
-    if "商品名称/描述" in fixed_col_map:
-        ws.column_dimensions[get_column_letter(fixed_col_map["商品名称/描述"])].width = 40
-    if "货号" in fixed_col_map:
-        ws.column_dimensions[get_column_letter(fixed_col_map["货号"])].width = 15
-    if "来源(仅自己可见)" in fixed_col_map:
-        ws.column_dimensions[get_column_letter(fixed_col_map["来源(仅自己可见)"])].width = 25
-    if "商品规格" in fixed_col_map:
-        ws.column_dimensions[get_column_letter(fixed_col_map["商品规格"])].width = 20
+    _col_widths = {
+        "规格图片": 13,
+        "商品名称/描述": 40,
+        "售价": 12,
+        "货号": 18,
+        "商品ID": 12,
+        "标签": 15,
+        "来源(仅自己可见)": 25,
+        "商品简称": 15,
+        "商品规格": 20,
+        "颜色": 15,
+        "规格编码": 15,
+        "批发价": 12,
+        "打包价": 12,
+        "代发价": 12,
+        "拿货价(仅自己可见)": 18,
+        "活动类型": 12,
+        "活动价": 12,
+        "库存": 10,
+        "重量(kg)": 12,
+        "备注(公开)": 20,
+        "自动下架时间": 18,
+    }
+    for header, width in _col_widths.items():
+        col = fixed_col_map.get(header)
+        if col:
+            ws.column_dimensions[get_column_letter(col)].width = width
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
