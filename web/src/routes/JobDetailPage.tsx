@@ -627,6 +627,7 @@ export default function JobDetailPage() {
   const [resultError, setResultError] = useState(false);
   const [loading, setLoading] = useState(true);
   const [jobTitle, setJobTitle] = useState<string>("任务详情");
+  const [exporting, setExporting] = useState(false);
   const retryRef = useRef<ReturnType<typeof setInterval>>();
 
   // 加载 job 信息获取真实文件名
@@ -661,10 +662,6 @@ export default function JobDetailPage() {
     if (result && retryRef.current) clearInterval(retryRef.current);
   }, [result]);
 
-  if (loading) return <Loading />;
-
-  const [exporting, setExporting] = useState(false);
-
   const handleExportExcel = useCallback(async () => {
     if (!jobId || exporting) return;
     setExporting(true);
@@ -694,6 +691,8 @@ export default function JobDetailPage() {
       setExporting(false);
     }
   }, [jobId, exporting]);
+
+  if (loading) return <Loading />;
 
   return (
     <div className="page">
