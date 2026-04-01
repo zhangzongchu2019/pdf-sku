@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useParams, Link } from "react-router-dom";
 import api from "../api/client";
+import { useAuthStore } from "../stores/authStore";
 import { statusLabel } from "../utils/format";
 import Loading from "../components/common/Loading";
 
@@ -356,7 +357,55 @@ function ProgressPanel({ jobId }: { jobId: string }) {
 }
 
 /* ── 结果视图 ── */
+/** 带 Authorization header 加载图片，返回 blob URL */
+function useAuthImage(url: string) {
+  const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let revoke = "";
+    const token = useAuthStore.getState().token;
+    const headers: Record<string, string> = {};
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+
+    fetch(url, { headers })
+      .then((r) => { if (!r.ok) throw new Error(String(r.status)); return r.blob(); })
+      .then((blob) => { revoke = URL.createObjectURL(blob); setBlobUrl(revoke); })
+      .catch(() => setFailed(true));
+
+    return () => { if (revoke) URL.revokeObjectURL(revoke); };
+  }, [url]);
+
+  return { blobUrl, failed };
+}
+
+function PageScreenshot({ jobId, pageNo, onClick }: { jobId: string; pageNo: number; onClick: (src: string) => void }) {
+  const API_BASE = import.meta.env.VITE_API_BASE || "/api/v1";
+  const url = `${API_BASE}/jobs/${jobId}/pages/${pageNo}/screenshot`;
+  const { blobUrl, failed } = useAuthImage(url);
+
+  if (failed) return null;
+  if (!blobUrl) return <div style={{ width: 300, height: 200, display: "flex", alignItems: "center", justifyContent: "center", color: "#bfbfbf", fontSize: 13 }}>加载中...</div>;
+
+  return (
+    <div style={{ flexShrink: 0, marginBottom: 8 }}>
+      <div style={{ fontSize: 12, color: "#8c8c8c", marginBottom: 4, fontWeight: 500 }}>原始页面</div>
+      <img
+        src={blobUrl}
+        alt={`第 ${pageNo} 页原始内容`}
+        onClick={() => onClick(blobUrl)}
+        style={{
+          maxWidth: 300, maxHeight: 400, borderRadius: 6,
+          border: "1px solid #e8e8e8", cursor: "pointer",
+          objectFit: "contain", background: "#fafafa",
+        }}
+      />
+    </div>
+  );
+}
+
 function ResultView({ data }: { data: DatasetDetail }) {
+  const { jobId } = useParams<{ jobId: string }>();
   const [expandedPages, setExpandedPages] = useState<Set<number>>(
     new Set(data.pages?.length ? [data.pages[0].page_no] : [])
   );
@@ -422,7 +471,14 @@ function ResultView({ data }: { data: DatasetDetail }) {
 
             {/* 页内容 */}
             {isOpen && (
-              <div>
+              <div style={{ display: "flex", gap: 16, padding: "0 16px" }}>
+                {/* 左侧: 原始页面截图 */}
+                {jobId && (
+                  <PageScreenshot jobId={jobId} pageNo={page.page_no} onClick={setLightboxImg} />
+                )}
+
+                {/* 右侧: SKU 列表 */}
+                <div style={{ flex: 1, minWidth: 0 }}>
                 {page.error && (
                   <div style={{
                     color: "#cf1322", background: "#fff2f0", padding: "10px 16px",
@@ -539,6 +595,7 @@ function ResultView({ data }: { data: DatasetDetail }) {
                     );
                   })
                 )}
+                </div>
               </div>
             )}
           </div>
@@ -569,7 +626,16 @@ export default function JobDetailPage() {
   const [result, setResult] = useState<DatasetDetail | null>(null);
   const [resultError, setResultError] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [jobTitle, setJobTitle] = useState<string>("任务详情");
   const retryRef = useRef<ReturnType<typeof setInterval>>();
+
+  // 加载 job 信息获取真实文件名
+  useEffect(() => {
+    if (!jobId) return;
+    api.get<JobInfo>(`/jobs/${jobId}`).then((j) => {
+      if (j.source_file) setJobTitle(j.source_file);
+    }).catch(() => {});
+  }, [jobId]);
 
   const loadResult = useCallback(async () => {
     if (!jobId) return;
@@ -602,7 +668,7 @@ export default function JobDetailPage() {
       <div className="page-header">
         <div>
           <Link to="/jobs" className="back-link">← 返回列表</Link>
-          <h2>{result?.dataset || "任务详情"}</h2>
+          <h2>{jobTitle}</h2>
         </div>
       </div>
 

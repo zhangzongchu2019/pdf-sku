@@ -64,6 +64,22 @@ def get_sse_manager():
     return sse_manager
 
 
+def _check_merchant_access(user, job: PDFJob) -> None:
+    """非 admin 用户只能访问自己 merchant 的 Job，否则抛 404。"""
+    if user.role != "admin" and user.merchant_id and job.merchant_id != user.merchant_id:
+        raise JobNotFoundError(f"Job {job.job_id} not found")
+
+
+async def _get_job_checked(db: AsyncSession, job_id: uuid.UUID, user) -> PDFJob:
+    """获取 Job 并校验 merchant 访问权限。"""
+    result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise JobNotFoundError(f"Job {job_id} not found")
+    _check_merchant_access(user, job)
+    return job
+
+
 # ───────────────────────── TUS 端点 ─────────────────────────
 
 @router.post("/uploads", status_code=201)
@@ -202,24 +218,44 @@ async def create_job(
     }
 
 
+@router.get("/merchants")
+async def list_merchants(db: DBSession, user: AnyUser):
+    """返回当前用户可见的 merchant_id 列表（按最近使用排序）。"""
+    query = (
+        select(PDFJob.merchant_id, func.max(PDFJob.created_at).label("last_used"))
+        .group_by(PDFJob.merchant_id)
+        .order_by(desc("last_used"))
+    )
+    if user.role != "admin" and user.merchant_id:
+        query = query.where(PDFJob.merchant_id == user.merchant_id)
+    rows = (await db.execute(query)).all()
+    return {"data": [r.merchant_id for r in rows]}
+
+
 @router.get("/jobs")
 async def list_jobs(
     db: DBSession,
+    user: AnyUser,
     status: str | None = Query(None),
     merchant_id: str | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
-    """列出 Job (分页)。"""
+    """列出 Job (分页)。非 admin 用户只能看到自己 merchant 的 Job。"""
     query = select(PDFJob).order_by(desc(PDFJob.created_at))
     count_query = select(func.count()).select_from(PDFJob)
+
+    # 非 admin 强制按 merchant_id 隔离
+    if user.role != "admin" and user.merchant_id:
+        query = query.where(PDFJob.merchant_id == user.merchant_id)
+        count_query = count_query.where(PDFJob.merchant_id == user.merchant_id)
+    elif merchant_id:
+        query = query.where(PDFJob.merchant_id == merchant_id)
+        count_query = count_query.where(PDFJob.merchant_id == merchant_id)
 
     if status:
         query = query.where(PDFJob.user_status == status)
         count_query = count_query.where(PDFJob.user_status == status)
-    if merchant_id:
-        query = query.where(PDFJob.merchant_id == merchant_id)
-        count_query = count_query.where(PDFJob.merchant_id == merchant_id)
 
     total = (await db.execute(count_query)).scalar() or 0
     jobs = (await db.execute(
@@ -238,18 +274,17 @@ async def list_jobs(
 
 
 @router.get("/jobs/{job_id}")
-async def get_job(job_id: uuid.UUID, db: DBSession):
-    """获取 Job 详情。"""
-    result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
-    job = result.scalar_one_or_none()
-    if not job:
-        raise JobNotFoundError(f"Job {job_id} not found")
+async def get_job(job_id: uuid.UUID, db: DBSession, user: AnyUser):
+    """获取 Job 详情。非 admin 仅可查看自己 merchant 的 Job。"""
+    job = await _get_job_checked(db, job_id, user)
     return _job_to_dict(job, detail=True)
 
 
 @router.post("/jobs/{job_id}/cancel")
-async def cancel_job(job_id: uuid.UUID, db: DBSession):
-    """取消 Job。"""
+async def cancel_job(job_id: uuid.UUID, db: DBSession, user: AnyUser):
+    """取消 Job。非 admin 仅可取消自己 merchant 的 Job。"""
+    await _get_job_checked(db, job_id, user)
+
     from pdf_sku.gateway.user_status import update_job_status
     job = await update_job_status(
         db, str(job_id), JobInternalStatus.CANCELLED.value, trigger="user_cancel"
@@ -259,13 +294,10 @@ async def cancel_job(job_id: uuid.UUID, db: DBSession):
 
 
 @router.post("/jobs/{job_id}/requeue")
-async def requeue_job(job_id: uuid.UUID, db: DBSession, redis: RedisClient):
+async def requeue_job(job_id: uuid.UUID, db: DBSession, redis: RedisClient, user: AnyUser):
     """手动重提 Job — 重置为 UPLOADED 并触发评估流程。"""
     from pdf_sku.gateway.user_status import update_job_status
-    result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
-    job = result.scalar_one_or_none()
-    if not job:
-        raise JobNotFoundError(f"Job {job_id} not found")
+    job = await _get_job_checked(db, job_id, user)
 
     _requeueable = (
         JobInternalStatus.ORPHANED.value,
@@ -447,10 +479,11 @@ async def reprocess_job_ai(job_id: uuid.UUID, db: DBSession):
 
 @router.get("/jobs/{job_id}/pages")
 async def get_pages(
-    job_id: uuid.UUID, db: DBSession,
+    job_id: uuid.UUID, db: DBSession, user: AnyUser,
     page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200),
 ):
     """获取 Job 的页面列表。"""
+    await _get_job_checked(db, job_id, user)
     count = (await db.execute(
         select(func.count()).where(Page.job_id == job_id)
     )).scalar() or 0
@@ -473,14 +506,12 @@ async def get_pages(
 async def get_page_screenshot(
     job_id: uuid.UUID,
     db: DBSession,
+    user: AnyUser,
     page_number: int = PathParam(..., ge=1),
 ):
     """返回指定页面的截图 (PNG)。"""
 
-    job_result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
-    job = job_result.scalar_one_or_none()
-    if not job:
-        raise JobNotFoundError(f"Job {job_id} not found")
+    job = await _get_job_checked(db, job_id, user)
 
     page_result = await db.execute(
         select(Page).where(Page.job_id == job_id, Page.page_number == page_number)
@@ -561,8 +592,10 @@ async def get_job_image(
     job_id: uuid.UUID,
     image_id: str,
     db: DBSession,
+    user: AnyUser,
 ):
     """返回 Job 中提取的图片文件。"""
+    await _get_job_checked(db, job_id, user)
     result = await db.execute(
         select(Image).where(Image.job_id == job_id, Image.image_id == image_id)
     )
@@ -589,9 +622,11 @@ async def get_job_image(
 async def get_page_detail(
     job_id: uuid.UUID,
     db: DBSession,
+    user: AnyUser,
     page_number: int = PathParam(..., ge=1),
 ):
     """返回页面 + SKU + Images 合并响应。"""
+    await _get_job_checked(db, job_id, user)
     page_result = await db.execute(
         select(Page).where(Page.job_id == job_id, Page.page_number == page_number)
     )
@@ -664,11 +699,13 @@ async def get_page_detail(
 async def get_skus(
     job_id: uuid.UUID,
     db: DBSession,
+    user: AnyUser,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     page_number: int | None = Query(None, ge=1),
 ):
     """获取 Job 的 SKU 列表（可按页面过滤），附带 images。"""
+    await _get_job_checked(db, job_id, user)
 
     base_query = select(SKU).where(SKU.job_id == job_id, SKU.superseded == False)
     count_query = select(func.count()).select_from(SKU).where(
@@ -722,12 +759,9 @@ async def get_skus(
 
 
 @router.get("/jobs/{job_id}/evaluation")
-async def get_evaluation(job_id: uuid.UUID, db: DBSession):
+async def get_evaluation(job_id: uuid.UUID, db: DBSession, user: AnyUser):
     """获取 Job 的评估结果。"""
-    result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
-    job = result.scalar_one_or_none()
-    if not job:
-        raise JobNotFoundError(f"Job {job_id} not found")
+    job = await _get_job_checked(db, job_id, user)
 
     eval_result = await db.execute(
         select(Evaluation).where(Evaluation.file_hash == job.file_hash)
@@ -752,12 +786,9 @@ async def get_evaluation(job_id: uuid.UUID, db: DBSession):
 # ───────────────────────── SSE ─────────────────────────
 
 @router.get("/jobs/{job_id}/events")
-async def sse_stream(job_id: uuid.UUID, db: DBSession):
+async def sse_stream(job_id: uuid.UUID, db: DBSession, user: AnyUser):
     """SSE 事件流。对齐: Gateway 详设 §4.3"""
-    # 验证 Job 存在
-    result = await db.execute(select(PDFJob.job_id).where(PDFJob.job_id == job_id))
-    if not result.scalar_one_or_none():
-        raise JobNotFoundError(f"Job {job_id} not found")
+    await _get_job_checked(db, job_id, user)
 
     mgr = get_sse_manager()
     return EventSourceResponse(

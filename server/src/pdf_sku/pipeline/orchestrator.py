@@ -349,6 +349,12 @@ class Orchestrator:
 
         job_uuid = UUID(job_id)
 
+        # 获取真实文件名
+        job_row = (await db.execute(
+            select(PDFJob).where(PDFJob.job_id == job_uuid)
+        )).scalar_one_or_none()
+        real_filename = job_row.source_file if job_row else (file_path.rsplit("/", 1)[-1] if "/" in file_path else file_path)
+
         # 查询所有页面
         page_rows = (await db.execute(
             select(Page).where(Page.job_id == job_uuid).order_by(Page.page_number)
@@ -408,7 +414,7 @@ class Orchestrator:
             })
 
         output = {
-            "dataset": file_path.rsplit("/", 1)[-1] if "/" in file_path else file_path,
+            "dataset": real_filename,
             "pdf": file_path,
             "total_pages": len(page_rows),
             "total_skus": total_skus,

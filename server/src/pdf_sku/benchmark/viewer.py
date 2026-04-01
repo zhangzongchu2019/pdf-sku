@@ -2,10 +2,17 @@
 from __future__ import annotations
 
 import json
+from uuid import UUID
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
+from sqlalchemy import select
+
+from pdf_sku.common.dependencies import DBSession
+from pdf_sku.common.models import PDFJob
+from pdf_sku.common.exceptions import JobNotFoundError
+from pdf_sku.auth.dependencies import AnyUser
 
 import os
 
@@ -50,8 +57,20 @@ async def get_dataset(name: str):
 
 
 @router.get("/api/v1/jobs/{job_id}/result")
-async def get_job_result(job_id: str):
+async def get_job_result(job_id: str, db: DBSession, user: AnyUser):
     """读取 job 目录下的 result.json 供前端可视化。"""
+    # 校验 merchant 访问权限
+    try:
+        job_uuid = UUID(job_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid job_id")
+    result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_uuid))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if user.role != "admin" and user.merchant_id and job.merchant_id != user.merchant_id:
+        raise HTTPException(404, "Job not found")
+
     safe = Path(job_id).name
     result_path = JOB_DATA_DIR / safe / "result.json"
     if not result_path.exists():

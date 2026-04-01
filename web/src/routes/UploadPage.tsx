@@ -1,11 +1,13 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useUploadStore } from "../stores/uploadStore";
 import { useJobStore } from "../stores/jobStore";
 import { useNotificationStore } from "../stores/notificationStore";
+import { useAuthStore } from "../stores/authStore";
 import { formatBytes } from "../utils/format";
+import api from "../api/client";
 
-const MAX_SIZE = 100 * 1024 * 1024; // 100MB
+const MAX_SIZE = 1024 * 1024 * 1024; // 1GB
 
 export default function UploadPage() {
   const navigate = useNavigate();
@@ -13,33 +15,23 @@ export default function UploadPage() {
   const { uploads, addFile, startUpload, removeUpload, clearCompleted } = useUploadStore();
   const createJob = useJobStore((s) => s.createJob);
   const notify = useNotificationStore((s) => s.add);
+  const authMerchantId = useAuthStore((s) => s.merchantId);
 
-  const [merchantId, setMerchantId] = useState("");
+  const [merchantId, setMerchantId] = useState(authMerchantId || "");
   const [category, setCategory] = useState("");
   const [dragActive, setDragActive] = useState(false);
+  const [merchantList, setMerchantList] = useState<string[]>([]);
+  const [showDropdown, setShowDropdown] = useState(false);
 
-  const handleFiles = useCallback((files: FileList | File[]) => {
-    const arr = Array.from(files);
-    for (const file of arr) {
-      if (!file.name.toLowerCase().endsWith(".pdf")) {
-        notify({ type: "error", message: `${file.name} 不是 PDF 文件` });
-        continue;
-      }
-      if (file.size > MAX_SIZE) {
-        notify({ type: "error", message: `${file.name} 超过 100MB 限制` });
-        continue;
-      }
-      addFile(file);
-    }
-  }, [addFile, notify]);
+  useEffect(() => {
+    api.get<{ data: string[] }>("/merchants").then((res) => {
+      setMerchantList(res.data || []);
+      // 优先用当前用户的 merchantId，其次用最近使用的
+      if (!authMerchantId && res.data?.length) setMerchantId(res.data[0]);
+    }).catch(() => {});
+  }, [authMerchantId]);
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setDragActive(false);
-    handleFiles(e.dataTransfer.files);
-  }, [handleFiles]);
-
-  const handleUploadAndCreate = useCallback(async (uploadId: string) => {
+  const doUploadAndCreate = useCallback(async (uploadId: string) => {
     if (!merchantId.trim()) {
       notify({ type: "error", message: "请输入商户 ID" });
       return;
@@ -54,14 +46,64 @@ export default function UploadPage() {
     }
   }, [merchantId, category, startUpload, createJob, notify, navigate]);
 
+  const handleFiles = useCallback((files: FileList | File[]) => {
+    const arr = Array.from(files);
+    for (const file of arr) {
+      if (!file.name.toLowerCase().endsWith(".pdf")) {
+        notify({ type: "error", message: `${file.name} 不是 PDF 文件` });
+        continue;
+      }
+      if (file.size > MAX_SIZE) {
+        notify({ type: "error", message: `${file.name} 超过 1GB 限制` });
+        continue;
+      }
+      const uploadId = addFile(file);
+      doUploadAndCreate(uploadId);
+    }
+  }, [addFile, notify, doUploadAndCreate]);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setDragActive(false);
+    handleFiles(e.dataTransfer.files);
+  }, [handleFiles]);
+
   return (
     <div className="page upload-page">
       <h2>上传 PDF 目录</h2>
 
       <div className="form-row">
         <label>商户 ID *</label>
-        <input value={merchantId} onChange={(e) => setMerchantId(e.target.value)}
-               placeholder="例: merchant_001" className="input" />
+        <div style={{ position: "relative" }}>
+          <input value={merchantId}
+                 onChange={(e) => setMerchantId(e.target.value)}
+                 onFocus={() => merchantList.length > 0 && setShowDropdown(true)}
+                 onBlur={() => setTimeout(() => setShowDropdown(false), 150)}
+                 placeholder="例: merchant_001" className="input" />
+          {showDropdown && merchantList.length > 0 && (
+            <div style={{
+              position: "absolute", top: "100%", left: 0, right: 0, zIndex: 10,
+              background: "#fff", border: "1px solid #d9d9d9", borderRadius: 6,
+              boxShadow: "0 4px 12px rgba(0,0,0,0.1)", maxHeight: 200, overflowY: "auto",
+            }}>
+              {merchantList
+                .filter((m) => !merchantId || m.toLowerCase().includes(merchantId.toLowerCase()))
+                .map((m) => (
+                  <div key={m}
+                       onMouseDown={() => { setMerchantId(m); setShowDropdown(false); }}
+                       style={{
+                         padding: "8px 12px", cursor: "pointer", fontSize: 14,
+                         background: m === merchantId ? "#e6f7ff" : "#fff",
+                       }}
+                       onMouseEnter={(e) => { (e.target as HTMLElement).style.background = "#f5f5f5"; }}
+                       onMouseLeave={(e) => { (e.target as HTMLElement).style.background = m === merchantId ? "#e6f7ff" : "#fff"; }}
+                  >
+                    {m}
+                  </div>
+                ))}
+            </div>
+          )}
+        </div>
       </div>
       <div className="form-row">
         <label>品类 (可选)</label>
@@ -81,7 +123,7 @@ export default function UploadPage() {
         <div className="dropzone-content">
           <span className="dropzone-icon">📁</span>
           <p>拖拽 PDF 文件到此处，或点击选择</p>
-          <p className="dropzone-hint">支持批量上传，单文件最大 100MB</p>
+          <p className="dropzone-hint">支持批量上传，单文件最大 1GB</p>
         </div>
       </div>
 
@@ -103,12 +145,6 @@ export default function UploadPage() {
               </div>
               <div className="upload-actions">
                 <span className="upload-status">{u.status === "uploading" ? `${u.progress.percentage}%` : u.status}</span>
-                {u.status === "pending" && (
-                  <button className="btn btn-primary btn-sm"
-                          onClick={() => handleUploadAndCreate(u.id)}>
-                    上传并创建
-                  </button>
-                )}
                 {u.status === "error" && <span className="error-text">{u.error}</span>}
                 <button className="btn btn-text btn-sm" onClick={() => removeUpload(u.id)}>✕</button>
               </div>
