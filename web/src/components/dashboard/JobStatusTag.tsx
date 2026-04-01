@@ -3,6 +3,7 @@
  * 按 action_hint 渲染不同颜色
  */
 import { STATUS_COLORS } from "../../utils/designTokens";
+import { statusLabel } from "../../utils/format";
 
 interface JobStatusTagProps {
   internalStatus: string;
@@ -37,7 +38,7 @@ export function JobStatusTag({ internalStatus, userStatus, actionHint }: JobStat
           backgroundColor: color,
         }}
       />
-      {userStatus || internalStatus}
+      {statusLabel(userStatus || internalStatus)}
       {actionHint && (
         <ActionHintBadge hint={actionHint} />
       )}

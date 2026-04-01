@@ -260,21 +260,88 @@ async def cancel_job(job_id: uuid.UUID, db: DBSession):
 
 @router.post("/jobs/{job_id}/requeue")
 async def requeue_job(job_id: uuid.UUID, db: DBSession, redis: RedisClient):
-    """手动重提 Job。"""
+    """手动重提 Job — 重置为 UPLOADED 并触发评估流程。"""
     from pdf_sku.gateway.user_status import update_job_status
     result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_id))
     job = result.scalar_one_or_none()
     if not job:
         raise JobNotFoundError(f"Job {job_id} not found")
 
-    if job.status not in (JobInternalStatus.ORPHANED.value, JobInternalStatus.EVAL_FAILED.value):
+    _requeueable = (
+        JobInternalStatus.ORPHANED.value,
+        JobInternalStatus.EVAL_FAILED.value,
+        JobInternalStatus.DEGRADED_HUMAN.value,
+        JobInternalStatus.PARTIAL_FAILED.value,
+        JobInternalStatus.CANCELLED.value,
+        JobInternalStatus.REJECTED.value,
+        JobInternalStatus.EVALUATING.value,
+        JobInternalStatus.PROCESSING.value,
+    )
+    if job.status not in _requeueable:
         from pdf_sku.common.exceptions import JobNotOrphanedError
         raise JobNotOrphanedError(f"Job status {job.status} cannot be requeued")
 
+    old_status = job.status
+
+    # 清理旧的处理数据（SKU / Image / Binding / 人工任务），避免重试时产生重复
+    task_ids = (await db.execute(
+        select(HumanTask.task_id).where(HumanTask.job_id == job_id)
+    )).scalars().all()
+    if task_ids:
+        await db.execute(delete(Annotation).where(Annotation.task_id.in_(task_ids)))
+        await db.execute(
+            delete(StateTransition).where(
+                StateTransition.entity_type == "task",
+                StateTransition.entity_id.in_([str(tid) for tid in task_ids]),
+            )
+        )
+    await db.execute(delete(HumanTask).where(HumanTask.job_id == job_id))
+    await db.execute(delete(SKUImageBinding).where(SKUImageBinding.job_id == job_id))
+    await db.execute(delete(SKU).where(SKU.job_id == job_id))
+    await db.execute(delete(Image).where(Image.job_id == job_id))
+
+    # 清除评估缓存（Redis + DB），避免重试命中旧的失败结果
+    eval_cache_key = f"{job.file_hash}:{job.frozen_config_version or 'default'}"
+    try:
+        await redis.delete(f"eval:{eval_cache_key}")
+    except Exception:
+        pass
+    await db.execute(delete(Evaluation).where(Evaluation.job_id == job_id))
+
+    # 重置所有页面状态
+    from pdf_sku.common.enums import PageStatus
+    blank_pages = set(job.blank_pages or [])
+    await db.execute(
+        update(Page).where(Page.job_id == job_id)
+        .values(status=PageStatus.PENDING.value, needs_review=False, sku_count=0)
+    )
+    if blank_pages:
+        await db.execute(
+            update(Page).where(Page.job_id == job_id, Page.page_number.in_(list(blank_pages)))
+            .values(status=PageStatus.BLANK.value)
+        )
+
+    # 重置 Job 状态
     job = await update_job_status(
         db, str(job_id), JobInternalStatus.UPLOADED.value, trigger="manual_requeue"
     )
+    job.degrade_reason = None
+    job.error_message = None
     await db.commit()
+
+    # 发布 JobCreated 事件，触发评估器自动拾取
+    await event_bus.publish("JobCreated", {
+        "job_id": str(job_id),
+        "file_hash": job.file_hash or "",
+        "total_pages": job.total_pages,
+        "status": JobInternalStatus.UPLOADED.value,
+        "prescan": {},
+        "config_version": job.frozen_config_version or "default",
+    })
+
+    logger.info("job_requeued", job_id=str(job_id),
+                old_status=old_status, new_status=job.status)
+
     return {"job_id": str(job_id), "status": job.status, "user_status": job.user_status}
 
 

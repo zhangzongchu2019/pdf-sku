@@ -1,6 +1,7 @@
 /**
  * 评估卡片 — 展示 route_reason / sampling / prompt_version
  */
+import { statusLabel } from "../../utils/format";
 import type { Evaluation } from "../../types/models";
 
 interface EvaluationCardProps {
@@ -46,7 +47,7 @@ export function EvaluationCard({ evaluation }: EvaluationCardProps) {
           marginBottom: 12,
         }}
       >
-        <InfoCell label="路由" value={evaluation.route} />
+        <InfoCell label="路由" value={statusLabel(evaluation.route)} />
         <InfoCell label="路由原因" value={evaluation.route_reason ?? "—"} />
         <InfoCell label="文档置信度" value={`${(evaluation.doc_confidence * 100).toFixed(1)}%`} />
         <InfoCell label="模型" value={evaluation.model_used} />

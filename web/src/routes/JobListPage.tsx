@@ -7,9 +7,16 @@ import Loading from "../components/common/Loading";
 import EmptyState from "../components/common/EmptyState";
 import { formatDate } from "../utils/format";
 
+/** 可重试状态：仅限明确的失败/降级态 */
+const RETRYABLE = new Set([
+  "DEGRADED_HUMAN", "EVAL_FAILED", "ORPHANED",
+  "PARTIAL_FAILED", "CANCELLED", "REJECTED",
+]);
+
 export default function JobListPage() {
-  const { jobs, total, loading, fetchJobs, deleteJob } = useJobStore();
+  const { jobs, total, loading, fetchJobs, deleteJob, retryJob } = useJobStore();
   const [page, setPage] = useState(1);
+  const [retryingId, setRetryingId] = useState<string | null>(null);
 
   useEffect(() => {
     fetchJobs({ page });
@@ -51,7 +58,26 @@ export default function JobListPage() {
                   <td>{job.total_pages}</td>
                   <td>{job.total_skus}</td>
                   <td>{formatDate(job.created_at)}</td>
-                  <td>
+                  <td style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                    {RETRYABLE.has(job.status) && retryingId !== job.job_id && (
+                      <button
+                        className="btn btn-primary btn-sm"
+                        onClick={async (e) => {
+                          e.preventDefault();
+                          setRetryingId(job.job_id);
+                          try {
+                            await retryJob(job.job_id);
+                            await fetchJobs({ page });
+                          } catch { /* ignore */ }
+                          setRetryingId(null);
+                        }}
+                      >
+                        重试
+                      </button>
+                    )}
+                    {retryingId === job.job_id && (
+                      <span style={{ fontSize: 12, color: "#1890ff" }}>重试中...</span>
+                    )}
                     <button
                       className="btn btn-danger btn-sm"
                       onClick={async () => {

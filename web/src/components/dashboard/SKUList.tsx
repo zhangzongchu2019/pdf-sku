@@ -2,6 +2,7 @@
  * SKU 列表 — 展示提取结果表格
  */
 import { useState } from "react";
+import { statusLabel } from "../../utils/format";
 import type { SKU } from "../../types/models";
 
 interface SKUListProps {
@@ -122,7 +123,7 @@ export function SKUList({ skus, jobId, onReconcile }: SKUListProps) {
                     <ValidityTag validity={sku.validity} />
                   </td>
                   <td style={{ padding: "6px", color: "#94A3B8" }}>
-                    {sku.status ?? "—"}
+                    {statusLabel(sku.status)}
                   </td>
                   <td style={{ padding: "6px" }}>
                     <ImportTag status={sku.import_status} />
@@ -177,7 +178,7 @@ export function SKUList({ skus, jobId, onReconcile }: SKUListProps) {
                             )}
                           </div>
                           <div style={{ marginTop: 8, fontSize: 11, color: "#94A3B8" }}>
-                            SKU ID: {sku.sku_id} | 来源: {sku.attribute_source}
+                            SKU ID: {sku.sku_id} | 来源: {statusLabel(sku.attribute_source)}
                           </div>
                         </div>
                         {/* Images */}

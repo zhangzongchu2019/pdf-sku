@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useParams, Link } from "react-router-dom";
 import api from "../api/client";
+import { statusLabel } from "../utils/format";
 import Loading from "../components/common/Loading";
 
 /* ── 类型定义 ── */
@@ -47,7 +48,9 @@ interface DatasetDetail {
 interface JobInfo {
   job_id: string;
   source_file: string;
+  status: string;
   user_status: string;
+  degrade_reason: string | null;
   total_pages: number;
   total_skus: number;
   created_at: string;
@@ -103,10 +106,36 @@ function ConfidenceBar({ value }: { value: number }) {
   );
 }
 
-const TERMINAL_STATUSES = ["COMPLETED", "PARTIAL", "FAILED", "CANCELLED"];
+const TERMINAL_STATUSES = ["COMPLETED", "PARTIAL", "FAILED", "CANCELLED", "NEEDS_MANUAL", "ORPHANED", "REJECTED", "DEGRADED"];
 function isTerminal(status: string) {
   return TERMINAL_STATUSES.some((s) => status?.toUpperCase().includes(s));
 }
+
+/** 判断 Job 是否可重试，返回提示标题和描述 */
+function retryableInfo(job: JobInfo): { title: string; desc: string } | null {
+  const s = job.status;
+  const dr = job.degrade_reason || "";
+  if (s === "DEGRADED_HUMAN" && dr.startsWith("eval_failed"))
+    return { title: "AI 模型调用超时", desc: "评估阶段大模型请求失败，可能由于网络波动或服务繁忙，请尝试重新分析" };
+  if (s === "DEGRADED_HUMAN")
+    return { title: "已降级为人工处理", desc: "评估阶段判定需要人工处理，可尝试重新分析" };
+  if (s === "EVAL_FAILED")
+    return { title: "评估失败", desc: "文件评估阶段出现异常，请尝试重新分析" };
+  if (s === "PARTIAL_FAILED")
+    return { title: "部分页面处理失败", desc: "部分页面处理过程中出现异常，可尝试重新分析" };
+  if (s === "ORPHANED")
+    return { title: "处理中断", desc: "任务处理过程中意外中断，请尝试重新分析" };
+  if (s === "CANCELLED")
+    return { title: "任务已取消", desc: "该任务此前已被取消，可重新发起分析" };
+  if (s === "REJECTED")
+    return { title: "文件被拒绝", desc: "文件预检未通过，可尝试重新分析" };
+  if (s === "EVALUATING" || s === "PROCESSING")
+    return { title: "任务似乎已卡住", desc: "任务长时间未更新，可能后端已中断，可尝试重新分析" };
+  return null;
+}
+
+/** 卡住检测阈值：连续 N 次轮询状态未变化则视为卡住 */
+const STUCK_POLL_THRESHOLD = 20; // 20 * 3s = 60s
 
 /* ── 进度面板 ── */
 function ProgressPanel({ jobId }: { jobId: string }) {
@@ -114,6 +143,10 @@ function ProgressPanel({ jobId }: { jobId: string }) {
   const [pages, setPages] = useState<PageInfo[]>([]);
   const timerRef = useRef<ReturnType<typeof setInterval>>();
   const [done, setDone] = useState(false);
+  const [stuck, setStuck] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const stuckCountRef = useRef(0);
+  const lastStatusRef = useRef("");
 
   const poll = useCallback(async () => {
     try {
@@ -121,7 +154,23 @@ function ProgressPanel({ jobId }: { jobId: string }) {
       setJob(j);
       const resp = await api.get<{ data: PageInfo[] }>(`/jobs/${jobId}/pages`);
       setPages(resp.data || []);
-      if (isTerminal(j.user_status)) setDone(true);
+      if (isTerminal(j.user_status)) {
+        setDone(true);
+        setRetrying(false);
+      } else {
+        // 重试成功后状态变为活跃态，清除 retrying
+        setRetrying(false);
+        // 卡住检测：如果 status 持续不变且处于活跃态
+        const key = `${j.status}:${(resp.data || []).map((p: PageInfo) => p.status).join(",")}`;
+        if (key === lastStatusRef.current) {
+          stuckCountRef.current++;
+          if (stuckCountRef.current >= STUCK_POLL_THRESHOLD) setStuck(true);
+        } else {
+          stuckCountRef.current = 0;
+          setStuck(false);
+        }
+        lastStatusRef.current = key;
+      }
     } catch { /* ignore */ }
   }, [jobId]);
 
@@ -145,13 +194,7 @@ function ProgressPanel({ jobId }: { jobId: string }) {
   const total = job.total_pages || pages.length;
   const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
 
-  const statusLabel: Record<string, string> = {
-    PROCESSING: "处理中", COMPLETED: "已完成", PARTIAL: "部分完成",
-    FAILED: "失败", CANCELLED: "已取消", UPLOADED: "已上传", EVALUATING: "评估中",
-  };
-  const displayStatus = Object.entries(statusLabel).find(([k]) =>
-    job.user_status?.toUpperCase().includes(k)
-  )?.[1] || job.user_status;
+  const displayStatus = statusLabel(job.user_status);
 
   return (
     <div style={{ marginBottom: 24 }}>
@@ -213,7 +256,97 @@ function ProgressPanel({ jobId }: { jobId: string }) {
         )}
       </div>
 
-      {done && (
+      {stuck && !done && !retrying && (
+        <div className="card" style={{
+          display: "flex", alignItems: "center", gap: 12,
+          padding: "14px 20px", marginTop: 12,
+          background: "#fffbe6", border: "1px solid #ffe58f",
+        }}>
+          <span style={{ fontSize: 20 }}>&#9888;</span>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 14, fontWeight: 600, color: "#d48806" }}>
+              任务似乎已卡住
+            </div>
+            <div style={{ fontSize: 12, color: "#8c8c8c", marginTop: 2 }}>
+              任务长时间未更新，可能后端已中断，可尝试强制重新分析
+            </div>
+          </div>
+          <button
+            onClick={async () => {
+              setRetrying(true);
+              try {
+                await api.post(`/jobs/${jobId}/requeue`);
+                setStuck(false);
+                stuckCountRef.current = 0;
+                lastStatusRef.current = "";
+                poll();
+              } catch {
+                setRetrying(false);
+              }
+            }}
+            style={{
+              padding: "6px 16px", backgroundColor: "#d48806", color: "#fff",
+              border: "none", borderRadius: 6, cursor: "pointer",
+              fontSize: 13, fontWeight: 500, whiteSpace: "nowrap",
+            }}
+          >
+            强制重新分析
+          </button>
+        </div>
+      )}
+
+      {done && retryableInfo(job) && !retrying && (
+        <div className="card" style={{
+          display: "flex", alignItems: "center", gap: 12,
+          padding: "14px 20px", marginTop: 12,
+          background: "#fff2f0", border: "1px solid #ffccc7",
+        }}>
+          <span style={{ fontSize: 20 }}>&#9888;</span>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 14, fontWeight: 600, color: "#cf1322" }}>
+              {retryableInfo(job)!.title}
+            </div>
+            <div style={{ fontSize: 12, color: "#8c8c8c", marginTop: 2 }}>
+              {retryableInfo(job)!.desc}
+            </div>
+          </div>
+          <button
+            onClick={async () => {
+              setRetrying(true);
+              try {
+                await api.post(`/jobs/${jobId}/requeue`);
+                setDone(false);
+                poll();
+              } catch {
+                setRetrying(false);
+              }
+            }}
+            style={{
+              padding: "6px 16px", backgroundColor: "#1890ff", color: "#fff",
+              border: "none", borderRadius: 6, cursor: "pointer",
+              fontSize: 13, fontWeight: 500, whiteSpace: "nowrap",
+            }}
+          >
+            重新分析
+          </button>
+        </div>
+      )}
+
+      {retrying && (
+        <div style={{
+          fontSize: 13, color: "#1890ff", marginTop: 12,
+          display: "flex", alignItems: "center", gap: 8,
+        }}>
+          <span style={{
+            display: "inline-block", width: 14, height: 14,
+            border: "2px solid #1890ff", borderTopColor: "transparent",
+            borderRadius: "50%", animation: "spin 0.8s linear infinite",
+          }} />
+          已提交重新分析，正在重新处理...
+        </div>
+      )}
+
+      {done && !retryableInfo(job) && (
         <div style={{ fontSize: 13, color: "#8c8c8c", marginTop: 8 }}>
           处理已完成，正在加载结果...
         </div>
@@ -278,10 +411,10 @@ function ResultView({ data }: { data: DatasetDetail }) {
                 transform: isOpen ? "rotate(90deg)" : "none",
               }}>&#9654;</span>
               <strong style={{ fontSize: 14 }}>第 {page.page_no} 页</strong>
-              <Badge text={page.status} color={statusColor(page.status)} />
+              <Badge text={statusLabel(page.status)} color={statusColor(page.status)} />
               {page.page_type && <Badge text={`类型 ${page.page_type}`} color="blue" />}
-              {page.extraction_method && <Badge text={page.extraction_method} color="purple" />}
-              {page.fitz_page_class && <Badge text={page.fitz_page_class} color="gray" />}
+              {page.extraction_method && <Badge text={statusLabel(page.extraction_method)} color="purple" />}
+              {page.fitz_page_class && <Badge text={statusLabel(page.fitz_page_class)} color="gray" />}
               <span style={{ marginLeft: "auto", fontSize: 13, color: "#8c8c8c", fontWeight: 600 }}>
                 {page.sku_count} SKUs
               </span>
@@ -327,7 +460,7 @@ function ResultView({ data }: { data: DatasetDetail }) {
                         <div style={{ flex: 1, minWidth: 0 }}>
                           <div style={{ fontSize: 15, fontWeight: 600, color: "#1f1f1f", marginBottom: 6, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                             {a.product_name || "未知商品"}
-                            <Badge text={sku.validity} color={sku.validity === "valid" ? "green" : "red"} />
+                            <Badge text={statusLabel(sku.validity)} color={sku.validity === "valid" ? "green" : "red"} />
                           </div>
 
                           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", fontSize: 13, marginBottom: 6 }}>
@@ -370,7 +503,7 @@ function ResultView({ data }: { data: DatasetDetail }) {
                           </div>
 
                           <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-                            {sku.extraction_method && <Badge text={sku.extraction_method} color="gray" />}
+                            {sku.extraction_method && <Badge text={statusLabel(sku.extraction_method)} color="gray" />}
                             <ConfidenceBar value={sku.confidence || 0} />
                             <span style={{ fontSize: 11, color: "#bfbfbf" }}>{sku.sku_id}</span>
                           </div>

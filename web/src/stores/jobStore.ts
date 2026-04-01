@@ -155,7 +155,11 @@ export const useJobStore = create<JobState>()(
       await jobsApi.retry(jobId);
       set((s) => {
         const job = s.jobs.find((j) => j.job_id === jobId);
-        if (job) job.user_status = "processing" as any;
+        if (job) {
+          job.status = "UPLOADED" as any;
+          job.user_status = "processing" as any;
+          job.degrade_reason = null;
+        }
       });
     },
 

@@ -8,7 +8,7 @@ import StatusBadge from "../components/common/StatusBadge";
 import Pagination from "../components/common/Pagination";
 import Loading from "../components/common/Loading";
 import EmptyState from "../components/common/EmptyState";
-import { formatDate } from "../utils/format";
+import { formatDate, statusLabel } from "../utils/format";
 import type { HumanTask } from "../types/models";
 
 const STATUSES = ["", "CREATED", "LOCKED", "COMPLETED", "SKIPPED", "ESCALATED"];
@@ -134,7 +134,7 @@ export default function TaskListPage() {
         {STATUSES.map((s) => (
           <button key={s} className={`btn btn-filter ${filter === s ? "active" : ""}`}
                   onClick={() => { setFilter(s); setPage(1); }}>
-            {s || "全部"}
+            {s ? statusLabel(s) : "全部"}
           </button>
         ))}
       </div>
@@ -170,9 +170,9 @@ export default function TaskListPage() {
                   <td className="td-mono">{t.task_id.slice(0, 8)}...</td>
                   <td className="td-mono">{t.job_id.slice(0, 8)}...</td>
                   <td>{t.page_number}</td>
-                  <td>{t.task_type}</td>
+                  <td>{statusLabel(t.task_type)}</td>
                   <td><StatusBadge status={t.status} /></td>
-                  <td><span className={`priority priority-${t.priority.toLowerCase()}`}>{t.priority}</span></td>
+                  <td><span className={`priority priority-${t.priority.toLowerCase()}`}>{statusLabel(t.priority)}</span></td>
                   <td>{t.assigned_to || "-"}</td>
                   <td>{formatDate(t.timeout_at)}</td>
                   <td>{formatDate(t.created_at)}</td>

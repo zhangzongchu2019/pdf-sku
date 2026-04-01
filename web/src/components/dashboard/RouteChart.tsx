@@ -9,6 +9,7 @@ import {
   ResponsiveContainer,
   Legend,
 } from "recharts";
+import { statusLabel } from "../../utils/format";
 
 export interface RouteDistribution {
   name: string;
@@ -49,6 +50,7 @@ export function RouteChart({ data, loading }: RouteChartProps) {
 
   const chartData = data.map((d) => ({
     ...d,
+    name: statusLabel(d.name),
     color: d.color || DEFAULT_COLORS[d.name] || "#64748B",
   }));
 
