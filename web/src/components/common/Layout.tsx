@@ -69,7 +69,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   const sseConnected = useSSEStore((s) => s.status === "connected");
   const uploadItems = useUploadStore((s) => s.uploads);
   const activeUploads = uploadItems.filter((f) => f.status === "uploading" || f.status === "hashing");
-  const { username, displayName, role, logout, isLoggedIn } = useAuthStore();
+  const { username, displayName, role, isLoggedIn } = useAuthStore();
 
   const ROLE_LABELS: Record<string, string> = {
     admin: "管理员",
@@ -187,9 +187,14 @@ export default function Layout({ children }: { children: React.ReactNode }) {
           </ul>
         </div>
 
-        {/* User info + logout */}
+        {/* User info — click to go to settings */}
         {isLoggedIn && (
-          <div className="sidebar-user">
+          <div
+            className="sidebar-user"
+            onClick={() => navigate("/settings")}
+            style={{ cursor: "pointer" }}
+            title="个人信息与设置"
+          >
             <div className="sidebar-user-info">
               <span className="sidebar-user-avatar">
                 {role === "admin" ? "👑" : role === "annotator" ? "✏️" : "📤"}
@@ -199,13 +204,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                 <div className="sidebar-user-role">{ROLE_LABELS[role] || role}</div>
               </div>
             </div>
-            <button
-              className="btn btn-text btn-sm"
-              onClick={() => { logout(); navigate("/login"); }}
-              title="退出登录"
-            >
-              🚪
-            </button>
+            <span style={{ fontSize: 12, color: "var(--text-secondary)" }}>⚙</span>
           </div>
         )}
       </nav>

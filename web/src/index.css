@@ -306,7 +306,9 @@ a:hover { text-decoration: underline; }
 .sidebar-user {
   display: flex; align-items: center; justify-content: space-between;
   padding: 8px 12px; border-top: 1px solid var(--border); margin-top: 4px;
+  border-radius: 6px; transition: background-color 0.15s;
 }
+.sidebar-user:hover { background-color: #22D3EE0A; }
 .sidebar-user-info { display: flex; align-items: center; gap: 8px; }
 .sidebar-user-avatar { font-size: 20px; }
 .sidebar-user-name { font-size: 13px; font-weight: 500; color: var(--text); line-height: 1.2; }
