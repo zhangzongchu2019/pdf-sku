@@ -1747,8 +1747,13 @@ class PageProcessor:
             if crop_w < 50 or crop_h < 50:
                 continue
 
-            # 跳过几乎等于原图的裁剪（面积 > 90%）
-            if crop_w * crop_h > src_w * src_h * 0.90:
+            raw_area_ratio = (crop_w * crop_h) / max(src_w * src_h, 1)
+            width_ratio = crop_w / max(src_w, 1)
+            height_ratio = crop_h / max(src_h, 1)
+            # 只有几乎等于整页时才跳过，单页大宣传块仍应保留。
+            if (raw_area_ratio > 0.985
+                    and width_ratio > 0.985
+                    and height_ratio > 0.985):
                 continue
 
             try:
@@ -1792,7 +1797,36 @@ class PageProcessor:
         updated_bindings: list[BindingResult] = []
         valid_skus = [s for s in skus if s.validity == "valid"]
 
-        if len(new_images) == 1:
+        if len(valid_skus) == 1:
+            # 单 SKU 页面: 多张独立宣传图都属于同一产品，全部挂到该 SKU。
+            target_sku_id = valid_skus[0].sku_id
+            replaced = False
+            for b in bindings:
+                if b.image_id == original_img.image_id and b.sku_id == target_sku_id:
+                    if not replaced:
+                        for rank, crop_img in enumerate(new_images, 1):
+                            updated_bindings.append(BindingResult(
+                                sku_id=target_sku_id,
+                                image_id=crop_img.image_id,
+                                confidence=b.confidence,
+                                method="scene_crop",
+                                is_ambiguous=False,
+                                rank=rank,
+                            ))
+                        replaced = True
+                else:
+                    updated_bindings.append(b)
+            if not replaced:
+                for rank, crop_img in enumerate(new_images, 1):
+                    updated_bindings.append(BindingResult(
+                        sku_id=target_sku_id,
+                        image_id=crop_img.image_id,
+                        confidence=0.90,
+                        method="scene_crop",
+                        is_ambiguous=False,
+                        rank=rank,
+                    ))
+        elif len(new_images) == 1:
             # 单区域裁剪: 所有 SKU 绑定到唯一裁剪图
             crop_img = new_images[0]
             for b in bindings:
