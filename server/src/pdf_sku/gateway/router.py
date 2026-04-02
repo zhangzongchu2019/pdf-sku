@@ -552,8 +552,9 @@ async def get_page_screenshot(
     db: DBSession,
     user: AnyUser,
     page_number: int = PathParam(..., ge=1),
+    size: str = "full",
 ):
-    """返回指定页面的截图 (PNG)。"""
+    """返回指定页面的截图。支持 ?size=thumb|medium|full。"""
 
     job = await _get_job_checked(db, job_id, user)
 
@@ -570,65 +571,119 @@ async def get_page_screenshot(
     job_dir = Path(settings.job_data_dir) / str(job_id)
     cache_path = job_dir / "screenshots" / f"page-{page_number}.png"
 
-    # 优先返回已缓存的截图
-    if cache_path.exists():
-        return FileResponse(str(cache_path), media_type="image/png")
+    # --- 获取原始 PNG 路径 (已缓存 / 显式路径 / 现场渲染) ---
+    origin_path: Path | None = None
 
-    # 显式指定的截图路径
-    if page.screenshot_path:
+    if cache_path.exists():
+        origin_path = cache_path
+    elif page.screenshot_path:
         explicit = Path(page.screenshot_path)
         if not explicit.is_absolute():
             explicit = job_dir / explicit
         if explicit.exists():
-            return FileResponse(str(explicit), media_type="image/png")
+            origin_path = explicit
 
-    source_pdf = job_dir / "source.pdf"
-    if not source_pdf.exists():
-        return JSONResponse(status_code=404, content={
-            "error_code": "SOURCE_PDF_MISSING",
-            "message": f"Source PDF not found for job {job_id}",
-        })
+    # 现场渲染并缓存
+    if origin_path is None:
+        source_pdf = job_dir / "source.pdf"
+        if not source_pdf.exists():
+            return JSONResponse(status_code=404, content={
+                "error_code": "SOURCE_PDF_MISSING",
+                "message": f"Source PDF not found for job {job_id}",
+            })
 
-    try:
-        import fitz
-
-        doc = fitz.open(source_pdf)
         try:
-            if page_number < 1 or page_number > doc.page_count:
-                return JSONResponse(status_code=404, content={
-                    "error_code": "PAGE_OUT_OF_RANGE",
-                    "message": f"Page {page_number} is out of range",
-                })
+            import fitz
 
-            zoom = 150 / 72
-            pix = doc[page_number - 1].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-            png_bytes = pix.tobytes("png")
-        finally:
-            doc.close()
-    except Exception as e:
-        logger.exception(
-            "screenshot_render_failed",
-            job_id=str(job_id),
-            page_number=page_number,
-            error=str(e),
+            doc = fitz.open(source_pdf)
+            try:
+                if page_number < 1 or page_number > doc.page_count:
+                    return JSONResponse(status_code=404, content={
+                        "error_code": "PAGE_OUT_OF_RANGE",
+                        "message": f"Page {page_number} is out of range",
+                    })
+
+                zoom = 150 / 72
+                pix = doc[page_number - 1].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                png_bytes = pix.tobytes("png")
+            finally:
+                doc.close()
+        except Exception as e:
+            logger.exception(
+                "screenshot_render_failed",
+                job_id=str(job_id),
+                page_number=page_number,
+                error=str(e),
+            )
+            return JSONResponse(status_code=500, content={
+                "error_code": "RENDER_FAILED",
+                "message": "Failed to render page screenshot",
+            })
+
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(png_bytes)
+            origin_path = cache_path
+        except Exception as e:
+            logger.warning(
+                "screenshot_cache_failed",
+                job_id=str(job_id),
+                page_number=page_number,
+                error=str(e),
+            )
+            # 渲染成功但缓存失败，直接返回内存数据
+            return Response(content=png_bytes, media_type="image/png")
+
+    # --- 原图直接返回 ---
+    if size not in _IMAGE_SIZES:
+        return FileResponse(str(origin_path), media_type="image/png")
+
+    # --- 缩略图: JPEG 缓存 ---
+    max_edge, quality = _IMAGE_SIZES[size]
+    ss_cache_dir = job_dir / "screenshots" / ".cache"
+    ss_cache_path = ss_cache_dir / f"page-{page_number}_{size}.jpg"
+
+    if not ss_cache_path.exists():
+        import asyncio
+
+        resolved = await asyncio.get_running_loop().run_in_executor(
+            None, _generate_thumbnail, origin_path, ss_cache_dir, ss_cache_path, max_edge, quality,
         )
-        return JSONResponse(status_code=500, content={
-            "error_code": "RENDER_FAILED",
-            "message": "Failed to render page screenshot",
-        })
+        if resolved != ss_cache_path:
+            return FileResponse(
+                str(origin_path), media_type="image/png",
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
 
-    try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_bytes(png_bytes)
-    except Exception as e:
-        logger.warning(
-            "screenshot_cache_failed",
-            job_id=str(job_id),
-            page_number=page_number,
-            error=str(e),
-        )
+    return FileResponse(
+        str(ss_cache_path),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
-    return Response(content=png_bytes, media_type="image/png")
+
+_IMAGE_SIZES: dict[str, tuple[int, int]] = {
+    "thumb": (128, 70),
+    "medium": (800, 80),
+}
+
+
+def _generate_thumbnail(
+    file_path: Path, cache_dir: Path, cache_path: Path,
+    max_edge: int, quality: int,
+) -> Path:
+    """同步生成缩略图（供 run_in_executor 调用）。返回实际文件路径。"""
+    from PIL import Image as PILImage
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with PILImage.open(file_path) as im:
+        if max(im.size) <= max_edge:
+            return file_path  # 原图已足够小
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        im.thumbnail((max_edge, max_edge), PILImage.LANCZOS)
+        im.save(cache_path, "JPEG", quality=quality)
+    return cache_path
 
 
 @router.get("/jobs/{job_id}/images/{image_id}")
@@ -637,8 +692,9 @@ async def get_job_image(
     image_id: str,
     db: DBSession,
     user: AnyUser,
+    size: str = "full",
 ):
-    """返回 Job 中提取的图片文件。"""
+    """返回 Job 中提取的图片文件。支持 ?size=thumb|medium|full 缩略图。"""
     await _get_job_checked(db, job_id, user)
     result = await db.execute(
         select(Image).where(Image.job_id == job_id, Image.image_id == image_id)
@@ -658,8 +714,35 @@ async def get_job_image(
             "message": "Image file not found on disk",
         })
 
-    media = "image/jpeg" if img.format == "jpg" else f"image/{img.format or 'jpeg'}"
-    return FileResponse(str(file_path), media_type=media)
+    # 原图直接返回
+    if size not in _IMAGE_SIZES:
+        media = "image/jpeg" if img.format == "jpg" else f"image/{img.format or 'jpeg'}"
+        return FileResponse(str(file_path), media_type=media)
+
+    # 缩略图: 磁盘缓存，首次按需生成（线程池避免阻塞事件循环）
+    max_edge, quality = _IMAGE_SIZES[size]
+    cache_dir = job_dir / "images" / ".cache"
+    cache_path = cache_dir / f"{image_id}_{size}.jpg"
+
+    if not cache_path.exists():
+        import asyncio
+
+        resolved = await asyncio.get_running_loop().run_in_executor(
+            None, _generate_thumbnail, file_path, cache_dir, cache_path, max_edge, quality,
+        )
+        if resolved != cache_path:
+            # 原图已经小于目标尺寸，直接返回原图
+            media = "image/jpeg" if img.format == "jpg" else f"image/{img.format or 'jpeg'}"
+            return FileResponse(
+                str(file_path), media_type=media,
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
+
+    return FileResponse(
+        str(cache_path),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @router.get("/jobs/{job_id}/pages/{page_number}/detail")

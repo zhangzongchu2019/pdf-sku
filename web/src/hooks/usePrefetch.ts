@@ -17,7 +17,7 @@ export function usePrefetch(
       try {
         // Preload screenshot image
         const img = new Image();
-        img.src = `/api/v1/jobs/${currentJobId}/pages/${nextPage}/screenshot`;
+        img.src = `/api/v1/jobs/${currentJobId}/pages/${nextPage}/screenshot?size=medium`;
         // Preload page data
         await jobsApi.getPage(currentJobId, nextPage);
       } catch {

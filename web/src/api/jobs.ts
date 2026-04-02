@@ -90,9 +90,9 @@ export const jobsApi = {
   getPageDetail: (jobId: string, pageNo: number) =>
     api.get<PageDetail>(`/jobs/${jobId}/pages/${pageNo}/detail`),
 
-  getImageUrl: (jobId: string, imageId: string) => {
+  getImageUrl: (jobId: string, imageId: string, size: "thumb" | "medium" | "full" = "thumb") => {
     const base = import.meta.env.VITE_API_BASE || "/api/v1";
-    return `${base}/jobs/${jobId}/images/${imageId}`;
+    return `${base}/jobs/${jobId}/images/${imageId}?size=${size}`;
   },
 
   dashboard: () => api.get<DashboardMetrics>("/dashboard/metrics"),

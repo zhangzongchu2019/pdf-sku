@@ -24,8 +24,8 @@ export function SKUList({ skus, jobId, onReconcile }: SKUListProps) {
   const [lightboxImg, setLightboxImg] = useState<string | null>(null);
   const [expandedSku, setExpandedSku] = useState<string | null>(null);
   const apiBase = import.meta.env.VITE_API_BASE || "/api/v1";
-  const imgUrl = (imageId: string) =>
-    jobId ? `${apiBase}/jobs/${jobId}/images/${imageId}` : "";
+  const imgUrl = (imageId: string, size: "thumb" | "medium" | "full" = "thumb") =>
+    jobId ? `${apiBase}/jobs/${jobId}/images/${imageId}?size=${size}` : "";
   const validCount = skus.filter((s) => s.validity === "valid").length;
   const needsReviewCount = skus.filter((s) => s.validity === "needs_review").length;
   const invalidCount = skus.filter((s) => s.validity === "invalid").length;
@@ -134,9 +134,10 @@ export function SKUList({ skus, jobId, onReconcile }: SKUListProps) {
                         {sku.images.slice(0, 3).map((img: any) => (
                           <img
                             key={img.image_id}
-                            src={imgUrl(img.image_id)}
+                            src={imgUrl(img.image_id, "thumb")}
+                            loading="lazy"
                             style={{ width: 32, height: 32, objectFit: "cover", borderRadius: 2, border: "1px solid #2D3548", cursor: "pointer" }}
-                            onClick={(e) => { e.stopPropagation(); setLightboxImg(imgUrl(img.image_id)); }}
+                            onClick={(e) => { e.stopPropagation(); setLightboxImg(imgUrl(img.image_id, "medium")); }}
                           />
                         ))}
                         {sku.images.length > 3 && (
@@ -189,9 +190,10 @@ export function SKUList({ skus, jobId, onReconcile }: SKUListProps) {
                               {sku.images.map((img: any) => (
                                 <img
                                   key={img.image_id}
-                                  src={imgUrl(img.image_id)}
+                                  src={imgUrl(img.image_id, "thumb")}
+                                  loading="lazy"
                                   style={{ width: 64, height: 64, objectFit: "cover", borderRadius: 3, border: "1px solid #2D3548", cursor: "pointer" }}
-                                  onClick={(e) => { e.stopPropagation(); setLightboxImg(imgUrl(img.image_id)); }}
+                                  onClick={(e) => { e.stopPropagation(); setLightboxImg(imgUrl(img.image_id, "medium")); }}
                                 />
                               ))}
                             </div>

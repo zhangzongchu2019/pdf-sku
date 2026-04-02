@@ -357,6 +357,17 @@ function ProgressPanel({ jobId }: { jobId: string }) {
 }
 
 /* ── 结果视图 ── */
+/** 带 Authorization header 的 <img> 封装 */
+function AuthImg({ src, alt, style, loading, onClick, onError }: {
+  src: string; alt?: string; style?: React.CSSProperties;
+  loading?: "lazy" | "eager"; onClick?: () => void;
+  onError?: React.ReactEventHandler<HTMLImageElement>;
+}) {
+  const { blobUrl, failed } = useAuthImage(src);
+  if (failed || !blobUrl) return null;
+  return <img src={blobUrl} alt={alt} style={style} loading={loading} onClick={onClick} onError={onError} />;
+}
+
 /** 带 Authorization header 加载图片，返回 blob URL */
 function useAuthImage(url: string) {
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
@@ -381,7 +392,7 @@ function useAuthImage(url: string) {
 
 function PageScreenshot({ jobId, pageNo, onClick }: { jobId: string; pageNo: number; onClick: (src: string) => void }) {
   const API_BASE = import.meta.env.VITE_API_BASE || "/api/v1";
-  const url = `${API_BASE}/jobs/${jobId}/pages/${pageNo}/screenshot`;
+  const url = `${API_BASE}/jobs/${jobId}/pages/${pageNo}/screenshot?size=medium`;
   const { blobUrl, failed } = useAuthImage(url);
 
   if (failed) return null;
@@ -406,10 +417,19 @@ function PageScreenshot({ jobId, pageNo, onClick }: { jobId: string; pageNo: num
 
 function ResultView({ data }: { data: DatasetDetail }) {
   const { jobId } = useParams<{ jobId: string }>();
+  const API_BASE = import.meta.env.VITE_API_BASE || "/api/v1";
   const [expandedPages, setExpandedPages] = useState<Set<number>>(
     new Set(data.pages?.length ? [data.pages[0].page_no] : [])
   );
   const [lightboxImg, setLightboxImg] = useState<string | null>(null);
+
+  /** 把静态路径 /images/jobs/{id}/images/xxx.jpg 转为 API 缩略图 URL */
+  const toSizedUrl = (staticPath: string, size: "thumb" | "medium" | "full" = "thumb") => {
+    // 从路径中提取 image_id: 最后一段去掉 .jpg
+    const filename = staticPath.split("/").pop() || "";
+    const imageId = filename.replace(/\.\w+$/, "");
+    return `${API_BASE}/jobs/${jobId}/images/${imageId}?size=${size}`;
+  };
 
   const togglePage = (pageNo: number) => {
     setExpandedPages((prev) => {
@@ -568,13 +588,13 @@ function ResultView({ data }: { data: DatasetDetail }) {
                         {/* 绑定图片 */}
                         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", flexShrink: 0, alignItems: "flex-start" }}>
                           {imgs.length > 0 ? imgs.map((p, j) => (
-                            <img
+                            <AuthImg
                               key={j}
-                              src={p}
+                              src={toSizedUrl(p, "thumb")}
                               alt="商品图"
                               loading="lazy"
                               onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
-                              onClick={() => setLightboxImg(p)}
+                              onClick={() => setLightboxImg(toSizedUrl(p, "medium"))}
                               style={{
                                 width: 72, height: 72, objectFit: "cover", borderRadius: 6,
                                 border: "1px solid #e8e8e8", cursor: "pointer",
@@ -613,7 +633,11 @@ function ResultView({ data }: { data: DatasetDetail }) {
             cursor: "pointer",
           }}
         >
-          <img src={lightboxImg} style={{ maxWidth: "90vw", maxHeight: "90vh", borderRadius: 8, boxShadow: "0 8px 40px rgba(0,0,0,0.3)" }} alt="preview" />
+          {lightboxImg.startsWith("blob:") ? (
+            <img src={lightboxImg} style={{ maxWidth: "90vw", maxHeight: "90vh", borderRadius: 8, boxShadow: "0 8px 40px rgba(0,0,0,0.3)" }} alt="preview" />
+          ) : (
+            <AuthImg src={lightboxImg} style={{ maxWidth: "90vw", maxHeight: "90vh", borderRadius: 8, boxShadow: "0 8px 40px rgba(0,0,0,0.3)" }} alt="preview" />
+          )}
         </div>
       )}
     </>

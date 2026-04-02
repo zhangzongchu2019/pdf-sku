@@ -97,7 +97,7 @@ function PageThumbnail({
     >
       {loaded ? (
         <img
-          src={`/api/v1/jobs/${jobId}/pages/${page.page_no}/screenshot?w=120`}
+          src={`/api/v1/jobs/${jobId}/pages/${page.page_no}/screenshot?size=thumb`}
           alt={`第 ${page.page_no} 页`}
           style={{ width: "100%", height: 80, objectFit: "cover" }}
           loading="lazy"

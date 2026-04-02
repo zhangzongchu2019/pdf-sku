@@ -46,6 +46,23 @@ class Orchestrator:
         self._pp = page_processor
         self._db_factory = db_session_factory
 
+    @staticmethod
+    def _compress_image(data: bytes, max_edge: int = 2000, quality: int = 85) -> bytes:
+        """大图压缩: 长边超过 max_edge 时缩放 + 重压缩 JPEG。"""
+        from PIL import Image as PILImage
+        import io
+
+        buf = io.BytesIO(data)
+        with PILImage.open(buf) as im:
+            if max(im.size) <= max_edge:
+                return data  # 无需压缩
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            im.thumbnail((max_edge, max_edge), PILImage.LANCZOS)
+            out = io.BytesIO()
+            im.save(out, "JPEG", quality=quality)
+            return out.getvalue()
+
     async def process_job(
         self,
         db: AsyncSession,
@@ -267,7 +284,9 @@ class Orchestrator:
                 file_rel = f"images/{image_id}.jpg"
                 file_abs = job_dir / file_rel
                 if img.data:
-                    file_abs.write_bytes(img.data)
+                    file_abs.write_bytes(
+                        self._compress_image(img.data, max_edge=2000, quality=85)
+                    )
 
                 bbox = [int(v) for v in img.bbox] if img.bbox else None
                 resolution = [int(img.width), int(img.height)] if img.width and img.height else None
