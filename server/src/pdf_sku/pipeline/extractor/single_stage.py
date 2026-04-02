@@ -33,17 +33,23 @@ def _sanitize_attrs(item: dict) -> dict:
 SINGLE_STAGE_PROMPT = """从这个 PDF 页面中提取所有商品(SKU)信息。
 对每个商品提取: product_name, model_number, price, specs, color, tag, source。
 
-核心原则: 宁可多提、不可遗漏。确保页面上每一个可识别的产品都被提取。
+核心原则: 只提取页面上实际印刷的文字信息，绝对禁止根据图片外观推断任何内容。
 
 提取规则:
 - 仔细扫描页面的每个区域（左上、右上、左下、右下、中间），不要只关注最显眼的产品
 - 如果页面是产品图册/画册，每个不同的产品图片区域都要提取为独立 SKU
 - 小字体的型号编号（如 Y001, FP-W01, SPJ-001, 302# 等）务必提取到 model_number 字段
-- product_name: 使用页面上标注的中文名称。如果没有文字标注但能看到产品图片，用简短中文描述产品类型（如"沙发"、"茶几"、"餐椅"）
+- product_name: 只使用页面上实际印刷/标注的名称，不要根据图片自行描述产品类型
 - 看到中文商品用中文提取，不要翻译成英文
-- 如果页面上有多个产品但文字很少，每个产品图片区域仍需独立提取一条 SKU
-- 不要虚构不存在的信息，但对于页面上可见的产品图片，即使只有图片没有文字也要提取
+- 只提取页面上有文字标注（名称、型号、价格、规格等）的产品，没有任何文字标注的纯图片不要提取
 - 如果页面没有任何商品（如目录页、封面页、纯文字说明页），返回空数组 []
+
+绝对禁止（最高优先级）:
+- 禁止根据图片中产品的外观推断颜色（如看到图片是棕色就填"棕色"）— color 字段只能填页面上印刷的颜色文字
+- 禁止根据图片中产品的外观推断规格（如看到L型沙发就填"L型设计"）— specs 字段只能填页面上印刷的规格文字
+- 禁止根据图片中产品的外观推断材质（如看到皮革就填"皮革"）
+- 如果页面上没有印刷某个字段的文字信息，该字段必须填 null 或空字符串
+- 错误示例: 页面只写了"型号：法拉利沙发"，你不能填 color="米白色与棕色" specs="L型设计" — 因为这些是你看图推断的，不是页面文字
 
 重要: 不要提前停止！如果页面有 10 个产品，必须提取 10 条 SKU。逐区域检查确保无遗漏。
 - 重要: 同一系列下不同产品类型（如同系列的玄关柜、鞋柜、电视柜、斗柜）必须分别提取为独立 SKU，不可合并
@@ -62,6 +68,7 @@ SINGLE_STAGE_PROMPT = """从这个 PDF 页面中提取所有商品(SKU)信息。
 - 如果页面展示了一张床，检查床两侧是否有床头柜
 - 如果页面展示了沙发，检查旁边是否有边几/茶几
 - 配套家具（如床头柜、边几）是独立产品，必须单独提取
+- 最终检查: 你填写的每个 color/specs/price 字段，是否都能在页面的印刷文字中找到对应原文？如果找不到，改为 null
 
 仅返回 JSON 数组:
 [{{"product_name": "...", "model_number": "...", "price": "...", "specs": "...", "color": "...", "confidence": 0.8}}]"""
@@ -78,14 +85,13 @@ RESCUE_PROMPT = """这个 PDF 页面包含商品但之前提取不完整。请�
 6. 特别注意页面边角和底部，容易被忽略的小产品图
 
 提取要求:
-- 对每个可见的产品图片区域，提取一条 SKU
-- 即使只有产品图片没有文字，也要用简短中文描述产品类型（如"沙发"、"茶几"）
+- 只提取页面上有文字标注（名称、型号、价格、规格）的产品
+- 没有任何文字标注的纯图片产品不要提取
+- product_name、color、specs 等字段必须来自页面上实际印刷的文字，不要根据图片外观推断
 - 型号编号提取到 model_number 字段
-- 配套家具（如床+床头柜）分别提取为独立 SKU
-- 不要遗漏任何产品区域
+- 配套家具（如床+床头柜）如果各自有文字标注，分别提取为独立 SKU
 - 重要: 同一系列下不同产品类型（如同系列的玄关柜、鞋柜、电视柜、斗柜）必须分别提取为独立 SKU，不可合并
-- 重要: 如果页面有 4 个产品图片，必须返回 4 条 SKU，数量要与图片数量一致
-- 同一型号的不同颜色/材质版本，如果页面上能明确区分，也要分别提取
+- 同一型号的不同颜色/材质版本，如果页面上有文字区分，也要分别提取
 
 仅返回 JSON 数组:
 [{{"product_name": "...", "model_number": "...", "price": "...", "specs": "...", "color": "...", "confidence": 0.7}}]"""
@@ -174,14 +180,10 @@ class SingleStageExtractor:
                 prompt += ("\n\n## 密集产品图片页（重要）\n"
                            "这是一个密集产品图片页面，包含多个产品图片排列成网格或密集布局。\n"
                            "关键要求:\n"
-                           "- 每一个独立的产品图片/照片都是一个独立SKU，即使外观相似\n"
-                           "- 不同颜色、不同材质、不同尺寸的版本各自算独立SKU\n"
-                           "- 即使产品图片旁边没有任何文字标注，也必须提取\n"
-                           "- product_name 用简短中文描述即可(如\"餐椅\"、\"沙发\"、\"茶几\")\n"
-                           "- 如果能看到颜色差异，在product_name或color中注明(如\"灰色餐椅\"、\"白色餐椅\")\n"
-                           "- 先数一数这个区域有几个不同的产品图片，然后逐一提取，确保数量一致\n"
-                           "- 重要：同一款产品如果有多种颜色（如灰色、白色、黑色），每种颜色都是独立SKU，必须分别提取\n"
-                           "- 重要：同一款产品的不同尺寸（如单人位、双人位、三人位），每个尺寸也是独立SKU\n")
+                           "- 只提取有文字标注（名称、型号、价格、规格）的产品\n"
+                           "- 没有任何文字标注的纯图片不要提取\n"
+                           "- product_name、color、specs 等字段必须来自页面上的实际印刷文字，不要根据图片外观推断\n"
+                           "- 先找到页面上所有文字标注，然后提取对应的产品信息\n")
 
             if page_class == "IMG_LABEL":
                 prompt += ("\n\n## 产品标签页提取（重要）\n"
@@ -200,13 +202,13 @@ class SingleStageExtractor:
                                "不同型号（如 MODEL:C40, MODEL:C42）是不同产品，必须分别提取。\n"
                                "英文产品名直接保留原文，不需要翻译。")
 
-            # 纯图页面（无文字标注）：每个产品图片都是一个独立产品
+            # 纯图页面（无文字标注）：提示无文字可提取
             if not text_content and screenshot:
                 prompt += ("\n\n## 纯图页面（无文字标注）\n"
-                           "这个页面没有文字标注，只有产品图片。\n"
-                           "每一个独立的产品图片就是一个产品，用简短中文描述产品类型即可。\n"
-                           "即使多个产品外观相似（如都是椅子），只要是不同的产品图片就要分别提取。\n"
-                           "先数一数页面上有几个独立的产品图片，然后逐一提取。")
+                           "这个页面几乎没有文字标注。\n"
+                           "仔细查找页面上所有细小的文字（型号、价格、规格等），如果找到则提取。\n"
+                           "如果确实没有任何文字标注，返回空数组 []。\n"
+                           "不要根据图片外观自行描述产品类型、颜色或规格。")
 
             resp = await self._llm._call_llm(
                 operation="extract_sku_single",
@@ -398,6 +400,86 @@ class SingleStageExtractor:
         except Exception as e:
             logger.warning("companion_extract_failed", error=str(e))
         return []
+
+    async def detect_product_regions(
+        self,
+        screenshot: bytes,
+        product_names: list[str] | None = None,
+    ) -> list[dict]:
+        """检测场景图中各个产品的位置，返回归一化 bbox 列表。
+
+        Args:
+            screenshot: 页面截图 (JPEG bytes)
+            product_names: 已提取的产品名称，辅助 VLM 定位
+
+        Returns:
+            [{"label": "三人沙发", "bbox": [x0, y0, x1, y1]}]
+            bbox 归一化到 0.0~1.0
+        """
+        if not self._llm or not screenshot:
+            return []
+
+        products_hint = ""
+        if product_names:
+            names_str = "、".join(p for p in product_names if p)
+            if names_str:
+                products_hint = (
+                    f"\n\n已知该页面包含以下产品: {names_str}\n"
+                    "请为每个产品标注区域。如果同一产品有多个子件"
+                    "（如沙发组合中的三人位、单人位），可以一起框选，"
+                    "也可以分开框选为独立子图。"
+                )
+
+        prompt = (
+            "请识别这张产品图册页面中每个独立产品的位置区域。\n\n"
+            "要求:\n"
+            "- 只框选产品本身，不要包含过多背景/地面/墙面\n"
+            "- 框选应紧贴产品边缘，留少量边距即可\n"
+            "- 场景装饰物（灯、画、植物、地毯等）不要框选\n"
+            "- 如果页面展示的是一组产品（如沙发组合），将整组作为一个区域框选\n"
+            "- 如果页面有多个独立产品（如主图+小图），每个独立区域分别框选\n"
+            "- bbox 使用归一化坐标 [x0, y0, x1, y1]，范围 0.0~1.0"
+            "（左上角为 [0,0]，右下角为 [1,1]）\n"
+            f"{products_hint}\n\n"
+            "仅返回 JSON 数组:\n"
+            '[{"label": "产品描述", "bbox": [0.1, 0.15, 0.9, 0.85]}]'
+        )
+
+        try:
+            resp = await self._llm._call_llm(
+                operation="detect_product_regions",
+                prompt=prompt,
+                images=[screenshot],
+            )
+            if not resp.text or not resp.text.strip():
+                return []
+
+            parsed = _parser.parse(resp.text, expected_type="array")
+            if not parsed.success or not isinstance(parsed.data, list):
+                logger.warning("detect_regions_parse_failed", text=resp.text[:200])
+                return []
+
+            regions = []
+            for item in parsed.data:
+                if not isinstance(item, dict) or "bbox" not in item:
+                    continue
+                bbox = item["bbox"]
+                if (isinstance(bbox, list) and len(bbox) == 4
+                        and all(isinstance(v, (int, float)) for v in bbox)):
+                    # 校验归一化范围
+                    x0, y0, x1, y1 = bbox
+                    if (0 <= x0 < x1 <= 1.0 and 0 <= y0 < y1 <= 1.0
+                            and (x1 - x0) * (y1 - y0) > 0.01):
+                        regions.append({
+                            "label": str(item.get("label", "")),
+                            "bbox": [float(x0), float(y0), float(x1), float(y1)],
+                        })
+            logger.info("detect_product_regions", count=len(regions),
+                        labels=[r["label"] for r in regions])
+            return regions
+        except Exception as e:
+            logger.warning("detect_product_regions_failed", error=str(e))
+            return []
 
     def _rule_extract(self, raw: ParsedPageIR) -> list[SKUResult]:
         """最后规则兜底 (从表格提取)。"""

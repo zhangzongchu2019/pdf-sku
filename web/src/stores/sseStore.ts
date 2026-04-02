@@ -67,7 +67,10 @@ export const useSSEStore = create<SSEState>()(
       es.addEventListener("page_completed", (e: MessageEvent) => {
         try {
           const data: SSEPageCompleted = JSON.parse(e.data);
-          useJobStore.getState().updatePageStatus(data.page_no, data.status ?? "AI_COMPLETED");
+          const status = data.status ?? "AI_COMPLETED";
+          useJobStore.getState().updatePageStatus(data.page_no, status);
+          // 增量更新 job 进度数组（驱动仪表盘进度条）
+          useJobStore.getState().trackPageProgress(data.page_no, status);
           dispatch("page_completed", data);
         } catch { /* ignore */ }
       });

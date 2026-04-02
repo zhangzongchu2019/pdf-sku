@@ -51,6 +51,7 @@ interface JobState {
   // SSE callbacks
   updateJobFromSSE: (jobId: string, updates: Partial<Job>) => void;
   updatePageStatus: (pageNo: number, status: string) => void;
+  trackPageProgress: (pageNo: number, status: string) => void;
 }
 
 export const useJobStore = create<JobState>()(
@@ -181,6 +182,27 @@ export const useJobStore = create<JobState>()(
     updatePageStatus: (pageNo, status) => set((s) => {
       const page = s.pages.find((p) => p.page_number === pageNo);
       if (page) page.status = status as any;
+    }),
+
+    trackPageProgress: (pageNo, status) => set((s) => {
+      // 增量更新 currentJob 和 jobs 列表中同 job_id 的进度数组
+      const jobId = s.currentJob?.job_id;
+      if (!jobId) return;
+      const targets = [
+        s.currentJob,
+        s.jobs.find((j) => j.job_id === jobId),
+      ].filter(Boolean) as Job[];
+      for (const job of targets) {
+        if (status === "AI_COMPLETED") {
+          if (!job.ai_pages.includes(pageNo)) {
+            job.ai_pages = [...job.ai_pages, pageNo];
+          }
+        } else if (status === "AI_FAILED") {
+          if (!job.failed_pages.includes(pageNo)) {
+            job.failed_pages = [...job.failed_pages, pageNo];
+          }
+        }
+      }
     }),
   })),
 );

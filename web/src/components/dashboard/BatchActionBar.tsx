@@ -1,14 +1,12 @@
 /**
  * 批量操作栏 — 选中 Job 后出现
- * 支持: 批量重试 / 批量取消 / 批量分配 / 导出CSV
+ * 支持: 批量重试 / 批量取消
  */
 
 interface BatchActionBarProps {
   selectedCount: number;
   onBatchRetry: () => void;
   onBatchCancel: () => void;
-  onBatchAssign: () => void;
-  onExportCSV: () => void;
   onClear: () => void;
 }
 
@@ -16,8 +14,6 @@ export function BatchActionBar({
   selectedCount,
   onBatchRetry,
   onBatchCancel,
-  onBatchAssign,
-  onExportCSV,
   onClear,
 }: BatchActionBarProps) {
   if (selectedCount === 0) return null;
@@ -46,12 +42,6 @@ export function BatchActionBar({
       </BarButton>
       <BarButton onClick={onBatchCancel} color="#EF4444">
         批量取消
-      </BarButton>
-      <BarButton onClick={onBatchAssign} color="#F59E0B">
-        批量分配
-      </BarButton>
-      <BarButton onClick={onExportCSV} color="#22C55E">
-        导出 CSV
       </BarButton>
 
       <div style={{ flex: 1 }} />

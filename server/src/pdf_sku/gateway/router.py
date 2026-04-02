@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Annotated
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Header, Query, Request, Response, Path as PathParam
+from fastapi import APIRouter, Body, Depends, Header, Query, Request, Response, Path as PathParam
 from fastapi.responses import JSONResponse, FileResponse
 from sqlalchemy import select, func, desc, delete, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -329,6 +329,10 @@ async def cancel_job(job_id: uuid.UUID, db: DBSession, user: AnyUser):
     """取消 Job。非 admin 仅可取消自己 merchant 的 Job。"""
     await _get_job_checked(db, job_id, user)
 
+    # 通知正在运行的流水线停止处理
+    from pdf_sku.pipeline.orchestrator import signal_cancel
+    signal_cancel(str(job_id))
+
     from pdf_sku.gateway.user_status import update_job_status
     job = await update_job_status(
         db, str(job_id), JobInternalStatus.CANCELLED.value, trigger="user_cancel"
@@ -358,6 +362,10 @@ async def requeue_job(job_id: uuid.UUID, db: DBSession, redis: RedisClient, user
         raise JobNotOrphanedError(f"Job status {job.status} cannot be requeued")
 
     old_status = job.status
+
+    # 停止正在运行的流水线
+    from pdf_sku.pipeline.orchestrator import signal_cancel
+    signal_cancel(str(job_id))
 
     # 清理旧的处理数据（SKU / Image / Binding / 人工任务），避免重试时产生重复
     task_ids = (await db.execute(
@@ -403,6 +411,8 @@ async def requeue_job(job_id: uuid.UUID, db: DBSession, redis: RedisClient, user
     )
     job.degrade_reason = None
     job.error_message = None
+    job.ai_pages = []
+    job.failed_pages = []
     await db.commit()
 
     # 发布 JobCreated 事件，触发评估器自动拾取
@@ -421,6 +431,143 @@ async def requeue_job(job_id: uuid.UUID, db: DBSession, redis: RedisClient, user
     return {"job_id": str(job_id), "status": job.status, "user_status": job.user_status}
 
 
+# ───────────────────────── Batch Job Operations ─────────────────────────
+
+@router.post("/ops/jobs/batch-cancel")
+async def batch_cancel_jobs(db: DBSession, body: dict = Body(...)):
+    """批量取消 Jobs。"""
+    job_ids = body.get("job_ids", [])
+    if not job_ids:
+        return {"success_count": 0, "failed_items": []}
+
+    from pdf_sku.pipeline.orchestrator import signal_cancel
+    from pdf_sku.gateway.user_status import update_job_status
+
+    success = 0
+    failed_items = []
+    for jid in job_ids:
+        try:
+            job_uuid = uuid.UUID(jid)
+            result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_uuid))
+            job = result.scalar_one_or_none()
+            if not job:
+                failed_items.append({"job_id": jid, "reason": "not found"})
+                continue
+            signal_cancel(jid)
+            await update_job_status(db, jid, JobInternalStatus.CANCELLED.value, trigger="batch_cancel")
+            success += 1
+        except Exception as e:
+            failed_items.append({"job_id": jid, "reason": str(e)})
+
+    await db.commit()
+    return {"success_count": success, "failed_items": failed_items}
+
+
+@router.post("/ops/jobs/batch-retry")
+async def batch_retry_jobs(db: DBSession, redis: RedisClient, body: dict = Body(...)):
+    """批量重试 Jobs — 重置为 UPLOADED 并触发评估。"""
+    job_ids = body.get("job_ids", [])
+    if not job_ids:
+        return {"success_count": 0, "failed_items": []}
+
+    from pdf_sku.gateway.user_status import update_job_status
+    from pdf_sku.common.enums import PageStatus
+    from pdf_sku.pipeline.orchestrator import signal_cancel
+
+    _requeueable = (
+        JobInternalStatus.ORPHANED.value,
+        JobInternalStatus.EVAL_FAILED.value,
+        JobInternalStatus.DEGRADED_HUMAN.value,
+        JobInternalStatus.PARTIAL_FAILED.value,
+        JobInternalStatus.CANCELLED.value,
+        JobInternalStatus.REJECTED.value,
+        JobInternalStatus.EVALUATING.value,
+        JobInternalStatus.PROCESSING.value,
+        JobInternalStatus.FULL_IMPORTED.value,
+    )
+
+    success = 0
+    failed_items = []
+    requeue_events = []
+
+    for jid in job_ids:
+        try:
+            job_uuid = uuid.UUID(jid)
+            result = await db.execute(select(PDFJob).where(PDFJob.job_id == job_uuid))
+            job = result.scalar_one_or_none()
+            if not job:
+                failed_items.append({"job_id": jid, "reason": "not found"})
+                continue
+            if job.status not in _requeueable:
+                failed_items.append({"job_id": jid, "reason": f"status {job.status} cannot be retried"})
+                continue
+
+            # 停止正在运行的流水线
+            signal_cancel(jid)
+
+            # 清理旧数据
+            task_ids = (await db.execute(
+                select(HumanTask.task_id).where(HumanTask.job_id == job_uuid)
+            )).scalars().all()
+            if task_ids:
+                await db.execute(delete(Annotation).where(Annotation.task_id.in_(task_ids)))
+                await db.execute(delete(StateTransition).where(
+                    StateTransition.entity_type == "task",
+                    StateTransition.entity_id.in_([str(tid) for tid in task_ids]),
+                ))
+            await db.execute(delete(HumanTask).where(HumanTask.job_id == job_uuid))
+            await db.execute(delete(SKUImageBinding).where(SKUImageBinding.job_id == job_uuid))
+            await db.execute(delete(SKU).where(SKU.job_id == job_uuid))
+            await db.execute(delete(Image).where(Image.job_id == job_uuid))
+            await db.execute(delete(Evaluation).where(Evaluation.job_id == job_uuid))
+
+            # 清除 Redis 评估缓存
+            eval_cache_key = f"{job.file_hash}:{job.frozen_config_version or 'default'}"
+            try:
+                await redis.delete(f"eval:{eval_cache_key}")
+            except Exception:
+                pass
+
+            # 重置页面状态
+            blank_pages = set(job.blank_pages or [])
+            await db.execute(
+                update(Page).where(Page.job_id == job_uuid)
+                .values(status=PageStatus.PENDING.value, needs_review=False, sku_count=0)
+            )
+            if blank_pages:
+                await db.execute(
+                    update(Page).where(Page.job_id == job_uuid, Page.page_number.in_(list(blank_pages)))
+                    .values(status=PageStatus.BLANK.value)
+                )
+
+            # 重置 Job
+            await update_job_status(db, jid, JobInternalStatus.UPLOADED.value, trigger="batch_retry")
+            job.degrade_reason = None
+            job.error_message = None
+            job.ai_pages = []
+            job.failed_pages = []
+
+            requeue_events.append({
+                "job_id": jid,
+                "file_hash": job.file_hash or "",
+                "total_pages": job.total_pages,
+                "status": JobInternalStatus.UPLOADED.value,
+                "prescan": {},
+                "config_version": job.frozen_config_version or "default",
+            })
+            success += 1
+        except Exception as e:
+            failed_items.append({"job_id": jid, "reason": str(e)})
+
+    await db.commit()
+
+    # commit 后再发布事件，触发评估器
+    for evt in requeue_events:
+        await event_bus.publish("JobCreated", evt)
+
+    return {"success_count": success, "failed_items": failed_items}
+
+
 @router.delete("/ops/jobs/{job_id}")
 async def delete_job(job_id: uuid.UUID, db: DBSession):
     """物理删除 Job 及其关联数据。"""
@@ -428,6 +575,10 @@ async def delete_job(job_id: uuid.UUID, db: DBSession):
     job = result.scalar_one_or_none()
     if not job:
         raise JobNotFoundError(f"Job {job_id} not found")
+
+    # 通知正在运行的流水线停止处理
+    from pdf_sku.pipeline.orchestrator import signal_cancel
+    signal_cancel(str(job_id))
 
     task_ids = (await db.execute(
         select(HumanTask.task_id).where(HumanTask.job_id == job_id)
@@ -470,6 +621,10 @@ async def reprocess_job_ai(job_id: uuid.UUID, db: DBSession):
     if not job:
         raise JobNotFoundError(f"Job {job_id} not found")
 
+    # 停止可能正在运行的旧流水线
+    from pdf_sku.pipeline.orchestrator import signal_cancel
+    signal_cancel(str(job_id))
+
     task_ids = (await db.execute(
         select(HumanTask.task_id).where(HumanTask.job_id == job_id)
     )).scalars().all()
@@ -500,6 +655,10 @@ async def reprocess_job_ai(job_id: uuid.UUID, db: DBSession):
             .where(Page.job_id == job_id, Page.page_number.in_(list(blank_pages)))
             .values(status="BLANK")
         )
+
+    # 重置进度数组，避免 array_append 在旧值上追加
+    job.ai_pages = []
+    job.failed_pages = []
 
     await db.commit()
 

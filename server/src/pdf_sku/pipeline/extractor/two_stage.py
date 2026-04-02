@@ -27,7 +27,7 @@ BOUNDARY_PROMPT = """识别这个 PDF 页面中的商品(SKU)边界。
 
 ATTR_PROMPT = """为每个商品边界提取属性。
 提取字段: product_name, model_number, price, specs, color, tag, source。
-只提取页面上清晰可见的属性，缺失的填 null。
+只提取页面上实际印刷的文字信息，缺失的填 null。
 
 重要规则:
 - product_name: 包含完整商品描述，含型号、尺寸、材质等信息，可以多行（用换行符 \\n 分隔）
@@ -37,7 +37,7 @@ ATTR_PROMPT = """为每个商品边界提取属性。
 - color: 颜色
 - tag: 标签/分类
 - source: 来源
-- 不要虚构任何信息，只提取实际可见的内容
+- 所有字段只能填页面上实际印刷的文字，绝对禁止根据图片外观推断颜色、材质、规格等
 - 保持原文语言，中文商品用中文
 
 商品边界: {boundaries}

@@ -337,6 +337,26 @@ class PageProcessor:
                 if img.data:
                     img.image_hash = hashlib.md5(img.data[:2048]).hexdigest()[:12]
 
+            # ═══ Phase 2 补充: 过滤纯黑/纯白无内容图片 ═══
+            for img in raw.images:
+                if not img.search_eligible or not img.data:
+                    continue
+                try:
+                    from PIL import Image as PILImage
+                    import io
+                    pil = PILImage.open(io.BytesIO(img.data))
+                    stat = pil.convert("L").getextrema()  # (min, max)
+                    if stat[1] - stat[0] < 5:
+                        # 像素值范围 < 5 → 纯色（黑/白）无内容图片
+                        img.search_eligible = False
+                        img.is_duplicate = True
+                        logger.info("solid_color_image_filtered",
+                                    page=page_no, image_id=img.image_id,
+                                    size=(img.width, img.height),
+                                    brightness_range=stat)
+                except Exception:
+                    pass  # 解码失败不阻塞流程
+
             # ═══ Phase 2a: 密集网格页布局感知 eligible ═══
             # 如果页面有>=5个大小相似的非eligible图片，视为产品网格页，降低阈值
             _not_eligible = [img for img in raw.images if not img.search_eligible
@@ -1147,6 +1167,9 @@ class PageProcessor:
 
             skus = self._validator.enforce_sku_validity(skus, profile_data)
 
+            # ═══ Phase 6.5: 文字溯源校验 — 清除无法在页面文字中找到依据的字段 ═══
+            skus = self._verify_fields_against_text(skus, raw.raw_text, page_no)
+
             # ═══ Phase 7: ID 分配 ═══
             hash_prefix = (file_hash or "unknown")[:8]
             skus = self._id_gen.assign_ids(
@@ -1158,6 +1181,40 @@ class PageProcessor:
             # Composite 图片: 从截图裁剪生成实际图片数据
             if screenshot:
                 self._crop_composites(raw.images, screenshot)
+
+            # ═══ Phase 8.5: 场景产品裁剪 ═══
+            # 对全页场景图（单张大图 + 纯视觉/C类页面），用 VLM 检测产品区域并裁剪子图
+            if screenshot and skus:
+                eligible_imgs = [img for img in raw.images if img.search_eligible and img.data]
+                page_area = raw.metadata.page_width * raw.metadata.page_height
+                is_scene_page = (
+                    len(eligible_imgs) == 1
+                    and page_area > 0
+                    and self._is_full_page_image(eligible_imgs[0], page_area)
+                    and plan.page_class in (
+                        SINGLE_STD, SINGLE_LARGE, SINGLE_TALL, IMG_LABEL,
+                        MULTI_SPARSE, MIXED_OTHER,
+                    )
+                )
+                if is_scene_page:
+                    product_names = [
+                        s.attributes.get("product_name", "")
+                        for s in skus if s.validity == "valid"
+                    ]
+                    regions = await self._single_stage.detect_product_regions(
+                        screenshot, product_names,
+                    )
+                    if regions:
+                        new_images, new_bindings = self._apply_scene_crops(
+                            eligible_imgs[0], regions, skus, bindings,
+                            page_no, screenshot,
+                        )
+                        if new_images:
+                            raw.images.extend(new_images)
+                            bindings = new_bindings
+                            logger.info("scene_crop_applied",
+                                        page=page_no,
+                                        crops=len(new_images))
 
             # ═══ Phase 9: 校验 + 导出 ═══
             validation = self._validator.validate(
@@ -1523,6 +1580,59 @@ class PageProcessor:
         return merged
 
     @staticmethod
+    def _verify_fields_against_text(
+        skus: list[SKUResult],
+        raw_text: str,
+        page_no: int,
+    ) -> list[SKUResult]:
+        """清除 SKU 中无法在页面原文中找到依据的字段值。
+
+        LLM 经常根据图片外观推断颜色和规格，而非从页面文字中提取。
+        此方法对每个字段值进行文字溯源：如果在页面文字中找不到关键词，
+        则清空该字段。
+        """
+        if not raw_text or not raw_text.strip():
+            # 无页面文字 → 所有可推断字段都不可能来自文字
+            for sku in skus:
+                attrs = sku.attributes
+                cleared = []
+                for field in ("color",):
+                    if attrs.get(field):
+                        cleared.append(f"{field}={attrs[field]}")
+                        attrs[field] = ""
+                if cleared:
+                    logger.info("text_verify_cleared_no_text",
+                                page=page_no, sku=attrs.get("model_number", "?"),
+                                cleared=cleared)
+            return skus
+
+        # 标准化页面文字：去除空白、转小写
+        page_text_norm = raw_text.replace(" ", "").replace("\n", "").lower()
+
+        def _text_in_page(val: str) -> bool:
+            """检查值（或其子项）是否能在页面文字中找到。"""
+            parts = [p.strip() for p in val.replace("/", ",").replace("、", ",").split(",") if p.strip()]
+            return any(
+                p.lower().replace(" ", "") in page_text_norm
+                for p in parts if len(p) >= 2
+            )
+
+        for sku in skus:
+            attrs = sku.attributes
+            cleared = []
+            # 校验 color 字段
+            color_val = attrs.get("color")
+            if color_val and not _text_in_page(color_val):
+                cleared.append(f"color={color_val}")
+                attrs["color"] = ""
+
+            if cleared:
+                logger.info("text_verify_cleared",
+                            page=page_no, sku=attrs.get("model_number", "?"),
+                            cleared=cleared)
+        return skus
+
+    @staticmethod
     def _crop_composites(images: list[ImageInfo], screenshot: bytes) -> None:
         """从页面截图裁剪 composite 图片区域，填充 img.data。"""
         composites = [img for img in images
@@ -1548,6 +1658,177 @@ class PageProcessor:
                 img.data = buf.getvalue()
         except Exception as e:
             logger.warning("crop_composites_failed", error=str(e))
+
+    @staticmethod
+    def _is_full_page_image(img: ImageInfo, page_area: float) -> bool:
+        """判断图片是否为全页大图（覆盖 > 50% 页面面积）。"""
+        if not img.bbox or len(img.bbox) < 4:
+            return False
+        bx0, by0, bx1, by1 = img.bbox
+        img_area = abs(bx1 - bx0) * abs(by1 - by0)
+        return page_area > 0 and img_area / page_area > 0.50
+
+    @staticmethod
+    def _apply_scene_crops(
+        original_img: ImageInfo,
+        regions: list[dict],
+        skus: list[SKUResult],
+        bindings: list[BindingResult],
+        page_no: int,
+        screenshot: bytes,
+    ) -> tuple[list[ImageInfo], list[BindingResult]]:
+        """从全页场景图中裁剪产品子图。
+
+        VLM 的归一化坐标基于 screenshot（页面渲染）。对于扫描版 PDF，
+        原始图片 == 整个页面，两者长宽比一致，可直接映射。
+        如果长宽比偏差 > 5%，回退到从 screenshot 裁剪。
+
+        Args:
+            original_img: 原始全页图片
+            regions: VLM 返回的 [{label, bbox: [x0,y0,x1,y1]}]（归一化坐标）
+            skus: 已提取的 SKU 列表
+            bindings: 已有绑定列表
+            page_no: 页码
+            screenshot: 页面截图 bytes（VLM 坐标的参考系）
+
+        Returns:
+            (new_images, updated_bindings)
+        """
+        from PIL import Image as PILImage
+        import io as _io
+
+        # 优先从原始图片裁剪（分辨率更高），长宽比不匹配时回退到 screenshot
+        try:
+            orig_pil = PILImage.open(_io.BytesIO(original_img.data))
+            orig_w, orig_h = orig_pil.size
+        except Exception as e:
+            logger.warning("scene_crop_open_orig_failed", error=str(e))
+            orig_pil = None
+            orig_w = orig_h = 0
+
+        try:
+            shot_pil = PILImage.open(_io.BytesIO(screenshot))
+            shot_w, shot_h = shot_pil.size
+        except Exception as e:
+            logger.warning("scene_crop_open_shot_failed", error=str(e))
+            if orig_pil is None:
+                return [], bindings
+            shot_pil = None
+            shot_w = shot_h = 0
+
+        # 选择裁剪源: 长宽比偏差 < 5% 用原图（高清），否则用截图（坐标精确）
+        use_orig = False
+        if orig_pil is not None and orig_w > 0 and orig_h > 0:
+            if shot_w > 0 and shot_h > 0:
+                orig_ratio = orig_w / orig_h
+                shot_ratio = shot_w / shot_h
+                use_orig = abs(orig_ratio - shot_ratio) / shot_ratio < 0.05
+            else:
+                use_orig = True
+
+        if use_orig:
+            source_pil, src_w, src_h = orig_pil, orig_w, orig_h
+        elif shot_pil is not None:
+            source_pil, src_w, src_h = shot_pil, shot_w, shot_h
+        else:
+            return [], bindings
+
+        new_images: list[ImageInfo] = []
+        for idx, region in enumerate(regions):
+            bbox = region["bbox"]  # 归一化 [x0, y0, x1, y1]
+            # 归一化坐标 → 像素坐标
+            px0 = max(0, int(bbox[0] * src_w))
+            py0 = max(0, int(bbox[1] * src_h))
+            px1 = min(src_w, int(bbox[2] * src_w))
+            py1 = min(src_h, int(bbox[3] * src_h))
+
+            crop_w = px1 - px0
+            crop_h = py1 - py0
+            if crop_w < 50 or crop_h < 50:
+                continue
+
+            # 跳过几乎等于原图的裁剪（面积 > 90%）
+            if crop_w * crop_h > src_w * src_h * 0.90:
+                continue
+
+            try:
+                cropped = source_pil.crop((px0, py0, px1, py1))
+                buf = _io.BytesIO()
+                cropped.save(buf, format="JPEG", quality=90)
+                crop_data = buf.getvalue()
+            except Exception as e:
+                logger.warning("scene_crop_region_failed",
+                               page=page_no, idx=idx, error=str(e))
+                continue
+
+            short_edge = min(crop_w, crop_h)
+            crop_id = f"p{page_no}_crop_{idx}"
+            crop_img = ImageInfo(
+                image_id=crop_id,
+                bbox=original_img.bbox,  # 保留原始 PDF 坐标（用于空间绑定）
+                data=crop_data,
+                width=crop_w,
+                height=crop_h,
+                short_edge=short_edge,
+                search_eligible=short_edge >= 100,
+                role="product_main",
+                image_hash=hashlib.md5(crop_data[:2048]).hexdigest()[:12],
+            )
+            new_images.append(crop_img)
+            logger.debug("scene_crop_region",
+                         page=page_no, idx=idx,
+                         label=region.get("label", ""),
+                         size=(crop_w, crop_h),
+                         source="original" if use_orig else "screenshot")
+
+        if not new_images:
+            return [], bindings
+
+        # 标记原始全页图: 不再作为主图，不持久化
+        original_img.role = "scene_full"
+        original_img.search_eligible = False
+
+        # 更新绑定: 将指向原始图片的绑定重指向裁剪图
+        updated_bindings: list[BindingResult] = []
+        valid_skus = [s for s in skus if s.validity == "valid"]
+
+        if len(new_images) == 1:
+            # 单区域裁剪: 所有 SKU 绑定到唯一裁剪图
+            crop_img = new_images[0]
+            for b in bindings:
+                if b.image_id == original_img.image_id:
+                    updated_bindings.append(BindingResult(
+                        sku_id=b.sku_id,
+                        image_id=crop_img.image_id,
+                        confidence=b.confidence,
+                        method="scene_crop",
+                        is_ambiguous=False,
+                        rank=1,
+                    ))
+                else:
+                    updated_bindings.append(b)
+        elif len(new_images) >= len(valid_skus):
+            # 多区域: 按顺序绑定（VLM 返回的区域顺序通常与 SKU 对应）
+            sku_ids = [s.sku_id for s in valid_skus]
+            for b in bindings:
+                if b.image_id == original_img.image_id and b.sku_id in sku_ids:
+                    sku_idx = sku_ids.index(b.sku_id)
+                    crop_idx = min(sku_idx, len(new_images) - 1)
+                    updated_bindings.append(BindingResult(
+                        sku_id=b.sku_id,
+                        image_id=new_images[crop_idx].image_id,
+                        confidence=b.confidence,
+                        method="scene_crop",
+                        is_ambiguous=False,
+                        rank=1,
+                    ))
+                else:
+                    updated_bindings.append(b)
+        else:
+            # 裁剪区域少于 SKU: 保留原始绑定，裁剪图作为补充
+            updated_bindings = bindings
+
+        return new_images, updated_bindings
 
     @staticmethod
     def _merge_combo_skus(skus: list[SKUResult], page_no: int) -> list[SKUResult]:

@@ -43,8 +43,8 @@ class SSEManager:
     def _setup_subscriptions(self) -> None:
         """订阅 EventBus 事件 → 分发到对应 Job 的 SSE 队列。"""
         for evt in [
-            "PageStatusChanged", "JobStatusChanged", "JobFailed",
-            "HumanNeeded", "SLAEscalated",
+            "PageStatusChanged", "PageCompleted", "JobStatusChanged",
+            "JobFailed", "HumanNeeded", "SLAEscalated",
         ]:
             event_bus.subscribe(evt, self._dispatch_event)
 
@@ -124,6 +124,7 @@ class SSEManager:
         evt = data.get("_event_type", "")
         mapping = {
             "PageStatusChanged": SSEEventType.PAGE_COMPLETED,
+            "PageCompleted": SSEEventType.PAGE_COMPLETED,
             "JobStatusChanged": SSEEventType.JOB_COMPLETED,
             "JobFailed": SSEEventType.JOB_FAILED,
             "HumanNeeded": SSEEventType.HUMAN_NEEDED,

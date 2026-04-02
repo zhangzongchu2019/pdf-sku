@@ -32,8 +32,9 @@ export default function DashboardPage() {
     fetchDashboard();
     fetchJobs();
     connect("__dashboard__");
-    const timer = setInterval(fetchDashboard, 30000);
-    return () => { clearInterval(timer); disconnect(); };
+    const dashTimer = setInterval(fetchDashboard, 30000);
+    const jobTimer = setInterval(fetchJobs, 10000);  // 10s 轮询 job 列表进度
+    return () => { clearInterval(dashTimer); clearInterval(jobTimer); disconnect(); };
   }, [fetchDashboard, fetchJobs, connect, disconnect]);
 
   if (loading && !dashboard) return <Loading />;
@@ -102,8 +103,6 @@ export default function DashboardPage() {
           selectedCount={selectedIds.size}
           onBatchRetry={handleBatchRetry}
           onBatchCancel={handleBatchCancel}
-          onBatchAssign={() => {}}
-          onExportCSV={() => {}}
           onClear={() => setSelectedIds(new Set())}
         />
       )}

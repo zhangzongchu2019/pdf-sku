@@ -33,6 +33,36 @@ logger = structlog.get_logger()
 
 PIPELINE_CONCURRENCY = int(os.environ.get("PIPELINE_CONCURRENCY", "5"))
 
+# ── 进程内取消信号 ──────────────────────────────────────────────
+# cancel_job / delete_job 写入, 处理流水线各节点读取
+# value = 写入时间戳，用于清理长期未消费的过期条目
+_cancelled_jobs: dict[str, float] = {}
+_CANCEL_TTL = 600  # 10 分钟后自动过期
+
+
+def signal_cancel(job_id: str) -> None:
+    """标记 job 为已取消（进程内信号）。"""
+    # 顺便清理过期条目，防止内存泄漏
+    now = time.time()
+    stale = [k for k, t in _cancelled_jobs.items() if now - t > _CANCEL_TTL]
+    for k in stale:
+        del _cancelled_jobs[k]
+    _cancelled_jobs[job_id] = now
+    logger.info("job_cancel_signalled", job_id=job_id)
+
+
+def clear_cancel(job_id: str) -> None:
+    """处理结束后清理取消标记。"""
+    _cancelled_jobs.pop(job_id, None)
+
+
+def is_cancelled(job_id: str) -> bool:
+    return job_id in _cancelled_jobs
+
+
+class _CancelledError(Exception):
+    """流水线内部取消异常，不应外泄。"""
+
 
 class Orchestrator:
     """Job 级处理编排器。"""
@@ -105,6 +135,10 @@ class Orchestrator:
         """
         job_id = str(job.job_id)
         job_uuid = job.job_id
+
+        # 清除可能残留的旧取消标记（如 cancel → reprocess 场景）
+        clear_cancel(job_id)
+
         file_path = self._resolve_file_path(job)
         blank_pages = evaluation.get("prescan", {}).get("blank_pages", [])
 
@@ -131,11 +165,18 @@ class Orchestrator:
             await self._process_parallel(job, non_blank, file_path,
                                           catalog_profile=catalog_profile)
 
+            # 取消检查: 并行处理结束后
+            if is_cancelled(job_id):
+                raise _CancelledError(f"Job {job_id} cancelled")
+
             # 终态判定 — 用新 session
             async with self._db_factory() as final_db:
                 result = await final_db.execute(
                     select(PDFJob).where(PDFJob.job_id == job_uuid))
-                fresh_job = result.scalar_one()
+                fresh_job = result.scalar_one_or_none()
+                if not fresh_job:
+                    logger.warning("job_deleted_before_finalize", job_id=job_id)
+                    return
                 await self._finalize_job(final_db, fresh_job)
                 await final_db.commit()
 
@@ -154,15 +195,23 @@ class Orchestrator:
                 logger.warning("excel_export_failed",
                                job_id=job_id, error=str(excel_err))
 
+        except _CancelledError:
+            logger.info("pipeline_cancelled", job_id=job_id)
+
         except Exception as e:
             logger.exception("pipeline_failed", job_id=job_id)
-            async with self._db_factory() as err_db:
-                await update_job_status(
-                    err_db, job_id, JobInternalStatus.PARTIAL_FAILED.value,
-                    trigger="pipeline_error", error_message=str(e))
-                await err_db.commit()
+            try:
+                async with self._db_factory() as err_db:
+                    await update_job_status(
+                        err_db, job_id, JobInternalStatus.PARTIAL_FAILED.value,
+                        trigger="pipeline_error", error_message=str(e))
+                    await err_db.commit()
+            except Exception:
+                logger.warning("pipeline_error_status_update_failed", job_id=job_id)
 
-        self._pp.clear_job_cache(job_id)
+        finally:
+            clear_cancel(job_id)
+            self._pp.clear_job_cache(job_id)
 
     async def _process_parallel(
         self,
@@ -173,15 +222,34 @@ class Orchestrator:
     ) -> None:
         """并行处理所有页面（Semaphore 控制并发）。"""
         semaphore = asyncio.Semaphore(PIPELINE_CONCURRENCY)
+        _jid = str(job.job_id)
 
         async def process_one(page_no: int):
+            # 排队阶段即检查取消，避免无谓等待 semaphore
+            if is_cancelled(_jid):
+                return
             async with semaphore:
-                async with self._db_factory() as page_db:
-                    result = await self._process_single_page(
-                        page_db, job, page_no, file_path,
-                        catalog_profile=catalog_profile)
-                    await self._on_page_done(page_db, job, page_no, result)
-                    await page_db.commit()
+                if is_cancelled(_jid):
+                    return
+                try:
+                    async with self._db_factory() as page_db:
+                        result = await self._process_single_page(
+                            page_db, job, page_no, file_path,
+                            catalog_profile=catalog_profile)
+                        # 处理完成后再次检查: 已取消则跳过持久化
+                        if is_cancelled(_jid):
+                            logger.info("page_skipped_cancelled",
+                                        job_id=_jid, page_no=page_no)
+                            return
+                        await self._on_page_done(page_db, job, page_no, result)
+                        await page_db.commit()
+                except Exception as e:
+                    if is_cancelled(_jid):
+                        # job 已被取消/删除导致 DB 操作失败 — 正常退出
+                        logger.info("page_aborted_cancelled",
+                                    job_id=_jid, page_no=page_no)
+                        return
+                    raise  # 非取消场景的异常继续上抛给 gather
 
         results = await asyncio.gather(
             *[process_one(p) for p in pages],
@@ -262,6 +330,20 @@ class Orchestrator:
                 classification_confidence=result.classification_confidence,
             )
         )
+
+        # 增量更新 Job 的页面进度数组（供仪表盘实时展示）
+        if result.status == "AI_COMPLETED":
+            await db.execute(
+                update(PDFJob).where(PDFJob.job_id == job.job_id).values(
+                    ai_pages=func.array_append(PDFJob.ai_pages, page_no)
+                )
+            )
+        elif result.status == "AI_FAILED":
+            await db.execute(
+                update(PDFJob).where(PDFJob.job_id == job.job_id).values(
+                    failed_pages=func.array_append(PDFJob.failed_pages, page_no)
+                )
+            )
 
         # 持久化 SKU + Image + Binding
         if result.skus:
