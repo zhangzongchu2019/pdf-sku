@@ -5,8 +5,13 @@ import hmac
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+from dotenv import load_dotenv
 from jose import jwt, JWTError
+
+# 确保 .env 中的变量被加载到 os.environ
+load_dotenv(Path(__file__).resolve().parents[3] / ".env", override=False)
 
 # ── 配置 ──
 SECRET_KEY = os.environ.get("JWT_SECRET_KEY", secrets.token_urlsafe(48))

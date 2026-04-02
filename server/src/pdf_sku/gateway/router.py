@@ -675,6 +675,7 @@ def _generate_thumbnail(
     """同步生成缩略图（供 run_in_executor 调用）。返回实际文件路径。"""
     from PIL import Image as PILImage
 
+    PILImage.MAX_IMAGE_PIXELS = 300_000_000
     cache_dir.mkdir(parents=True, exist_ok=True)
     with PILImage.open(file_path) as im:
         if max(im.size) <= max_edge:

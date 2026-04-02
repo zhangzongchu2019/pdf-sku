@@ -46,6 +46,32 @@ class Orchestrator:
         self._pp = page_processor
         self._db_factory = db_session_factory
 
+    _THUMB_SIZES = {"thumb": (128, 70), "medium": (800, 80)}
+
+    @staticmethod
+    def _pre_generate_thumbnails(file_path: Path, image_id: str, img_dir: Path) -> None:
+        """保存原图后立即预生成 thumb + medium 缩略图。"""
+        from PIL import Image as PILImage
+
+        cache_dir = img_dir / ".cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with PILImage.open(file_path) as im:
+                for size_name, (max_edge, quality) in Orchestrator._THUMB_SIZES.items():
+                    cache_path = cache_dir / f"{image_id}_{size_name}.jpg"
+                    if cache_path.exists():
+                        continue
+                    if max(im.size) <= max_edge:
+                        continue  # 原图已足够小，访问时会直接返回原图
+                    thumb = im.copy()
+                    if thumb.mode not in ("RGB", "L"):
+                        thumb = thumb.convert("RGB")
+                    thumb.thumbnail((max_edge, max_edge), PILImage.LANCZOS)
+                    thumb.save(cache_path, "JPEG", quality=quality)
+        except Exception as e:
+            logger.warning("pre_generate_thumbnails_failed",
+                           image_id=image_id, error=str(e))
+
     @staticmethod
     def _compress_image(data: bytes, max_edge: int = 2000, quality: int = 85) -> bytes:
         """大图压缩: 长边超过 max_edge 时缩放 + 重压缩 JPEG。"""
@@ -287,6 +313,8 @@ class Orchestrator:
                     file_abs.write_bytes(
                         self._compress_image(img.data, max_edge=2000, quality=85)
                     )
+                    # 预生成缩略图
+                    self._pre_generate_thumbnails(file_abs, image_id, img_dir)
 
                 bbox = [int(v) for v in img.bbox] if img.bbox else None
                 resolution = [int(img.width), int(img.height)] if img.width and img.height else None
