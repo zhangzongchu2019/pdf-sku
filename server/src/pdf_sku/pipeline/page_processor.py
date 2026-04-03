@@ -58,6 +58,7 @@ from pdf_sku.pipeline.binder.binder import SKUImageBinder
 from pdf_sku.pipeline.exporter.exporter import SKUIdGenerator, SKUExporter
 from pdf_sku.pipeline.cross_page_merger import CrossPageMerger
 from pdf_sku.settings import settings
+from pdf_sku.common.image_utils import image_has_transparency, flatten_for_jpeg
 import structlog
 
 logger = structlog.get_logger()
@@ -1701,10 +1702,12 @@ class PageProcessor:
         try:
             orig_pil = PILImage.open(_io.BytesIO(original_img.data))
             orig_w, orig_h = orig_pil.size
+            orig_has_transparency = image_has_transparency(orig_pil)
         except Exception as e:
             logger.warning("scene_crop_open_orig_failed", error=str(e))
             orig_pil = None
             orig_w = orig_h = 0
+            orig_has_transparency = False
 
         try:
             shot_pil = PILImage.open(_io.BytesIO(screenshot))
@@ -1719,7 +1722,10 @@ class PageProcessor:
         # 选择裁剪源: 长宽比偏差 < 5% 用原图（高清），否则用截图（坐标精确）
         use_orig = False
         if orig_pil is not None and orig_w > 0 and orig_h > 0:
-            if shot_w > 0 and shot_h > 0:
+            if orig_has_transparency and shot_pil is not None:
+                # 透明底原图应使用页面截图，保留 PDF 页面的真实背景色。
+                use_orig = False
+            elif shot_w > 0 and shot_h > 0:
                 orig_ratio = orig_w / orig_h
                 shot_ratio = shot_w / shot_h
                 use_orig = abs(orig_ratio - shot_ratio) / shot_ratio < 0.05
@@ -1758,6 +1764,7 @@ class PageProcessor:
 
             try:
                 cropped = source_pil.crop((px0, py0, px1, py1))
+                cropped = flatten_for_jpeg(cropped)
                 buf = _io.BytesIO()
                 cropped.save(buf, format="JPEG", quality=90)
                 crop_data = buf.getvalue()

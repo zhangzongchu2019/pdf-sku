@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
 from pdf_sku.common.dependencies import DBSession, RedisClient
+from pdf_sku.common.image_utils import flatten_for_jpeg
 from pdf_sku.common.models import (
     PDFJob,
     Page,
@@ -839,8 +840,7 @@ def _generate_thumbnail(
     with PILImage.open(file_path) as im:
         if max(im.size) <= max_edge:
             return file_path  # 原图已足够小
-        if im.mode not in ("RGB", "L"):
-            im = im.convert("RGB")
+        im = flatten_for_jpeg(im)
         im.thumbnail((max_edge, max_edge), PILImage.LANCZOS)
         im.save(cache_path, "JPEG", quality=quality)
     return cache_path

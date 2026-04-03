@@ -21,6 +21,34 @@ TEXT_COVERAGE_THRESHOLD = 0.1
 class PDFExtractor:
     """多库兜底 PDF 解析器。"""
 
+    @staticmethod
+    def _extract_fitz_image(
+        doc,
+        img_info: tuple,
+    ) -> tuple[bytes, int, int]:
+        """提取单张 PDF 图片，并在存在 soft mask 时保留透明信息。"""
+        import fitz
+
+        xref = img_info[0]
+        smask = img_info[1] if len(img_info) > 1 else 0
+
+        pix = fitz.Pixmap(doc, xref)
+        if pix.n > 3 and pix.alpha == 0:
+            pix = fitz.Pixmap(fitz.csRGB, pix)
+        elif pix.n > 4:
+            pix = fitz.Pixmap(fitz.csRGB, pix)
+
+        if smask:
+            try:
+                mask = fitz.Pixmap(doc, smask)
+                if mask.width == pix.width and mask.height == pix.height:
+                    pix = fitz.Pixmap(pix, mask)
+            except Exception as exc:
+                logger.debug("fitz_smask_merge_failed",
+                             xref=xref, smask=smask, error=str(exc))
+
+        return pix.tobytes("png"), pix.width, pix.height
+
     def extract(self, file_path: str, page_no: int) -> ParsedPageIR:
         """解析单页 (在进程池中执行)。"""
         # Level 1: pdfplumber
@@ -101,16 +129,9 @@ class PDFExtractor:
             # Images
             images = []
             for i, img_info in enumerate(page.get_images(full=True)):
-                xref = img_info[0]
                 try:
-                    pix = fitz.Pixmap(doc, xref)
-                    # CMYK/其他色彩空间 → 转 RGB
-                    if pix.n > 3 and pix.alpha == 0:
-                        pix = fitz.Pixmap(fitz.csRGB, pix)
-                    elif pix.n > 4:
-                        pix = fitz.Pixmap(fitz.csRGB, pix)
-                    img_data = pix.tobytes("png")
-                    short_edge = min(pix.width, pix.height)
+                    img_data, width, height = self._extract_fitz_image(doc, img_info)
+                    short_edge = min(width, height)
                     img_hash = hashlib.md5(img_data[:1024]).hexdigest()[:12] if img_data else ""
                     # 获取图片在页面上的显示bbox（用于DPI缩放计算真实显示尺寸）
                     bbox = (0, 0, 0, 0)
@@ -125,8 +146,8 @@ class PDFExtractor:
                         image_id=f"p{page_no}_img{i}",
                         data=img_data,
                         bbox=bbox,
-                        width=pix.width,
-                        height=pix.height,
+                        width=width,
+                        height=height,
                         short_edge=short_edge,
                         image_hash=img_hash,
                         search_eligible=short_edge >= 200,
@@ -162,15 +183,9 @@ class PDFExtractor:
             # 提取图片
             images: list[ImageInfo] = []
             for i, img_info in enumerate(page.get_images(full=True)):
-                xref = img_info[0]
                 try:
-                    pix = fitz.Pixmap(doc, xref)
-                    if pix.n > 3 and pix.alpha == 0:
-                        pix = fitz.Pixmap(fitz.csRGB, pix)
-                    elif pix.n > 4:
-                        pix = fitz.Pixmap(fitz.csRGB, pix)
-                    img_data = pix.tobytes("png")
-                    short_edge = min(pix.width, pix.height)
+                    img_data, width, height = self._extract_fitz_image(doc, img_info)
+                    short_edge = min(width, height)
                     img_hash = hashlib.md5(img_data[:2048]).hexdigest()[:12] if img_data else ""
                     # 获取图片在页面上的显示bbox
                     bbox = (0, 0, 0, 0)
@@ -185,8 +200,8 @@ class PDFExtractor:
                         image_id=f"p{page_no}_img{i}",
                         data=img_data,
                         bbox=bbox,
-                        width=pix.width,
-                        height=pix.height,
+                        width=width,
+                        height=height,
                         short_edge=short_edge,
                         image_hash=img_hash,
                         search_eligible=short_edge >= 200,
@@ -223,16 +238,8 @@ class PDFExtractor:
             # 提取 fitz 图片 data 列表
             fitz_data: list[tuple[bytes, int, int]] = []  # (data, w, h)
             for img_info in fitz_images:
-                xref = img_info[0]
                 try:
-                    pix = fitz.Pixmap(doc, xref)
-                    # CMYK/其他色彩空间 → 转 RGB
-                    if pix.n > 3 and pix.alpha == 0:
-                        pix = fitz.Pixmap(fitz.csRGB, pix)
-                    elif pix.n > 4:
-                        pix = fitz.Pixmap(fitz.csRGB, pix)
-                    img_bytes = pix.tobytes("png")
-                    fitz_data.append((img_bytes, pix.width, pix.height))
+                    fitz_data.append(PDFExtractor._extract_fitz_image(doc, img_info))
                 except Exception:
                     fitz_data.append((b"", 0, 0))
 

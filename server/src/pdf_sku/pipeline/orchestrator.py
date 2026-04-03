@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from pdf_sku.common.models import PDFJob, Page
 from pdf_sku.common.enums import JobInternalStatus, PageStatus
+from pdf_sku.common.image_utils import flatten_for_jpeg, encode_as_jpeg
 from pdf_sku.gateway.event_bus import event_bus
 from pdf_sku.gateway.user_status import update_job_status, refresh_job_page_stats
 from pdf_sku.pipeline.ir import PageResult
@@ -93,9 +94,7 @@ class Orchestrator:
                         continue
                     if max(im.size) <= max_edge:
                         continue  # 原图已足够小，访问时会直接返回原图
-                    thumb = im.copy()
-                    if thumb.mode not in ("RGB", "L"):
-                        thumb = thumb.convert("RGB")
+                    thumb = flatten_for_jpeg(im.copy())
                     thumb.thumbnail((max_edge, max_edge), PILImage.LANCZOS)
                     thumb.save(cache_path, "JPEG", quality=quality)
         except Exception as e:
@@ -104,20 +103,8 @@ class Orchestrator:
 
     @staticmethod
     def _compress_image(data: bytes, max_edge: int = 2000, quality: int = 85) -> bytes:
-        """大图压缩: 长边超过 max_edge 时缩放 + 重压缩 JPEG。"""
-        from PIL import Image as PILImage
-        import io
-
-        buf = io.BytesIO(data)
-        with PILImage.open(buf) as im:
-            if max(im.size) <= max_edge:
-                return data  # 无需压缩
-            if im.mode not in ("RGB", "L"):
-                im = im.convert("RGB")
-            im.thumbnail((max_edge, max_edge), PILImage.LANCZOS)
-            out = io.BytesIO()
-            im.save(out, "JPEG", quality=quality)
-            return out.getvalue()
+        """统一输出 JPEG；透明像素默认铺白底，避免最终展示成黑底。"""
+        return encode_as_jpeg(data, max_edge=max_edge, quality=quality)
 
     async def process_job(
         self,
