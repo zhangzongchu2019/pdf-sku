@@ -303,11 +303,11 @@ async def lifespan(app: FastAPI):
             log.info("evaluator_initialized")
 
             # Pipeline
-            from pdf_sku.pipeline.page_processor import PageProcessor
             from pdf_sku.pipeline.orchestrator import Orchestrator
+            from pdf_sku.pipeline_factory import build_page_processor
 
             orchestrator = Orchestrator(
-                page_processor=PageProcessor(
+                page_processor=build_page_processor(
                     llm_service=llm_service,
                     process_pool=process_pool,
                     config_provider=ConfigProvider(),

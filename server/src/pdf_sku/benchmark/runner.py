@@ -15,11 +15,11 @@ from typing import Any
 import structlog
 
 from pdf_sku.pipeline.ir import PageResult, SKUResult, ImageInfo, BindingResult
-from pdf_sku.pipeline.page_processor import PageProcessor
 from pdf_sku.pipeline.extractor.sku_dedup import (
     cross_page_dedup, dedup_by_model_variant, dedup_material_variants,
 )
 from pdf_sku.pipeline.catalog_profiler import scan_catalog
+from pdf_sku.pipeline_factory import build_page_processor
 from pdf_sku.config.service import DEFAULT_PROFILE
 
 from .models import ReferenceDataset
@@ -536,7 +536,7 @@ class BenchmarkRunner:
     """批量运行 Pipeline 并缓存结果。"""
 
     def __init__(self):
-        self._processor: PageProcessor | None = None
+        self._processor: Any | None = None
         self._pool: ProcessPoolExecutor | None = None
 
     async def _ensure_processor(self):
@@ -558,7 +558,7 @@ class BenchmarkRunner:
 
         # 创建一个无 DB 的 ConfigProvider mock
         from pdf_sku.config.service import ConfigProvider
-        self._processor = PageProcessor(
+        self._processor = build_page_processor(
             llm_service=llm_service,
             process_pool=self._pool,
             config_provider=ConfigProvider(),

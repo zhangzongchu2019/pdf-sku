@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173,http://localhost:3000"
     worker_id: str = os.environ.get("WORKER_ID", f"worker-{socket.gethostname()}")
     log_level: str = "INFO"
+    pipeline_implementation: str = "legacy"
+    pipeline_v2_allow_legacy_fallback: bool = False
+    pipeline_v2_region_refine_enabled: bool = True
+    pipeline_v2_page_verify_enabled: bool = True
 
     # === Database ===
     database_url: str = "postgresql+asyncpg://pdfsku:pdfsku@localhost:5432/pdfsku"
