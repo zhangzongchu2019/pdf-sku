@@ -490,7 +490,9 @@ class Orchestrator:
 
         # 查询所有绑定
         binding_rows = (await db.execute(
-            select(SKUImageBinding).where(SKUImageBinding.job_id == job_uuid)
+            select(SKUImageBinding)
+            .where(SKUImageBinding.job_id == job_uuid)
+            .order_by(SKUImageBinding.sku_id, SKUImageBinding.rank, SKUImageBinding.id)
         )).scalars().all()
 
         # 查询所有图片

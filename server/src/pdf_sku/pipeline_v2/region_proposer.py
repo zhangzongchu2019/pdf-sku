@@ -104,45 +104,49 @@ class RegionProposer:
         self,
         raw: ParsedPageIR,
         *,
+        pdf_text_objects: list[EvidenceObject] | None = None,
         ocr_blocks: list[OcrBlock] | None = None,
         layout_regions: list[LayoutRegion] | None = None,
         screenshot_size: tuple[int, int] | None = None,
     ) -> PageEvidence:
         objects: list[EvidenceObject] = []
 
-        for index, block in enumerate(raw.text_blocks):
-            lines = [line.strip() for line in (block.content or "").splitlines() if line.strip()]
-            if not lines:
-                continue
-            if len(lines) == 1:
-                objects.append(
-                    EvidenceObject(
-                        object_id=f"text_{index}",
-                        object_type="text_block",
-                        bbox=block.bbox,
-                        text=lines[0],
-                        source="pdf_text",
-                        confidence=block.confidence,
+        if pdf_text_objects:
+            objects.extend(pdf_text_objects)
+        else:
+            for index, block in enumerate(raw.text_blocks):
+                lines = [line.strip() for line in (block.content or "").splitlines() if line.strip()]
+                if not lines:
+                    continue
+                if len(lines) == 1:
+                    objects.append(
+                        EvidenceObject(
+                            object_id=f"text_{index}",
+                            object_type="text_block",
+                            bbox=block.bbox,
+                            text=lines[0],
+                            source="pdf_text",
+                            confidence=block.confidence,
+                        )
                     )
-                )
-                continue
+                    continue
 
-            x0, y0, x1, y1 = block.bbox
-            total_height = max(1.0, y1 - y0)
-            line_height = total_height / len(lines)
-            for line_index, line in enumerate(lines):
-                ly0 = y0 + line_index * line_height
-                ly1 = y0 + (line_index + 1) * line_height
-                objects.append(
-                    EvidenceObject(
-                        object_id=f"text_{index}_{line_index}",
-                        object_type="text_block",
-                        bbox=(x0, ly0, x1, ly1),
-                        text=line,
-                        source="pdf_text",
-                        confidence=block.confidence,
+                x0, y0, x1, y1 = block.bbox
+                total_height = max(1.0, y1 - y0)
+                line_height = total_height / len(lines)
+                for line_index, line in enumerate(lines):
+                    ly0 = y0 + line_index * line_height
+                    ly1 = y0 + (line_index + 1) * line_height
+                    objects.append(
+                        EvidenceObject(
+                            object_id=f"text_{index}_{line_index}",
+                            object_type="text_block",
+                            bbox=(x0, ly0, x1, ly1),
+                            text=line,
+                            source="pdf_text",
+                            confidence=block.confidence,
+                        )
                     )
-                )
 
         for index, image in enumerate(raw.images):
             objects.append(
@@ -170,6 +174,7 @@ class RegionProposer:
                     text=block.text.strip(),
                     source="ocr_text",
                     confidence=block.confidence,
+                    font_size=0.0,
                 )
             )
 
@@ -188,6 +193,7 @@ class RegionProposer:
                     label=region.label,
                     source="layout",
                     confidence=region.confidence,
+                    font_size=0.0,
                 )
             )
 

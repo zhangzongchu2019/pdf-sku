@@ -19,6 +19,7 @@ from pdf_sku.settings import settings
 from .models import TableDocumentContext
 from .attribute_extractor import RegionAttributeExtractor
 from .document_hints import build_document_hints, merge_document_hints
+from .model_anchor_extractor import ModelAnchorExtractor
 from .page_verifier import PageVerifier
 from .region_proposer import RegionProposer
 from .region_refiner import RegionRefiner
@@ -70,6 +71,38 @@ def _render_page_screenshot_sync(
         doc.close()
 
 
+def _extract_precise_pdf_text_sync(
+    file_path: str,
+    page_no: int,
+) -> list[dict]:
+    import fitz
+
+    doc = fitz.open(file_path)
+    try:
+        page = doc[page_no - 1]
+        blocks = page.get_text("dict").get("blocks", [])
+        lines: list[dict] = []
+        for block in blocks:
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                text = "".join(span.get("text", "") for span in spans).strip()
+                if not text:
+                    continue
+                font_size = max((float(span.get("size", 0.0)) for span in spans), default=0.0)
+                lines.append(
+                    {
+                        "text": text,
+                        "bbox": tuple(float(value) for value in line.get("bbox", (0, 0, 0, 0))),
+                        "font_size": font_size,
+                    }
+                )
+        return lines
+    finally:
+        doc.close()
+
+
 class PageProcessor:
     """新 pipeline 的兼容入口。"""
 
@@ -89,6 +122,7 @@ class PageProcessor:
         self._region_proposer = RegionProposer(
             min_visual_only_area_ratio=_MIN_VISUAL_ONLY_AREA_RATIO,
         )
+        self._model_extractor = ModelAnchorExtractor()
         self._region_refiner = RegionRefiner(llm_service=llm_service)
         self._region_extractor = RegionAttributeExtractor()
         self._page_verifier = PageVerifier(llm_service=llm_service)
@@ -420,6 +454,42 @@ class PageProcessor:
         except Exception:
             return []
 
+    @staticmethod
+    def _needs_precise_pdf_text(raw: ParsedPageIR) -> bool:
+        if not raw.text_blocks:
+            return False
+        page_area = max(1.0, raw.metadata.page_width * raw.metadata.page_height)
+        for block in raw.text_blocks:
+            width = max(0.0, block.bbox[2] - block.bbox[0])
+            height = max(0.0, block.bbox[3] - block.bbox[1])
+            block_area = width * height
+            if block_area / page_area >= 0.55 and (block.content or "").count("\n") >= 4:
+                return True
+        return len(raw.text_blocks) == 1 and bool((raw.text_blocks[0].content or "").strip())
+
+    async def _extract_precise_pdf_text_objects(self, file_path: str, page_no: int):
+        from .models import EvidenceObject
+
+        loop = asyncio.get_running_loop()
+        if self._pool:
+            rows = await loop.run_in_executor(self._pool, _extract_precise_pdf_text_sync, file_path, page_no)
+        else:
+            rows = _extract_precise_pdf_text_sync(file_path, page_no)
+        objects = []
+        for index, row in enumerate(rows):
+            objects.append(
+                EvidenceObject(
+                    object_id=f"pdfline_{index}",
+                    object_type="text_block",
+                    bbox=row["bbox"],
+                    text=row["text"],
+                    source="pdf_text_precise",
+                    confidence=1.0,
+                    font_size=row["font_size"],
+                )
+            )
+        return objects
+
     def _build_regular_page_result(
         self,
         raw: ParsedPageIR,
@@ -429,8 +499,11 @@ class PageProcessor:
         *,
         file_hash: str,
         page_no: int,
+        preferred_image_ids: list[str | None] | None = None,
+        preferred_image_groups: list[list[str]] | None = None,
+        page_extraction_method: str = "region_rule_v2",
     ) -> PageResult:
-        if not proposals:
+        if not proposals and not skus:
             return PageResult(
                 status="AI_FAILED",
                 page_type=self._page_type(raw),
@@ -462,6 +535,24 @@ class PageProcessor:
                 )
                 skus.append(sku)
 
+        if preferred_image_groups is None and preferred_image_ids is not None:
+            preferred_image_groups = [[image_id] if image_id else [] for image_id in preferred_image_ids]
+        if preferred_image_groups and len(preferred_image_groups) != len(skus):
+            preferred_image_groups = None
+
+        if preferred_image_groups:
+            page_h = max(1.0, raw.metadata.page_height or 1.0)
+
+            def sort_key(item: tuple[SKUResult, list[str]]):
+                sku, _group = item
+                y = sku.source_bbox[1] / page_h if len(sku.source_bbox) >= 4 else 0
+                x = sku.source_bbox[0] / page_h if len(sku.source_bbox) >= 4 else 0
+                return (round(y, 2), round(x, 2))
+
+            paired = sorted(zip(skus, preferred_image_groups, strict=False), key=sort_key)
+            skus = [sku for sku, _ in paired]
+            preferred_image_groups = [group for _, group in paired]
+
         hash_prefix = (file_hash or hashlib.md5(str(page_no).encode("utf-8")).hexdigest())[:8]
         skus = self._id_gen.assign_ids(
             skus,
@@ -470,23 +561,56 @@ class PageProcessor:
             page_height=raw.metadata.page_height or 1.0,
         )
 
-        for sku in skus:
+        for sku_index, sku in enumerate(skus):
+            preferred_image_id = None
+            preferred_group = preferred_image_groups[sku_index] if preferred_image_groups else None
             region_image_ids = [
                 object_id for object_id, image in image_lookup.items()
                 if image.bbox != (0, 0, 0, 0) and self._bboxes_intersect(sku.source_bbox, image.bbox)
             ]
-            primary_image_id = self._primary_image_id(region_image_ids, image_lookup)
-            for image_id in region_image_ids:
+            if preferred_group:
+                region_image_ids = [
+                    image_id
+                    for image_id in dict.fromkeys(preferred_group)
+                    if image_id in image_lookup
+                ]
+                primary_image_id = region_image_ids[0] if region_image_ids else None
+            else:
+                if preferred_image_ids:
+                    preferred_image_id = preferred_image_ids[sku_index]
+                if preferred_image_id and preferred_image_id in image_lookup:
+                    primary_image_id = preferred_image_id
+                    if preferred_image_id not in region_image_ids:
+                        region_image_ids = [preferred_image_id, *region_image_ids]
+                else:
+                    primary_image_id = self._primary_image_id(region_image_ids, image_lookup)
+            if not preferred_group and not region_image_ids and preferred_image_id and preferred_image_id in image_lookup:
+                region_image_ids = [preferred_image_id]
+            if not primary_image_id and region_image_ids:
+                primary_image_id = self._primary_image_id(region_image_ids, image_lookup)
+            for rank, image_id in enumerate(region_image_ids, start=1):
                 image_lookup[image_id].role = "product_main" if image_id == primary_image_id else "product_detail"
-            bindings.append(
-                BindingResult(
-                    sku_id=sku.sku_id,
-                    image_id=primary_image_id,
-                    confidence=0.75 if primary_image_id else 0.0,
-                    method="region_membership",
-                    is_ambiguous=False,
+                bindings.append(
+                    BindingResult(
+                        sku_id=sku.sku_id,
+                        image_id=image_id,
+                        confidence=max(0.55, 0.78 - (rank - 1) * 0.08) if image_id else 0.0,
+                        method="region_membership" if not preferred_group else "model_anchor_image_group",
+                        is_ambiguous=False,
+                        rank=rank,
+                    )
                 )
-            )
+            if not region_image_ids:
+                bindings.append(
+                    BindingResult(
+                        sku_id=sku.sku_id,
+                        image_id=None,
+                        confidence=0.0,
+                        method="region_membership" if not preferred_group else "model_anchor_image_group",
+                        is_ambiguous=False,
+                        rank=1,
+                    )
+                )
 
         return PageResult(
             status="AI_COMPLETED",
@@ -496,7 +620,7 @@ class PageProcessor:
             images=raw.images,
             bindings=bindings,
             classification_confidence=0.8,
-            extraction_method="region_rule_v2",
+            extraction_method=page_extraction_method,
             fitz_page_class="REGION_V2",
         )
 
@@ -525,8 +649,16 @@ class PageProcessor:
                     self._run_layout_detection(screenshot),
                 )
 
+        pdf_text_objects = None
+        if self._needs_precise_pdf_text(raw):
+            try:
+                pdf_text_objects = await self._extract_precise_pdf_text_objects(file_path, page_no)
+            except Exception:
+                pdf_text_objects = None
+
         evidence = self._region_proposer.build_page_evidence(
             raw,
+            pdf_text_objects=pdf_text_objects,
             ocr_blocks=ocr_blocks,
             layout_regions=layout_regions,
             screenshot_size=self._screenshot_size(screenshot),
@@ -538,6 +670,35 @@ class PageProcessor:
                 fitz_page_class="BLANK",
                 classification_confidence=0.99,
             )
+
+        model_skus, model_bindings = self._model_extractor.extract(evidence)
+        if model_skus:
+            preferred_image_groups: list[list[str]] = []
+            current_group: list[str] | None = None
+            for binding in model_bindings:
+                if binding.rank == 1:
+                    if current_group is not None:
+                        preferred_image_groups.append(current_group)
+                    current_group = []
+                if current_group is None:
+                    current_group = []
+                if binding.image_id:
+                    current_group.append(binding.image_id)
+            if current_group is not None:
+                preferred_image_groups.append(current_group)
+            while len(preferred_image_groups) < len(model_skus):
+                preferred_image_groups.append([])
+            return self._build_regular_page_result(
+                raw,
+                evidence=evidence,
+                proposals=[],
+                skus=model_skus,
+                file_hash=file_hash,
+                page_no=page_no,
+                preferred_image_groups=preferred_image_groups,
+                page_extraction_method="model_anchor_v2",
+            )
+
         proposals = self._region_proposer.propose(evidence)
         if proposals and self._llm and settings.pipeline_v2_region_refine_enabled:
             proposals = await self._region_refiner.refine(

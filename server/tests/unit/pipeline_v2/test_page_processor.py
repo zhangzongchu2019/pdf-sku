@@ -9,6 +9,7 @@ from pdf_sku.pipeline.layout_detector import LayoutRegion
 from pdf_sku.pipeline.ir import ImageInfo, PageMetadata, PageResult, ParsedPageIR, SKUResult, TableData, TextBlock
 from pdf_sku.pipeline.parser.ocr_engine import OcrBlock
 from pdf_sku.pipeline_v2.document_hints import build_document_hints
+from pdf_sku.pipeline_v2.model_anchor_extractor import ModelAnchorExtractor
 from pdf_sku.pipeline_v2.models import DocumentHints, EvidenceObject, PageEvidence, RegionProposal
 from pdf_sku.pipeline_v2.page_processor import PageProcessor
 from pdf_sku.pipeline_v2.page_verifier import PageVerifier
@@ -70,6 +71,257 @@ def test_build_document_hints_from_sampled_pages():
     )
 
     assert "纯图商品目录" in hints.document_theme
+
+
+def test_model_anchor_extractor_prefers_precise_pdf_text_over_ocr_noise():
+    extractor = ModelAnchorExtractor()
+    evidence = PageEvidence(
+        page_no=1,
+        page_width=600,
+        page_height=800,
+        raw=ParsedPageIR(
+            page_no=1,
+            images=[ImageInfo(image_id="img-main", bbox=(260, 40, 500, 280), width=240, height=240, search_eligible=True)],
+            metadata=PageMetadata(page_width=600, page_height=800),
+        ),
+        objects=[
+            EvidenceObject(
+                object_id="pdf_title",
+                object_type="text_block",
+                bbox=(40, 40, 220, 70),
+                text="Wood Rope Back Chair",
+                source="pdf_text_precise",
+                font_size=18,
+            ),
+            EvidenceObject(
+                object_id="pdf_model",
+                object_type="text_block",
+                bbox=(40, 110, 150, 130),
+                text="HR-WOOD5114",
+                source="pdf_text_precise",
+                font_size=12,
+            ),
+            EvidenceObject(
+                object_id="pdf_spec",
+                object_type="text_block",
+                bbox=(40, 135, 200, 155),
+                text="H 89 cm   W 49 cm   D 41 cm",
+                source="pdf_text_precise",
+                font_size=12,
+            ),
+            EvidenceObject(
+                object_id="ocr_noise",
+                object_type="ocr_block",
+                bbox=(42, 136, 205, 158),
+                text="H89CMW49CMD41CM",
+                source="ocr_text",
+            ),
+        ],
+    )
+
+    skus, bindings = extractor.extract(evidence)
+
+    assert len(skus) == 1
+    assert skus[0].attributes["model_number"] == "HR-WOOD5114"
+    assert skus[0].attributes["product_name"] == "Wood Rope Back Chair"
+    assert skus[0].attributes["specs"] == "H 89 cm W 49 cm D 41 cm"
+    assert len(bindings) == 1
+    assert bindings[0].image_id == "img-main"
+
+
+def test_model_anchor_extractor_matches_models_to_nearest_local_images():
+    extractor = ModelAnchorExtractor()
+    evidence = PageEvidence(
+        page_no=1,
+        page_width=1190.55,
+        page_height=737.01,
+        raw=ParsedPageIR(
+            page_no=1,
+            images=[
+                ImageInfo(image_id="img-y-main", bbox=(55, 129, 189, 306), width=268, height=354, search_eligible=True),
+                ImageInfo(image_id="img-y-distractor", bbox=(234, 129, 362, 306), width=257, height=355, search_eligible=True),
+                ImageInfo(image_id="img-y-high", bbox=(407, 67, 539, 307), width=265, height=480, search_eligible=True),
+                ImageInfo(image_id="img-rope-main", bbox=(647, 220, 714, 320), width=128, height=196, search_eligible=True),
+                ImageInfo(image_id="img-rope-high", bbox=(1005, 114, 1173, 341), width=257, height=410, search_eligible=True),
+                ImageInfo(image_id="img-rope-bottom", bbox=(626, 475, 787, 669), width=270, height=349, search_eligible=True),
+                ImageInfo(image_id="img-y-bottom", bbox=(55, 453, 191, 643), width=272, height=380, search_eligible=True),
+                ImageInfo(image_id="img-divider", bbox=(595, 0, 683, 738), width=88, height=738, search_eligible=True),
+            ],
+            metadata=PageMetadata(page_width=1190.55, page_height=737.01),
+        ),
+        objects=[
+            EvidenceObject(
+                object_id="title-rope",
+                object_type="text_block",
+                bbox=(652, 55, 825, 97),
+                text="Rope Back Chair",
+                source="pdf_text_precise",
+                font_size=26,
+            ),
+            EvidenceObject(
+                object_id="title-y",
+                object_type="text_block",
+                bbox=(56, 58, 132, 99),
+                text="Y-chair",
+                source="pdf_text_precise",
+                font_size=26,
+            ),
+            EvidenceObject(
+                object_id="m-wood-y",
+                object_type="text_block",
+                bbox=(56, 310, 122, 326),
+                text="HR-WOOD5001C",
+                source="pdf_text_precise",
+                font_size=10,
+            ),
+            EvidenceObject(
+                object_id="m-wood-y-high",
+                object_type="text_block",
+                bbox=(408, 310, 474, 326),
+                text="HR-WOOD5001H",
+                source="pdf_text_precise",
+                font_size=10,
+            ),
+            EvidenceObject(
+                object_id="title-wood-y",
+                object_type="text_block",
+                bbox=(56, 344, 130, 367),
+                text="Wood Y-chair",
+                source="pdf_text_precise",
+                font_size=14,
+            ),
+            EvidenceObject(
+                object_id="m-wood-rope",
+                object_type="text_block",
+                bbox=(652, 329, 710, 345),
+                text="HR-WOOD5115",
+                source="pdf_text_precise",
+                font_size=10,
+            ),
+            EvidenceObject(
+                object_id="m-wood-rope-high",
+                object_type="text_block",
+                bbox=(1028, 329, 1092, 345),
+                text="HR-WOOD5115H",
+                source="pdf_text_precise",
+                font_size=10,
+            ),
+            EvidenceObject(
+                object_id="title-resin-rope",
+                object_type="text_block",
+                bbox=(653, 450, 781, 473),
+                text="Resin Rope Back Chair",
+                source="pdf_text_precise",
+                font_size=14,
+            ),
+            EvidenceObject(
+                object_id="title-resin-y",
+                object_type="text_block",
+                bbox=(377, 637, 456, 659),
+                text="Resin Y-chair",
+                source="pdf_text_precise",
+                font_size=14,
+            ),
+            EvidenceObject(
+                object_id="m-resin-y",
+                object_type="text_block",
+                bbox=(56, 646, 105, 662),
+                text="HR-PP5001",
+                source="pdf_text_precise",
+                font_size=10,
+            ),
+            EvidenceObject(
+                object_id="m-resin-rope",
+                object_type="text_block",
+                bbox=(652, 646, 696, 662),
+                text="HR-PP5115",
+                source="pdf_text_precise",
+                font_size=10,
+            ),
+        ],
+    )
+
+    skus, bindings = extractor.extract(evidence)
+
+    assert [sku.attributes["model_number"] for sku in skus] == [
+        "HR-WOOD5001C",
+        "HR-WOOD5001H",
+        "HR-WOOD5115",
+        "HR-WOOD5115H",
+        "HR-PP5001",
+        "HR-PP5115",
+    ]
+    assert [binding.image_id for binding in bindings if binding.rank == 1] == [
+        "img-y-main",
+        "img-y-high",
+        "img-rope-main",
+        "img-rope-high",
+        "img-y-bottom",
+        "img-rope-bottom",
+    ]
+
+
+def test_model_anchor_extractor_recalls_local_companions_without_crossing_h_variant():
+    extractor = ModelAnchorExtractor()
+    evidence = PageEvidence(
+        page_no=1,
+        page_width=1190.55,
+        page_height=737.01,
+        raw=ParsedPageIR(
+            page_no=1,
+            images=[
+                ImageInfo(image_id="img-rope-main", bbox=(646.7, 220.0, 714.4, 320.3), width=128, height=196, search_eligible=True),
+                ImageInfo(image_id="img-rope-top-left", bbox=(651.0, 121.4, 708.6, 217.7), width=116, height=193, search_eligible=True),
+                ImageInfo(image_id="img-rope-top-right", bbox=(762.8, 121.3, 825.4, 216.7), width=126, height=191, search_eligible=True),
+                ImageInfo(image_id="img-rope-high", bbox=(1004.5, 114.1, 1173.4, 341.3), width=257, height=410, search_eligible=True),
+                ImageInfo(image_id="img-rope-normal-near-high", bbox=(932.1, 121.4, 988.3, 217.7), width=113, height=193, search_eligible=True),
+            ],
+            metadata=PageMetadata(page_width=1190.55, page_height=737.01),
+        ),
+        objects=[
+            EvidenceObject(
+                object_id="title-rope",
+                object_type="text_block",
+                bbox=(652, 55, 825, 97),
+                text="Rope Back Chair",
+                source="pdf_text_precise",
+                font_size=26,
+            ),
+            EvidenceObject(
+                object_id="m-wood-rope",
+                object_type="text_block",
+                bbox=(652, 329, 710, 345),
+                text="HR-WOOD5115",
+                source="pdf_text_precise",
+                font_size=10,
+            ),
+            EvidenceObject(
+                object_id="m-wood-rope-high",
+                object_type="text_block",
+                bbox=(1028, 329, 1092, 345),
+                text="HR-WOOD5115H",
+                source="pdf_text_precise",
+                font_size=10,
+            ),
+        ],
+    )
+
+    skus, bindings = extractor.extract(evidence)
+
+    binding_groups: dict[str, list[str]] = {}
+    current_model = ""
+    model_iter = iter([sku.attributes["model_number"] for sku in skus])
+    for binding in bindings:
+        if binding.rank == 1:
+            current_model = next(model_iter)
+        binding_groups.setdefault(current_model, []).append(binding.image_id)
+
+    assert binding_groups["HR-WOOD5115"] == [
+        "img-rope-main",
+        "img-rope-top-left",
+        "img-rope-top-right",
+    ]
+    assert binding_groups["HR-WOOD5115H"] == ["img-rope-high"]
 
 
 def _table_page_one() -> ParsedPageIR:
@@ -241,6 +493,219 @@ async def test_v2_regular_page_outputs_visual_only_regions():
     assert len(result.skus) == 2
     assert all(sku.attributes["evidence_mode"] == "visual_only" for sku in result.skus)
     assert legacy.calls == []
+
+
+@pytest.mark.asyncio
+async def test_v2_regular_page_prefers_model_anchor_extraction(monkeypatch):
+    legacy = _LegacyStub()
+    processor = PageProcessor(fallback_processor=legacy)
+
+    async def fake_extract(file_path: str, page_no: int) -> ParsedPageIR:
+        return ParsedPageIR(
+            page_no=1,
+            text_blocks=[
+                TextBlock(
+                    content="Catalog spread page\nwith all text collapsed into one block",
+                    bbox=(0, 0, 600, 800),
+                )
+            ],
+            images=[
+                ImageInfo(image_id="img-a", bbox=(260, 40, 420, 220), width=240, height=240, search_eligible=True),
+                ImageInfo(image_id="img-b", bbox=(260, 260, 420, 440), width=240, height=240, search_eligible=True),
+            ],
+            metadata=PageMetadata(page_width=600, page_height=800),
+        )
+
+    async def fake_precise(file_path: str, page_no: int):
+        return [
+            EvidenceObject(
+                object_id="line-1",
+                object_type="text_block",
+                bbox=(40, 40, 220, 70),
+                text="Wood Rope Back Chair",
+                source="pdf_text_precise",
+                font_size=18,
+            ),
+            EvidenceObject(
+                object_id="line-2",
+                object_type="text_block",
+                bbox=(40, 110, 150, 130),
+                text="HR-WOOD5114",
+                source="pdf_text_precise",
+                font_size=12,
+            ),
+            EvidenceObject(
+                object_id="line-3",
+                object_type="text_block",
+                bbox=(40, 135, 210, 155),
+                text="H 89 cm   W 49 cm   D 41 cm",
+                source="pdf_text_precise",
+                font_size=12,
+            ),
+            EvidenceObject(
+                object_id="line-4",
+                object_type="text_block",
+                bbox=(40, 260, 220, 290),
+                text="Resin Rope Back Chair",
+                source="pdf_text_precise",
+                font_size=18,
+            ),
+            EvidenceObject(
+                object_id="line-5",
+                object_type="text_block",
+                bbox=(40, 330, 130, 350),
+                text="HR-PP5115",
+                source="pdf_text_precise",
+                font_size=12,
+            ),
+            EvidenceObject(
+                object_id="line-6",
+                object_type="text_block",
+                bbox=(40, 355, 210, 375),
+                text="H 89 cm   W 49 cm   D 41 cm",
+                source="pdf_text_precise",
+                font_size=12,
+            ),
+        ]
+
+    monkeypatch.setattr(processor, "_extract_page", fake_extract)
+    monkeypatch.setattr(processor, "_extract_precise_pdf_text_objects", fake_precise)
+
+    result = await processor.process_page(
+        job_id="job-model-anchor",
+        file_path="/tmp/fake.pdf",
+        page_no=1,
+        file_hash="abc12345",
+    )
+
+    assert result.status == "AI_COMPLETED"
+    assert result.extraction_method == "model_anchor_v2"
+    assert [sku.attributes["model_number"] for sku in result.skus] == ["HR-WOOD5114", "HR-PP5115"]
+    assert [sku.attributes["product_name"] for sku in result.skus] == ["Wood Rope Back Chair", "Resin Rope Back Chair"]
+    assert result.bindings[0].image_id == "img-a"
+    assert result.bindings[1].image_id == "img-b"
+    assert legacy.calls == []
+
+
+@pytest.mark.asyncio
+async def test_v2_model_anchor_page_can_keep_multiple_images_per_model(monkeypatch):
+    processor = PageProcessor(allow_legacy_fallback=False)
+
+    async def fake_extract(file_path: str, page_no: int) -> ParsedPageIR:
+        return ParsedPageIR(
+            page_no=1,
+            text_blocks=[
+                TextBlock(content="spread", bbox=(0, 0, 600, 800)),
+            ],
+            images=[
+                ImageInfo(image_id="img-a-main", bbox=(260, 40, 420, 220), width=240, height=240, search_eligible=True),
+                ImageInfo(image_id="img-a-detail", bbox=(430, 60, 520, 180), width=140, height=180, search_eligible=True),
+                ImageInfo(image_id="img-b-main", bbox=(260, 260, 420, 440), width=240, height=240, search_eligible=True),
+                ImageInfo(image_id="img-b-detail", bbox=(430, 280, 520, 400), width=140, height=180, search_eligible=True),
+            ],
+            metadata=PageMetadata(page_width=600, page_height=800),
+        )
+
+    async def fake_precise(file_path: str, page_no: int):
+        return [
+            EvidenceObject(
+                object_id="line-1",
+                object_type="text_block",
+                bbox=(40, 40, 220, 70),
+                text="Wood Rope Back Chair",
+                source="pdf_text_precise",
+                font_size=18,
+            ),
+            EvidenceObject(
+                object_id="line-2",
+                object_type="text_block",
+                bbox=(40, 110, 150, 130),
+                text="HR-WOOD5114",
+                source="pdf_text_precise",
+                font_size=12,
+            ),
+            EvidenceObject(
+                object_id="line-3",
+                object_type="text_block",
+                bbox=(40, 260, 220, 290),
+                text="Resin Rope Back Chair",
+                source="pdf_text_precise",
+                font_size=18,
+            ),
+            EvidenceObject(
+                object_id="line-4",
+                object_type="text_block",
+                bbox=(40, 330, 130, 350),
+                text="HR-PP5115",
+                source="pdf_text_precise",
+                font_size=12,
+            ),
+        ]
+
+    monkeypatch.setattr(processor, "_extract_page", fake_extract)
+    monkeypatch.setattr(processor, "_extract_precise_pdf_text_objects", fake_precise)
+
+    result = await processor.process_page(
+        job_id="job-model-anchor-multi-image",
+        file_path="/tmp/fake.pdf",
+        page_no=1,
+        file_hash="abc12345",
+    )
+
+    bindings_by_sku = {}
+    for binding in result.bindings:
+        bindings_by_sku.setdefault(binding.sku_id, []).append(binding.image_id)
+
+    assert result.status == "AI_COMPLETED"
+    assert len(result.skus) == 2
+    assert list(bindings_by_sku.values()) == [
+        ["img-a-main", "img-a-detail"],
+        ["img-b-main", "img-b-detail"],
+    ]
+
+
+def test_v2_build_regular_page_result_keeps_preferred_images_aligned_after_sort():
+    processor = PageProcessor(allow_legacy_fallback=False)
+    raw = ParsedPageIR(
+        page_no=1,
+        images=[
+            ImageInfo(image_id="img-left", bbox=(20, 40, 160, 220), width=280, height=360),
+            ImageInfo(image_id="img-right", bbox=(260, 40, 400, 260), width=280, height=440),
+        ],
+        metadata=PageMetadata(page_width=500, page_height=700),
+    )
+    skus = [
+        SKUResult(
+            sku_id="",
+            attributes={"model_number": "RIGHT"},
+            source_bbox=(260, 40, 400, 260),
+            validity="valid",
+            confidence=0.9,
+            extraction_method="model_anchor_v2",
+        ),
+        SKUResult(
+            sku_id="",
+            attributes={"model_number": "LEFT"},
+            source_bbox=(20, 40, 160, 220),
+            validity="valid",
+            confidence=0.9,
+            extraction_method="model_anchor_v2",
+        ),
+    ]
+
+    result = processor._build_regular_page_result(
+        raw,
+        evidence=PageEvidence(page_no=1, page_width=500, page_height=700, raw=raw),
+        proposals=[],
+        skus=skus,
+        file_hash="sortbind",
+        page_no=1,
+        preferred_image_ids=["img-right", "img-left"],
+        page_extraction_method="model_anchor_v2",
+    )
+
+    assert [sku.attributes["model_number"] for sku in result.skus] == ["LEFT", "RIGHT"]
+    assert [binding.image_id for binding in result.bindings] == ["img-left", "img-right"]
 
 
 def test_v2_clear_job_cache_clears_local_and_legacy_cache():

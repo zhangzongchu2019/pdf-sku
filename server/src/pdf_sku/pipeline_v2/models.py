@@ -60,6 +60,7 @@ class EvidenceObject:
     label: str = ""
     source: str = ""
     confidence: float = 1.0
+    font_size: float = 0.0
 
 
 @dataclass

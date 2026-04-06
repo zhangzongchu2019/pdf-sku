@@ -22,6 +22,10 @@ type: project
   - 回答“最终 Excel 必须怎么导出”
   - 包含字段顺序、重点识别字段、图片列展开规则、图片嵌入要求
 
+- [pipeline-v2-usage.md](/home/fulei/codes/pdf-sku/docs/pipeline-v2-usage.md)
+  - 回答“怎么把系统切到 v2 并实际跑起来”
+  - 包含在线 Job、benchmark、单文件脚本三种使用方式
+
 ## 阅读顺序
 
 建议按以下顺序阅读：
@@ -29,6 +33,10 @@ type: project
 1. 先看 [pipeline-design.md](/home/fulei/codes/pdf-sku/docs/pipeline-design.md)
 2. 再看 [pipeline-implementation.md](/home/fulei/codes/pdf-sku/docs/pipeline-implementation.md)
 3. 最后看 [pipeline-export-contract.md](/home/fulei/codes/pdf-sku/docs/pipeline-export-contract.md)
+
+如果你现在要直接运行，请先看：
+
+- [pipeline-v2-usage.md](/home/fulei/codes/pdf-sku/docs/pipeline-v2-usage.md)
 
 ## 解释优先级
 

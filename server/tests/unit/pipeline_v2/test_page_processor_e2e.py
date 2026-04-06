@@ -50,6 +50,29 @@ def _make_regular_pdf(path) -> str:
     return str(path)
 
 
+def _make_model_anchor_pdf(path) -> str:
+    doc = fitz.open()
+    page = doc.new_page(width=800, height=600)
+
+    page.insert_text((40, 60), "Wood Rope Back Chair", fontsize=18)
+    page.insert_text((40, 110), "HR-WOOD5114", fontsize=12)
+    page.insert_text((40, 140), "H 89 cm   W 49 cm   D 41 cm", fontsize=12)
+
+    page.insert_text((40, 320), "Resin Rope Back Chair", fontsize=18)
+    page.insert_text((40, 370), "HR-PP5115", fontsize=12)
+    page.insert_text((40, 400), "H 89 cm   W 49 cm   D 41 cm", fontsize=12)
+
+    image = PILImage.new("RGB", (180, 180), color=(230, 230, 230))
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    page.insert_image(fitz.Rect(340, 40, 560, 240), stream=buf.getvalue())
+    page.insert_image(fitz.Rect(340, 280, 560, 500), stream=buf.getvalue())
+
+    doc.save(path)
+    doc.close()
+    return str(path)
+
+
 @pytest.mark.asyncio
 async def test_v2_processes_real_table_pdf_with_header_inheritance(tmp_path):
     pdf_path = _make_table_pdf(tmp_path / "table.pdf")
@@ -95,3 +118,24 @@ async def test_v2_processes_real_regular_pdf(tmp_path):
     assert result.bindings and result.bindings[0].image_id is not None
 
     processor.clear_job_cache("e2e-regular")
+
+
+@pytest.mark.asyncio
+async def test_v2_processes_real_model_anchor_pdf(tmp_path):
+    pdf_path = _make_model_anchor_pdf(tmp_path / "model-anchor.pdf")
+    processor = PageProcessor()
+
+    result = await processor.process_page(
+        job_id="e2e-model-anchor",
+        file_path=pdf_path,
+        page_no=1,
+        file_hash="anchor123",
+    )
+
+    assert result.status == "AI_COMPLETED"
+    assert result.extraction_method == "model_anchor_v2"
+    assert [sku.attributes["model_number"] for sku in result.skus] == ["HR-WOOD5114", "HR-PP5115"]
+    assert [sku.attributes["product_name"] for sku in result.skus] == ["Wood Rope Back Chair", "Resin Rope Back Chair"]
+    assert result.bindings and all(binding.image_id is not None for binding in result.bindings)
+
+    processor.clear_job_cache("e2e-model-anchor")
