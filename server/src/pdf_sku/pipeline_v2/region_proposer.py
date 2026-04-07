@@ -54,6 +54,8 @@ def _is_visual_candidate(
     page_height: float,
     min_area_ratio: float,
 ) -> bool:
+    if image.is_fragmented:
+        return False
     if image.bbox == (0, 0, 0, 0):
         return bool(image.search_eligible)
     page_area = max(1.0, page_width * page_height)

@@ -739,6 +739,118 @@ def test_model_anchor_extractor_accepts_generic_product_name_label_in_english():
     assert [binding.image_id for binding in bindings] == ["img-main"]
 
 
+def test_model_anchor_extractor_prefers_inline_name_and_extracts_color():
+    extractor = ModelAnchorExtractor()
+    evidence = PageEvidence(
+        page_no=1,
+        page_width=1600,
+        page_height=1600,
+        raw=ParsedPageIR(
+            page_no=1,
+            images=[
+                ImageInfo(
+                    image_id="img-main",
+                    bbox=(200, 120, 500, 420),
+                    width=600,
+                    height=600,
+                    short_edge=600,
+                    search_eligible=True,
+                ),
+            ],
+            metadata=PageMetadata(page_width=1600, page_height=1600),
+        ),
+        objects=[
+            EvidenceObject(
+                object_id="ocr-model",
+                object_type="ocr_block",
+                bbox=(220, 460, 340, 480),
+                text="GK986书桌",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-spec",
+                object_type="ocr_block",
+                bbox=(220, 482, 420, 500),
+                text="规格：1200x550x770mm",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-color",
+                object_type="ocr_block",
+                bbox=(220, 504, 360, 522),
+                text="颜色：复古胡桃色",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-distant-title",
+                object_type="ocr_block",
+                bbox=(820, 900, 930, 920),
+                text="床尾凳",
+                source="ocr_text",
+            ),
+        ],
+    )
+
+    skus, bindings = extractor.extract(evidence)
+
+    assert len(skus) == 1
+    assert skus[0].attributes["model_number"] == "GK986"
+    assert skus[0].attributes["product_name"] == "书桌"
+    assert skus[0].attributes["color"] == "复古胡桃色"
+    assert [binding.image_id for binding in bindings] == ["img-main"]
+
+
+def test_model_anchor_extractor_cleans_numeric_prefix_from_title_fallback():
+    extractor = ModelAnchorExtractor()
+    evidence = PageEvidence(
+        page_no=1,
+        page_width=1600,
+        page_height=1600,
+        raw=ParsedPageIR(
+            page_no=1,
+            images=[
+                ImageInfo(
+                    image_id="img-main",
+                    bbox=(980, 900, 1260, 1180),
+                    width=600,
+                    height=600,
+                    short_edge=600,
+                    search_eligible=True,
+                ),
+            ],
+            metadata=PageMetadata(page_width=1600, page_height=1600),
+        ),
+        objects=[
+            EvidenceObject(
+                object_id="ocr-title",
+                object_type="ocr_block",
+                bbox=(1000, 1090, 1100, 1110),
+                text="001九斗柜",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-model",
+                object_type="ocr_block",
+                bbox=(1002, 1122, 1120, 1140),
+                text="型号：GK026",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-spec",
+                object_type="ocr_block",
+                bbox=(1002, 1144, 1180, 1162),
+                text="规格：1200x425x790mm",
+                source="ocr_text",
+            ),
+        ],
+    )
+
+    skus, _bindings = extractor.extract(evidence)
+
+    assert len(skus) == 1
+    assert skus[0].attributes["product_name"] == "九斗柜"
+
+
 def test_region_attribute_extractor_keeps_backpack_name_as_non_label_line():
     extractor = RegionAttributeExtractor()
     evidence = PageEvidence(
@@ -976,6 +1088,62 @@ def _two_panel_scene_with_left_text_bytes() -> bytes:
     return buf.getvalue()
 
 
+def _tile_page_screenshot_bytes() -> bytes:
+    img = PILImage.new("RGB", (1200, 800), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((80, 90, 520, 500), fill=(215, 215, 215))
+    draw.rectangle((680, 90, 1120, 500), fill=(205, 205, 205))
+    draw.rectangle((130, 180, 470, 460), fill=(95, 95, 95))
+    draw.rectangle((730, 180, 1070, 460), fill=(120, 120, 120))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
+def _tile_page_raw() -> ParsedPageIR:
+    images: list[ImageInfo] = []
+
+    def add_tiles(prefix_x: int, prefix_y: int, *, start_index: int) -> int:
+        index = start_index
+        tile_width = 110
+        tile_height = 102
+        gap = 2
+        for row in range(4):
+            for col in range(4):
+                x0 = prefix_x + col * (tile_width + gap)
+                y0 = prefix_y + row * (tile_height + gap)
+                x1 = x0 + tile_width
+                y1 = y0 + tile_height
+                images.append(
+                    ImageInfo(
+                        image_id=f"p1_img{index}",
+                        bbox=(float(x0), float(y0), float(x1), float(y1)),
+                        width=180,
+                        height=180,
+                        short_edge=180,
+                        search_eligible=False,
+                    )
+                )
+                index += 1
+        return index
+
+    next_index = add_tiles(80, 90, start_index=0)
+    add_tiles(680, 90, start_index=next_index)
+
+    return ParsedPageIR(
+        page_no=1,
+        text_blocks=[
+            TextBlock(content="Cabinet Alpha", bbox=(120, 560, 320, 590), font_size=20),
+            TextBlock(content="MODEL: GK988", bbox=(120, 602, 280, 628), font_size=14),
+            TextBlock(content="Cabinet Beta", bbox=(720, 560, 930, 590), font_size=20),
+            TextBlock(content="MODEL: GK989", bbox=(720, 602, 880, 628), font_size=14),
+        ],
+        images=images,
+        raw_text="Cabinet Alpha MODEL: GK988 Cabinet Beta MODEL: GK989",
+        metadata=PageMetadata(page_width=1200, page_height=800),
+    )
+
+
 def test_scene_image_splitter_can_split_single_large_scene(monkeypatch):
     splitter = SceneImageSplitter()
     images = splitter.extract(
@@ -997,6 +1165,58 @@ def test_scene_image_splitter_can_split_single_large_scene(monkeypatch):
     assert all(image.search_eligible for image in images)
     assert all(image.data for image in images)
     assert all(image.width < 900 and image.height < 600 for image in images)
+
+
+@pytest.mark.asyncio
+async def test_v2_tile_page_merges_fragments_into_composite_images(monkeypatch):
+    processor = PageProcessor(allow_legacy_fallback=False)
+    raw = _tile_page_raw()
+
+    async def fake_extract(file_path: str, page_no: int) -> ParsedPageIR:
+        return raw
+
+    async def fake_count_pages(file_path: str) -> int:
+        return 1
+
+    async def fake_render(file_path: str, page_no: int, **kwargs) -> bytes:
+        return _tile_page_screenshot_bytes()
+
+    async def fake_ocr(screenshot: bytes | None):
+        return []
+
+    async def fake_layout(screenshot: bytes | None):
+        return []
+
+    monkeypatch.setattr(processor, "_extract_page", fake_extract)
+    monkeypatch.setattr(processor, "_count_pages", fake_count_pages)
+    monkeypatch.setattr(processor, "_render_page_screenshot", fake_render)
+    monkeypatch.setattr(processor, "_run_ocr", fake_ocr)
+    monkeypatch.setattr(processor, "_run_layout_detection", fake_layout)
+
+    result = await processor.process_page(
+        job_id="job-tile-page",
+        file_path="/tmp/tile.pdf",
+        page_no=1,
+        file_hash="deadbeef",
+    )
+
+    assert result.status == "AI_COMPLETED"
+    assert result.extraction_method == "model_anchor_v2"
+    assert {sku.attributes.get("model_number") for sku in result.skus} == {"GK988", "GK989"}
+
+    composite_images = [
+        image for image in result.images
+        if image.image_id.startswith("p1_composite_") and image.search_eligible
+    ]
+    assert len(composite_images) == 2
+    assert all(image.data for image in composite_images)
+
+    fragment_images = [image for image in result.images if image.is_fragmented]
+    assert len(fragment_images) == 32
+    assert all(not image.search_eligible for image in fragment_images)
+
+    bound_image_ids = {binding.image_id for binding in result.bindings if binding.image_id}
+    assert bound_image_ids == {image.image_id for image in composite_images}
 
 
 def test_scene_image_splitter_can_split_wide_scene_without_text_hint(monkeypatch):

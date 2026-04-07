@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
@@ -222,7 +223,7 @@ class PageProcessor:
         file_hash: str,
     ) -> PageResult:
         raw = context.first_page_raw if page_no == 1 and context.first_page_raw else await self._extract_page(file_path, page_no)
-        self._prepare_images(raw)
+        self._prepare_images(raw, page_no=page_no)
         schema = context.schema
         if schema is None:
             return PageResult(
@@ -396,6 +397,166 @@ class PageProcessor:
         return not raw.tables and not raw.images and not any((block.content or "").strip() for block in raw.text_blocks)
 
     @staticmethod
+    def _looks_like_tile_page(images: list[ImageInfo]) -> bool:
+        candidates = [
+            image
+            for image in images
+            if image.width > 0 and image.height > 0 and image.bbox != (0, 0, 0, 0)
+        ]
+        if len(candidates) < 30:
+            return False
+        small_count = sum(1 for image in candidates if min(image.width, image.height) < 200)
+        return small_count >= len(candidates) * 0.7
+
+    @staticmethod
+    def _compose_tile_cluster_image(
+        screenshot_img: PILImage.Image,
+        *,
+        bbox: tuple[float, float, float, float],
+        page_width: float,
+        page_height: float,
+        page_no: int,
+        index: int,
+    ) -> ImageInfo | None:
+        screen_width, screen_height = screenshot_img.size
+        if screen_width <= 0 or screen_height <= 0 or page_width <= 0 or page_height <= 0:
+            return None
+
+        x0 = max(0, int((bbox[0] / page_width) * screen_width))
+        y0 = max(0, int((bbox[1] / page_height) * screen_height))
+        x1 = min(screen_width, int((bbox[2] / page_width) * screen_width))
+        y1 = min(screen_height, int((bbox[3] / page_height) * screen_height))
+        if x1 <= x0 or y1 <= y0:
+            return None
+
+        crop = screenshot_img.crop((x0, y0, x1, y1))
+        if crop.width <= 1 or crop.height <= 1:
+            return None
+
+        out = io.BytesIO()
+        crop.save(out, format="JPEG", quality=88)
+        crop_data = out.getvalue()
+        short_edge = min(crop.width, crop.height)
+        return ImageInfo(
+            image_id=f"p{page_no}_composite_{index}",
+            bbox=bbox,
+            data=crop_data,
+            width=crop.width,
+            height=crop.height,
+            short_edge=short_edge,
+            role="unknown",
+            search_eligible=short_edge >= 80,
+            image_hash=hashlib.md5(crop_data[:2048]).hexdigest()[:12],
+        )
+
+    @classmethod
+    def _merge_tile_fragments(
+        cls,
+        raw: ParsedPageIR,
+        *,
+        screenshot: bytes | None,
+        page_no: int,
+    ) -> None:
+        if not cls._looks_like_tile_page(raw.images) or not screenshot:
+            return
+
+        valid_indices = [
+            index
+            for index, image in enumerate(raw.images)
+            if image.bbox != (0, 0, 0, 0)
+        ]
+        if len(valid_indices) < 30:
+            return
+
+        parent = {index: index for index in valid_indices}
+        rank = {index: 0 for index in valid_indices}
+
+        def find(index: int) -> int:
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        def union(left: int, right: int) -> None:
+            root_left = find(left)
+            root_right = find(right)
+            if root_left == root_right:
+                return
+            if rank[root_left] < rank[root_right]:
+                root_left, root_right = root_right, root_left
+            parent[root_right] = root_left
+            if rank[root_left] == rank[root_right]:
+                rank[root_left] += 1
+
+        gap = 5.0
+        for pos, left in enumerate(valid_indices):
+            left_box = raw.images[left].bbox
+            for right in valid_indices[pos + 1:]:
+                right_box = raw.images[right].bbox
+                horizontally_adjacent = left_box[0] < right_box[2] + gap and right_box[0] < left_box[2] + gap
+                vertically_adjacent = left_box[1] < right_box[3] + gap and right_box[1] < left_box[3] + gap
+                if horizontally_adjacent and vertically_adjacent:
+                    union(left, right)
+
+        clusters: dict[int, list[int]] = defaultdict(list)
+        for index in valid_indices:
+            clusters[find(index)].append(index)
+
+        try:
+            with PILImage.open(io.BytesIO(screenshot)) as screenshot_img:
+                normalized_screenshot = flatten_for_jpeg(screenshot_img)
+        except Exception:
+            return
+
+        merged: list[ImageInfo] = []
+        composite_count = 0
+        for members in clusters.values():
+            if len(members) == 1:
+                image = raw.images[members[0]]
+                native_short = min(image.width, image.height) if image.width and image.height else 0
+                if native_short < 200:
+                    image.is_fragmented = True
+                    image.search_eligible = False
+                merged.append(image)
+                continue
+
+            union_bbox = (
+                min(raw.images[index].bbox[0] for index in members),
+                min(raw.images[index].bbox[1] for index in members),
+                max(raw.images[index].bbox[2] for index in members),
+                max(raw.images[index].bbox[3] for index in members),
+            )
+            composite = cls._compose_tile_cluster_image(
+                normalized_screenshot,
+                bbox=union_bbox,
+                page_width=raw.metadata.page_width,
+                page_height=raw.metadata.page_height,
+                page_no=page_no,
+                index=composite_count,
+            )
+            if composite is not None:
+                merged.append(composite)
+                composite_count += 1
+
+            for index in members:
+                image = raw.images[index]
+                image.is_fragmented = True
+                image.search_eligible = False
+                merged.append(image)
+
+        if composite_count == 0:
+            return
+
+        raw.images = merged
+        logger.info(
+            "pipeline_v2_tile_fragments_merged",
+            page_no=page_no,
+            original_count=len(valid_indices),
+            composite_count=composite_count,
+            total_images=len(raw.images),
+        )
+
+    @staticmethod
     def _trim_image_background(image: ImageInfo, raw: ParsedPageIR) -> None:
         if not image.data or image.bbox == (0, 0, 0, 0):
             return
@@ -442,8 +603,13 @@ class PageProcessor:
             image.bbox[1] + y1 * scale_y,
         )
 
-    @classmethod
-    def _prepare_images(cls, raw: ParsedPageIR) -> None:
+    def _prepare_images(
+        self,
+        raw: ParsedPageIR,
+        *,
+        screenshot: bytes | None = None,
+        page_no: int,
+    ) -> None:
         seen_image_ids: set[str] = set()
         for index, image in enumerate(raw.images):
             candidate_id = (image.image_id or "").strip() or f"image_{index}"
@@ -451,7 +617,19 @@ class PageProcessor:
                 candidate_id = f"{candidate_id}_{index}"
             image.image_id = candidate_id
             seen_image_ids.add(candidate_id)
-            cls._trim_image_background(image, raw)
+        self._merge_tile_fragments(raw, screenshot=screenshot, page_no=page_no)
+
+        seen_image_ids.clear()
+        for index, image in enumerate(raw.images):
+            candidate_id = (image.image_id or "").strip() or f"image_{index}"
+            if candidate_id in seen_image_ids:
+                candidate_id = f"{candidate_id}_{index}"
+            image.image_id = candidate_id
+            seen_image_ids.add(candidate_id)
+            if image.is_fragmented:
+                image.search_eligible = False
+                continue
+            self._trim_image_background(image, raw)
             if image.short_edge <= 0 and image.width and image.height:
                 image.short_edge = min(image.width, image.height)
             if not image.search_eligible:
@@ -906,9 +1084,14 @@ class PageProcessor:
         page_no: int,
         document_hints,
     ) -> PageResult:
-        self._prepare_images(raw)
         screenshot = None
-        screenshot_needed = bool(self._llm) or settings.ocr_enabled or settings.layout_detect_enabled
+        tile_merge_needed = self._looks_like_tile_page(raw.images)
+        screenshot_needed = (
+            tile_merge_needed
+            or bool(self._llm)
+            or settings.ocr_enabled
+            or settings.layout_detect_enabled
+        )
         ocr_blocks: list[OcrBlock] = []
         layout_regions: list[LayoutRegion] = []
         if screenshot_needed:
@@ -921,6 +1104,7 @@ class PageProcessor:
                     self._run_ocr(screenshot),
                     self._run_layout_detection(screenshot),
                 )
+        self._prepare_images(raw, screenshot=screenshot, page_no=page_no)
 
         pdf_text_objects = None
         if self._needs_precise_pdf_text(raw):
