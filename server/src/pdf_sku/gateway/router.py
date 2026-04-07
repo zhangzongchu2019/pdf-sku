@@ -828,6 +828,42 @@ _IMAGE_SIZES: dict[str, tuple[int, int]] = {
 }
 
 
+def _image_media_type(file_path: Path, fallback_format: str | None = None) -> str:
+    suffix = file_path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if suffix == ".png":
+        return "image/png"
+    if suffix == ".webp":
+        return "image/webp"
+    if fallback_format:
+        fmt = fallback_format.lower()
+        if fmt == "jpg":
+            fmt = "jpeg"
+        return f"image/{fmt}"
+    return "image/jpeg"
+
+
+def _resolve_job_image_file(
+    *,
+    job_dir: Path,
+    image_id: str,
+    extracted_path: str | None = None,
+    fallback_format: str | None = None,
+) -> tuple[Path, str] | None:
+    images_dir = job_dir / "images"
+    for suffix in (".jpg", ".jpeg", ".png", ".webp"):
+        candidate = images_dir / f"{image_id}{suffix}"
+        if candidate.exists():
+            return candidate, _image_media_type(candidate)
+
+    if extracted_path:
+        file_path = job_dir / extracted_path
+        if file_path.exists():
+            return file_path, _image_media_type(file_path, fallback_format)
+    return None
+
+
 def _generate_thumbnail(
     file_path: Path, cache_dir: Path, cache_path: Path,
     max_edge: int, quality: int,
@@ -860,23 +896,22 @@ async def get_job_image(
         select(Image).where(Image.job_id == job_id, Image.image_id == image_id)
     )
     img = result.scalar_one_or_none()
-    if not img or not img.extracted_path:
+    job_dir = Path(settings.job_data_dir) / str(job_id)
+    resolved = _resolve_job_image_file(
+        job_dir=job_dir,
+        image_id=image_id,
+        extracted_path=img.extracted_path if img else None,
+        fallback_format=img.format if img else None,
+    )
+    if not resolved:
         return JSONResponse(status_code=404, content={
             "error_code": "IMAGE_NOT_FOUND",
             "message": f"Image {image_id} not found",
         })
-
-    job_dir = Path(settings.job_data_dir) / str(job_id)
-    file_path = job_dir / img.extracted_path
-    if not file_path.exists():
-        return JSONResponse(status_code=404, content={
-            "error_code": "IMAGE_FILE_MISSING",
-            "message": "Image file not found on disk",
-        })
+    file_path, media = resolved
 
     # 原图直接返回
     if size not in _IMAGE_SIZES:
-        media = "image/jpeg" if img.format == "jpg" else f"image/{img.format or 'jpeg'}"
         return FileResponse(str(file_path), media_type=media)
 
     # 缩略图: 磁盘缓存，首次按需生成（线程池避免阻塞事件循环）
@@ -884,7 +919,10 @@ async def get_job_image(
     cache_dir = job_dir / "images" / ".cache"
     cache_path = cache_dir / f"{image_id}_{size}.jpg"
 
-    if not cache_path.exists():
+    if (
+        not cache_path.exists()
+        or cache_path.stat().st_mtime < file_path.stat().st_mtime
+    ):
         import asyncio
 
         resolved = await asyncio.get_running_loop().run_in_executor(
@@ -892,7 +930,6 @@ async def get_job_image(
         )
         if resolved != cache_path:
             # 原图已经小于目标尺寸，直接返回原图
-            media = "image/jpeg" if img.format == "jpg" else f"image/{img.format or 'jpeg'}"
             return FileResponse(
                 str(file_path), media_type=media,
                 headers={"Cache-Control": "public, max-age=86400"},

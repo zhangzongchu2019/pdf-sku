@@ -124,6 +124,30 @@ def _contains_letters(text: str) -> bool:
     return bool(re.search(r"[A-Za-z\u4e00-\u9fff]", text))
 
 
+def _looks_like_ocr_title_text(text: str) -> bool:
+    normalized = _normalize_text(text)
+    if len(normalized) < 2:
+        return False
+    if re.search(r"[_\"“”'`~!?,，。；;:：]", normalized):
+        return False
+    chinese_parts = re.findall(r"[\u4e00-\u9fff]+", normalized)
+    english_parts = re.findall(r"[A-Za-z]+(?:[-'][A-Za-z]+)?", normalized)
+    if chinese_parts:
+        if len(chinese_parts) != 1:
+            return False
+        if not 2 <= len(chinese_parts[0]) <= 12:
+            return False
+    if english_parts:
+        joined_english = " ".join(english_parts)
+        if len(joined_english) < 4 or len(joined_english) > 32:
+            return False
+        if len(english_parts) == 1 and english_parts[0].isupper():
+            return False
+    if not chinese_parts and not english_parts:
+        return False
+    return True
+
+
 def _canonical_product_name(title_text: str, model_number: str) -> str:
     title_text = _normalize_text(title_text)
     model_upper = (model_number or "").upper()
@@ -139,7 +163,11 @@ def _is_title_line(line: EvidenceObject, baseline_font_size: float) -> bool:
     text = _normalize_text(line.text)
     if not text or _is_page_marker(text) or _extract_model_token(text) or _is_spec_line(text):
         return False
+    if len(text) < 2:
+        return False
     if not _contains_letters(text):
+        return False
+    if line.source == "ocr_text" and not _looks_like_ocr_title_text(text):
         return False
     if len(text) > 72:
         return False
@@ -675,6 +703,12 @@ class ModelAnchorExtractor:
         best: tuple[float, EvidenceObject] | None = None
         for title in candidates:
             dx = abs(_center(anchor.bbox)[0] - _center(title.bbox)[0])
+            if (
+                title.source == "ocr_text"
+                and title.bbox[3] < anchor.bbox[1]
+                and (anchor.bbox[1] - title.bbox[3]) > max(180.0, page_width * 0.12)
+            ):
+                continue
             score = dx * 0.35
             if title.bbox[1] > anchor.bbox[3]:
                 gap = title.bbox[1] - anchor.bbox[3]

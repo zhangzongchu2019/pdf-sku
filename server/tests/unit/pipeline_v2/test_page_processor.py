@@ -1,7 +1,10 @@
 """pipeline_v2 PageProcessor 测试。"""
 from __future__ import annotations
 
+import io
+
 import pytest
+from PIL import Image as PILImage, ImageDraw
 
 from pdf_sku.llm_adapter.client.base import LLMResponse
 from pdf_sku.pipeline.catalog_profiler import CatalogProfile
@@ -14,6 +17,7 @@ from pdf_sku.pipeline_v2.models import DocumentHints, EvidenceObject, PageEviden
 from pdf_sku.pipeline_v2.page_processor import PageProcessor
 from pdf_sku.pipeline_v2.page_verifier import PageVerifier
 from pdf_sku.pipeline_v2.region_refiner import RegionRefiner
+from pdf_sku.pipeline_v2.scene_image_splitter import SceneImageSplitter
 from pdf_sku.settings import settings
 
 
@@ -127,6 +131,180 @@ def test_model_anchor_extractor_prefers_precise_pdf_text_over_ocr_noise():
     assert skus[0].attributes["specs"] == "H 89 cm W 49 cm D 41 cm"
     assert len(bindings) == 1
     assert bindings[0].image_id == "img-main"
+
+
+def test_model_anchor_extractor_keeps_product_name_empty_for_ocr_noise_title():
+    extractor = ModelAnchorExtractor()
+    evidence = PageEvidence(
+        page_no=1,
+        page_width=1606,
+        page_height=1100,
+        raw=ParsedPageIR(
+            page_no=1,
+            images=[
+                ImageInfo(
+                    image_id="scene-main",
+                    bbox=(0, 0, 1606, 1100),
+                    width=1606,
+                    height=1100,
+                    search_eligible=True,
+                ),
+            ],
+            metadata=PageMetadata(page_width=1606, page_height=1100),
+        ),
+        objects=[
+            EvidenceObject(
+                object_id="ocr-noise",
+                object_type="ocr_block",
+                bbox=(980, 270, 1132, 493),
+                text="厂",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-model",
+                object_type="ocr_block",
+                bbox=(1284, 916, 1383, 940),
+                text="SC-9901",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-spec-1",
+                object_type="ocr_block",
+                bbox=(1283, 940, 1485, 964),
+                text="单人位：1170*920*890mm",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-spec-2",
+                object_type="ocr_block",
+                bbox=(1282, 958, 1484, 981),
+                text="三人位：2170*920*890mm",
+                source="ocr_text",
+            ),
+        ],
+    )
+
+    skus, _bindings = extractor.extract(evidence)
+
+    assert len(skus) == 1
+    assert skus[0].attributes["model_number"] == "SC-9901"
+    assert "product_name" not in skus[0].attributes
+
+
+def test_model_anchor_extractor_keeps_product_name_empty_for_ocr_slogan():
+    extractor = ModelAnchorExtractor()
+    evidence = PageEvidence(
+        page_no=1,
+        page_width=1606,
+        page_height=1100,
+        raw=ParsedPageIR(
+            page_no=1,
+            images=[
+                ImageInfo(
+                    image_id="scene-main",
+                    bbox=(0, 0, 1606, 1100),
+                    width=1606,
+                    height=1100,
+                    search_eligible=True,
+                ),
+            ],
+            metadata=PageMetadata(page_width=1606, page_height=1100),
+        ),
+        objects=[
+            EvidenceObject(
+                object_id="ocr-slogan",
+                object_type="ocr_block",
+                bbox=(903, 796, 1120, 839),
+                text="Sit in peace_",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-model",
+                object_type="ocr_block",
+                bbox=(1310, 789, 1410, 811),
+                text="SC-2316",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-spec-1",
+                object_type="ocr_block",
+                bbox=(1310, 811, 1512, 832),
+                text="单人位：1010*830*850mm",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-spec-2",
+                object_type="ocr_block",
+                bbox=(1310, 828, 1512, 848),
+                text="三人位：1880*820*850mm",
+                source="ocr_text",
+            ),
+        ],
+    )
+
+    skus, _bindings = extractor.extract(evidence)
+
+    assert len(skus) == 1
+    assert skus[0].attributes["model_number"] == "SC-2316"
+    assert "product_name" not in skus[0].attributes
+
+
+def test_model_anchor_extractor_keeps_product_name_empty_for_far_ocr_phrase():
+    extractor = ModelAnchorExtractor()
+    evidence = PageEvidence(
+        page_no=1,
+        page_width=1606,
+        page_height=1100,
+        raw=ParsedPageIR(
+            page_no=1,
+            images=[
+                ImageInfo(
+                    image_id="scene-main",
+                    bbox=(0, 0, 1606, 1100),
+                    width=1606,
+                    height=1100,
+                    search_eligible=True,
+                ),
+            ],
+            metadata=PageMetadata(page_width=1606, page_height=1100),
+        ),
+        objects=[
+            EvidenceObject(
+                object_id="ocr-phrase",
+                object_type="ocr_block",
+                bbox=(1119, 182, 1182, 199),
+                text="雅致与精细",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-model",
+                object_type="ocr_block",
+                bbox=(1121, 506, 1222, 531),
+                text="SC-2318",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-spec-1",
+                object_type="ocr_block",
+                bbox=(1125, 532, 1320, 556),
+                text="单人位：840*840*850mm",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-spec-2",
+                object_type="ocr_block",
+                bbox=(1125, 549, 1328, 572),
+                text="三人位：1850*840*850mm",
+                source="ocr_text",
+            ),
+        ],
+    )
+
+    skus, _bindings = extractor.extract(evidence)
+
+    assert len(skus) == 1
+    assert skus[0].attributes["model_number"] == "SC-2318"
+    assert "product_name" not in skus[0].attributes
 
 
 def test_model_anchor_extractor_matches_models_to_nearest_local_images():
@@ -324,6 +502,194 @@ def test_model_anchor_extractor_recalls_local_companions_without_crossing_h_vari
     assert binding_groups["HR-WOOD5115H"] == ["img-rope-high"]
 
 
+def _scene_image_bytes() -> bytes:
+    img = PILImage.new("RGB", (900, 600), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((45, 50, 855, 545), fill=(220, 220, 220))
+    draw.rectangle((60, 160, 230, 470), fill=(95, 95, 95))
+    draw.rectangle((325, 110, 590, 430), fill=(120, 120, 120))
+    draw.rectangle((665, 160, 840, 470), fill=(95, 95, 95))
+    draw.rectangle((350, 435, 560, 515), fill=(75, 75, 75))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
+def _wide_scene_panel_bytes(*, with_inset: bool = False) -> bytes:
+    img = PILImage.new("RGB", (1200, 800), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((50, 60, 1150, 560), fill=(220, 220, 220))
+    draw.rectangle((110, 260, 300, 520), fill=(95, 95, 95))
+    draw.rectangle((430, 180, 760, 500), fill=(110, 110, 110))
+    draw.rectangle((860, 260, 1060, 520), fill=(95, 95, 95))
+    draw.rectangle((470, 470, 700, 545), fill=(70, 70, 70))
+    if with_inset:
+        draw.rectangle((120, 620, 430, 760), fill=(205, 205, 205))
+        draw.rectangle((160, 655, 255, 745), fill=(95, 95, 95))
+        draw.rectangle((275, 640, 395, 748), fill=(110, 110, 110))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
+def _scene_image_with_detached_text_bytes() -> bytes:
+    img = PILImage.new("RGB", (1200, 800), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((60, 60, 1020, 640), fill=(225, 225, 225))
+    draw.rectangle((110, 260, 320, 560), fill=(95, 95, 95))
+    draw.rectangle((430, 180, 760, 500), fill=(110, 110, 110))
+    draw.rectangle((820, 260, 980, 560), fill=(95, 95, 95))
+    draw.rectangle((1030, 675, 1120, 690), fill=(20, 20, 20))
+    draw.rectangle((1030, 708, 1160, 720), fill=(50, 50, 50))
+    draw.rectangle((1030, 735, 1170, 747), fill=(50, 50, 50))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
+def _wide_scene_with_inset_and_text_bytes() -> bytes:
+    img = PILImage.new("RGB", (1400, 900), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((70, 70, 1120, 620), fill=(220, 220, 220))
+    draw.rectangle((150, 250, 360, 540), fill=(95, 95, 95))
+    draw.rectangle((470, 180, 810, 500), fill=(110, 110, 110))
+    draw.rectangle((880, 250, 1050, 540), fill=(95, 95, 95))
+    draw.rectangle((90, 690, 520, 845), fill=(205, 205, 205))
+    draw.rectangle((160, 730, 305, 825), fill=(95, 95, 95))
+    draw.rectangle((330, 715, 465, 830), fill=(110, 110, 110))
+    draw.rectangle((760, 705, 1030, 745), fill=(40, 40, 40))
+    draw.rectangle((1090, 700, 1270, 728), fill=(40, 40, 40))
+    draw.rectangle((1090, 748, 1310, 776), fill=(65, 65, 65))
+    draw.rectangle((1090, 793, 1330, 821), fill=(65, 65, 65))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
+def test_scene_image_splitter_can_split_single_large_scene(monkeypatch):
+    splitter = SceneImageSplitter()
+    images = splitter.extract(
+        ImageInfo(
+            image_id="scene-full",
+            bbox=(0, 0, 900, 600),
+            data=_scene_image_bytes(),
+            width=900,
+            height=600,
+            short_edge=600,
+            search_eligible=True,
+        ),
+        page_no=1,
+        page_width=900,
+        page_height=600,
+    )
+
+    assert len(images) == 1
+    assert all(image.search_eligible for image in images)
+    assert all(image.data for image in images)
+    assert all(image.width < 900 and image.height < 600 for image in images)
+
+
+def test_scene_image_splitter_can_split_wide_scene_without_text_hint(monkeypatch):
+    splitter = SceneImageSplitter()
+    images = splitter.extract(
+        ImageInfo(
+            image_id="scene-wide",
+            bbox=(0, 0, 1200, 800),
+            data=_wide_scene_panel_bytes(),
+            width=1200,
+            height=800,
+            short_edge=800,
+            search_eligible=True,
+        ),
+        page_no=1,
+        page_width=1200,
+        page_height=800,
+    )
+
+    assert len(images) == 1
+    assert all(image.data for image in images)
+    assert images[0].width < 1200
+    assert images[0].height < 800
+
+
+def test_scene_image_splitter_keeps_inset_panel_alongside_scene_split(monkeypatch):
+    splitter = SceneImageSplitter()
+    images = splitter.extract(
+        ImageInfo(
+            image_id="scene-wide",
+            bbox=(0, 0, 1200, 800),
+            data=_wide_scene_panel_bytes(with_inset=True),
+            width=1200,
+            height=800,
+            short_edge=800,
+            search_eligible=True,
+        ),
+        page_no=1,
+        page_width=1200,
+        page_height=800,
+    )
+
+    assert len(images) == 2
+    assert images[0].width < 1200
+    assert images[0].height < 800
+    assert images[1].width < images[0].width
+    assert images[1].height < images[0].height
+
+
+def test_scene_image_splitter_prefers_single_main_panel_over_detached_text(monkeypatch):
+    splitter = SceneImageSplitter()
+    images = splitter.extract(
+        ImageInfo(
+            image_id="scene-with-text",
+            bbox=(0, 0, 1200, 800),
+            data=_scene_image_with_detached_text_bytes(),
+            width=1200,
+            height=800,
+            short_edge=800,
+            search_eligible=True,
+        ),
+        page_no=1,
+        page_width=1200,
+        page_height=800,
+        text_boxes=[
+            (1030, 675, 1120, 690),
+            (1030, 708, 1160, 720),
+            (1030, 735, 1170, 747),
+        ],
+    )
+
+    assert len(images) == 1
+    assert images[0].width < 1100
+    assert images[0].height < 700
+
+
+def test_scene_image_splitter_keeps_inset_panel_when_detached_text_exists(monkeypatch):
+    splitter = SceneImageSplitter()
+    images = splitter.extract(
+        ImageInfo(
+            image_id="scene-inset-text",
+            bbox=(0, 0, 1400, 900),
+            data=_wide_scene_with_inset_and_text_bytes(),
+            width=1400,
+            height=900,
+            short_edge=900,
+            search_eligible=True,
+        ),
+        page_no=4,
+        page_width=1400,
+        page_height=900,
+        text_boxes=[
+            (760, 705, 1030, 745),
+            (1090, 700, 1270, 728),
+            (1090, 748, 1310, 776),
+            (1090, 793, 1330, 821),
+        ],
+    )
+
+    assert len(images) == 2
+    assert images[0].width > images[1].width
+
+
 def _table_page_one() -> ParsedPageIR:
     headers = ["商品名称/描述", "售价", "颜色"]
     rows = [
@@ -493,6 +859,49 @@ async def test_v2_regular_page_outputs_visual_only_regions():
     assert len(result.skus) == 2
     assert all(sku.attributes["evidence_mode"] == "visual_only" for sku in result.skus)
     assert legacy.calls == []
+
+
+@pytest.mark.asyncio
+async def test_v2_regular_page_single_large_image_can_emit_scene_subimages(monkeypatch):
+    processor = PageProcessor(allow_legacy_fallback=False)
+
+    async def fake_extract(file_path: str, page_no: int) -> ParsedPageIR:
+        return ParsedPageIR(
+            page_no=1,
+            text_blocks=[
+                TextBlock(content="SC-9901", bbox=(680, 520, 820, 550)),
+                TextBlock(content="单人位：1170*920*890mm", bbox=(680, 555, 860, 580)),
+                TextBlock(content="三人位：2170*920*890mm", bbox=(680, 585, 860, 610)),
+            ],
+            images=[
+                ImageInfo(
+                    image_id="scene-full",
+                    bbox=(0, 0, 900, 600),
+                    data=_scene_image_bytes(),
+                    width=900,
+                    height=600,
+                    short_edge=600,
+                    search_eligible=True,
+                )
+            ],
+            raw_text="SC-9901 单人位：1170*920*890mm 三人位：2170*920*890mm",
+            metadata=PageMetadata(page_width=900, page_height=600),
+        )
+
+    processor._extract_page = fake_extract
+
+    result = await processor.process_page(
+        job_id="job-scene-subimages",
+        file_path="/tmp/fake.pdf",
+        page_no=1,
+        file_hash="scene1234",
+    )
+
+    assert result.status == "AI_COMPLETED"
+    assert len(result.skus) == 1
+    bound_image_ids = [binding.image_id for binding in result.bindings if binding.image_id]
+    assert len(bound_image_ids) == 1
+    assert all(image_id.startswith("p1_scene_") for image_id in bound_image_ids)
 
 
 @pytest.mark.asyncio

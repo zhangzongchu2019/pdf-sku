@@ -23,6 +23,7 @@ from .model_anchor_extractor import ModelAnchorExtractor
 from .page_verifier import PageVerifier
 from .region_proposer import RegionProposer
 from .region_refiner import RegionRefiner
+from .scene_image_splitter import SceneImageSplitter
 from .table_preprocessor import TablePreprocessor
 
 logger = structlog.get_logger()
@@ -126,6 +127,7 @@ class PageProcessor:
         self._region_refiner = RegionRefiner(llm_service=llm_service)
         self._region_extractor = RegionAttributeExtractor()
         self._page_verifier = PageVerifier(llm_service=llm_service)
+        self._scene_splitter = SceneImageSplitter()
         self._id_gen = SKUIdGenerator()
         self._ocr_engine = OcrEngine()
         self._job_contexts: dict[str, TableDocumentContext] = {}
@@ -400,6 +402,51 @@ class PageProcessor:
             reverse=True,
         )
         return ranked[0] if ranked else None
+
+    @staticmethod
+    def _is_full_page_image(image: ImageInfo, raw: ParsedPageIR) -> bool:
+        if image.bbox == (0, 0, 0, 0):
+            return False
+        page_area = max(1.0, raw.metadata.page_width * raw.metadata.page_height)
+        image_area = max(0.0, image.bbox[2] - image.bbox[0]) * max(0.0, image.bbox[3] - image.bbox[1])
+        return image_area / page_area >= 0.55
+
+    def _scene_image_group_for_single_sku(
+        self,
+        raw: ParsedPageIR,
+        skus: list[SKUResult],
+        *,
+        page_no: int,
+    ) -> list[list[str]] | None:
+        if len(skus) != 1:
+            return None
+        eligible = [
+            image for image in raw.images
+            if image.search_eligible and image.data and self._is_full_page_image(image, raw)
+        ]
+        if len(eligible) != 1:
+            return None
+
+        original = eligible[0]
+        split_images = self._scene_splitter.extract(
+            original,
+            page_no=page_no,
+            page_width=raw.metadata.page_width,
+            page_height=raw.metadata.page_height,
+            raw_text=raw.raw_text,
+            text_boxes=[
+                block.bbox
+                for block in raw.text_blocks
+                if (block.content or "").strip()
+            ],
+        )
+        if not split_images:
+            return None
+
+        original.role = "scene_full"
+        original.search_eligible = False
+        raw.images.extend(split_images)
+        return [[image.image_id for image in split_images if image.image_id]]
 
     @staticmethod
     def _bboxes_intersect(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
@@ -688,6 +735,13 @@ class PageProcessor:
                 preferred_image_groups.append(current_group)
             while len(preferred_image_groups) < len(model_skus):
                 preferred_image_groups.append([])
+            scene_groups = self._scene_image_group_for_single_sku(
+                raw,
+                model_skus,
+                page_no=page_no,
+            )
+            if scene_groups:
+                preferred_image_groups = scene_groups
             return self._build_regular_page_result(
                 raw,
                 evidence=evidence,
@@ -732,6 +786,12 @@ class PageProcessor:
                 document_hints=document_hints,
             )
 
+        preferred_image_groups = self._scene_image_group_for_single_sku(
+            raw,
+            skus,
+            page_no=page_no,
+        )
+
         return self._build_regular_page_result(
             raw,
             evidence=evidence,
@@ -739,4 +799,5 @@ class PageProcessor:
             skus=skus,
             file_hash=file_hash,
             page_no=page_no,
+            preferred_image_groups=preferred_image_groups,
         )
