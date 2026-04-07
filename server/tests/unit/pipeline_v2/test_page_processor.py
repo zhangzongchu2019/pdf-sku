@@ -962,6 +962,20 @@ def _triple_panel_scene_bytes() -> bytes:
     return buf.getvalue()
 
 
+def _two_panel_scene_with_left_text_bytes() -> bytes:
+    img = PILImage.new("RGB", (1200, 800), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((60, 420, 500, 760), fill=(110, 110, 110))
+    draw.rectangle((700, 80, 1140, 760), fill=(140, 140, 140))
+    draw.rectangle((25, 24, 170, 34), fill=(25, 25, 25))
+    draw.rectangle((120, 110, 360, 150), fill=(20, 20, 20))
+    draw.rectangle((120, 180, 500, 215), fill=(40, 40, 40))
+    draw.rectangle((120, 240, 520, 275), fill=(40, 40, 40))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
 def test_scene_image_splitter_can_split_single_large_scene(monkeypatch):
     splitter = SceneImageSplitter()
     images = splitter.extract(
@@ -1107,6 +1121,34 @@ def test_scene_image_splitter_can_split_three_panel_montage():
     assert len(images) == 3
     widths = sorted((image.width for image in images), reverse=True)
     assert widths[0] > widths[1] >= widths[2]
+
+
+def test_scene_image_splitter_refines_split_panel_without_reintroducing_text():
+    splitter = SceneImageSplitter()
+    images = splitter.extract(
+        ImageInfo(
+            image_id="scene-two",
+            bbox=(0, 0, 1200, 800),
+            data=_two_panel_scene_with_left_text_bytes(),
+            width=1200,
+            height=800,
+            short_edge=800,
+            search_eligible=True,
+        ),
+        page_no=1,
+        page_width=1200,
+        page_height=800,
+        text_boxes=[
+            (120, 110, 360, 150),
+            (120, 180, 500, 215),
+            (120, 240, 520, 275),
+        ],
+    )
+
+    assert len(images) == 2
+    left, right = sorted(images, key=lambda image: image.bbox[0])
+    assert left.bbox[1] > 300
+    assert right.bbox[1] < 120
 
 
 def test_page_processor_assigns_split_scene_panels_to_multiple_skus():

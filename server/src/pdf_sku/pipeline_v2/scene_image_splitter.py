@@ -27,6 +27,69 @@ def _trim_near_white_bbox(
     return (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
 
 
+def _trim_significant_foreground_bbox(
+    pil_img: PILImage.Image,
+    *,
+    threshold: int = 245,
+    max_edge: int = 512,
+) -> tuple[int, int, int, int] | None:
+    mask, scale = _mask_from_image(
+        pil_img,
+        threshold=threshold,
+        max_edge=max_edge,
+    )
+    sample_h, sample_w = mask.shape
+    if sample_h == 0 or sample_w == 0:
+        return None
+
+    visited = np.zeros_like(mask, dtype=bool)
+    components: list[tuple[int, int, int, int, int]] = []
+    for y in range(sample_h):
+        for x in range(sample_w):
+            if not mask[y, x] or visited[y, x]:
+                continue
+            queue: deque[tuple[int, int]] = deque([(x, y)])
+            visited[y, x] = True
+            min_x = max_x = x
+            min_y = max_y = y
+            area = 0
+            while queue:
+                cx, cy = queue.pop()
+                area += 1
+                min_x = min(min_x, cx)
+                max_x = max(max_x, cx)
+                min_y = min(min_y, cy)
+                max_y = max(max_y, cy)
+                for ny in range(max(0, cy - 1), min(sample_h, cy + 2)):
+                    for nx in range(max(0, cx - 1), min(sample_w, cx + 2)):
+                        if visited[ny, nx] or not mask[ny, nx]:
+                            continue
+                        visited[ny, nx] = True
+                        queue.append((nx, ny))
+            components.append((min_x, min_y, max_x + 1, max_y + 1, area))
+
+    if not components:
+        return None
+
+    largest_area = max(area for *_bbox, area in components)
+    total_pixels = max(1, sample_w * sample_h)
+    kept = [
+        (x0, y0, x1, y1)
+        for x0, y0, x1, y1, area in components
+        if area >= max(largest_area * 0.12, total_pixels * 0.0025)
+    ]
+    if not kept:
+        return None
+
+    scale = max(scale, 1e-6)
+    return (
+        max(0, int(math.floor(min(box[0] for box in kept) / scale))),
+        max(0, int(math.floor(min(box[1] for box in kept) / scale))),
+        min(pil_img.size[0], int(math.ceil(max(box[2] for box in kept) / scale))),
+        min(pil_img.size[1], int(math.ceil(max(box[3] for box in kept) / scale))),
+    )
+
+
 def _mask_from_image(
     pil_img: PILImage.Image,
     *,
@@ -287,10 +350,15 @@ class SceneImageSplitter:
     def _refine_crop_bbox(
         pil_img: PILImage.Image,
         bbox: tuple[int, int, int, int],
+        *,
+        refine_img: PILImage.Image | None = None,
     ) -> tuple[int, int, int, int]:
         x0, y0, x1, y1 = bbox
-        crop = pil_img.crop((x0, y0, x1, y1))
-        trimmed = _trim_near_white_bbox(crop)
+        crop_source = refine_img if refine_img is not None else pil_img
+        crop = crop_source.crop((x0, y0, x1, y1))
+        trimmed = _trim_significant_foreground_bbox(crop)
+        if trimmed is None:
+            trimmed = _trim_near_white_bbox(crop)
         if trimmed is None:
             return bbox
         tx0, ty0, tx1, ty1 = trimmed
@@ -301,6 +369,7 @@ class SceneImageSplitter:
         cls,
         *,
         base_img: PILImage.Image,
+        refine_img: PILImage.Image,
         panel_bboxes: Iterable[tuple[int, int, int, int]],
         pad: int,
         page_box: tuple[float, float, float, float],
@@ -316,7 +385,11 @@ class SceneImageSplitter:
                 img_width=img_width,
                 img_height=img_height,
             )
-            crop_bbox = cls._refine_crop_bbox(base_img, crop_bbox)
+            crop_bbox = cls._refine_crop_bbox(
+                base_img,
+                crop_bbox,
+                refine_img=refine_img,
+            )
             crop = base_img.crop(crop_bbox)
             if crop.width < img_width * 0.12 or crop.height < img_height * 0.12:
                 continue
@@ -391,6 +464,7 @@ class SceneImageSplitter:
             if len(whitespace_panels) >= 2:
                 images = self._build_images_from_bboxes(
                     base_img=base_img,
+                    refine_img=panel_source,
                     panel_bboxes=whitespace_panels,
                     pad=pad,
                     page_box=page_box,
@@ -405,6 +479,7 @@ class SceneImageSplitter:
             if len(panel_bboxes) >= 2:
                 images = self._build_images_from_bboxes(
                     base_img=base_img,
+                    refine_img=panel_source,
                     panel_bboxes=panel_bboxes,
                     pad=pad,
                     page_box=page_box,
@@ -417,7 +492,11 @@ class SceneImageSplitter:
 
             if len(panel_bboxes) == 1:
                 panel_bbox = self._expand_bbox(panel_bboxes[0], pad=pad, img_width=img_width, img_height=img_height)
-                panel_bbox = self._refine_crop_bbox(base_img, panel_bbox)
+                panel_bbox = self._refine_crop_bbox(
+                    base_img,
+                    panel_bbox,
+                    refine_img=panel_source,
+                )
                 x0, y0, x1, y1 = panel_bbox
                 panel_area = max(1, (x1 - x0) * (y1 - y0))
                 img_area = max(1, img_width * img_height)
