@@ -19,6 +19,7 @@ from pdf_sku.pipeline_v2.page_processor import PageProcessor
 from pdf_sku.pipeline_v2.page_verifier import PageVerifier
 from pdf_sku.pipeline_v2.region_refiner import RegionRefiner
 from pdf_sku.pipeline_v2.scene_image_splitter import SceneImageSplitter
+from pdf_sku.pipeline_v2.table_preprocessor import TablePreprocessor
 from pdf_sku.settings import settings
 
 
@@ -1178,6 +1179,153 @@ def _table_page_two() -> ParsedPageIR:
         raw_text="山丘沙发 1299 浅灰",
         metadata=PageMetadata(page_width=300, page_height=500),
     )
+
+
+def _image_table_precise_lines() -> list[TextBlock]:
+    return [
+        TextBlock(content="型号", bbox=(180, 78, 210, 90)),
+        TextBlock(content="名称", bbox=(240, 78, 270, 90)),
+        TextBlock(content="尺寸", bbox=(320, 78, 350, 90)),
+        TextBlock(content="单价", bbox=(410, 78, 440, 90)),
+        TextBlock(content="材质说明", bbox=(488, 78, 540, 90)),
+        TextBlock(content="1", bbox=(15, 110, 25, 120)),
+        TextBlock(content="656", bbox=(185, 110, 205, 120)),
+        TextBlock(content="茶几", bbox=(240, 110, 270, 120)),
+        TextBlock(content="1300*700*430-650", bbox=(300, 110, 385, 120)),
+        TextBlock(content="1,180", bbox=(410, 110, 438, 120)),
+        TextBlock(content="山海白#微晶石", bbox=(480, 110, 548, 120)),
+        TextBlock(content="2", bbox=(15, 146, 25, 156)),
+        TextBlock(content="719", bbox=(185, 146, 205, 156)),
+        TextBlock(content="功夫茶几", bbox=(235, 146, 280, 156)),
+        TextBlock(content="1310-1600*面板宽670*", bbox=(287, 128, 392, 140)),
+        TextBlock(content="面板高545", bbox=(315, 142, 380, 154)),
+        TextBlock(content="(柜子：510*710*625)", bbox=(290, 156, 392, 168)),
+        TextBlock(content="(皮凳：425*330*350)", bbox=(290, 170, 386, 182)),
+        TextBlock(content="1,580", bbox=(410, 146, 438, 156)),
+        TextBlock(content="枫丹白露#微晶石", bbox=(474, 146, 542, 156)),
+    ]
+
+
+def _image_table_page() -> ParsedPageIR:
+    return ParsedPageIR(
+        page_no=1,
+        text_blocks=[
+            TextBlock(
+                content="collapsed image table",
+                bbox=(0, 0, 600, 800),
+            )
+        ],
+        images=[
+            ImageInfo(
+                image_id="img-row-1",
+                bbox=(40, 92, 160, 142),
+                width=1000,
+                height=580,
+                short_edge=580,
+                search_eligible=True,
+            ),
+            ImageInfo(
+                image_id="img-row-2",
+                bbox=(40, 132, 160, 182),
+                width=1000,
+                height=640,
+                short_edge=640,
+                search_eligible=True,
+            ),
+        ],
+        raw_text="\n".join(
+            [
+                "广东龙图家具有限公司报价表",
+                "型号",
+                "名称",
+                "尺寸",
+                "单价",
+                "材质说明",
+                "1",
+                "656",
+                "茶几",
+                "1300*700*430-650",
+                "1,180",
+                "山海白#微晶石",
+                "2",
+                "719",
+                "功夫茶几",
+                "1310-1600*面板宽670*",
+                "面板高545",
+                "(柜子：510*710*625)",
+                "(皮凳：425*330*350)",
+                "1,580",
+                "枫丹白露#微晶石",
+            ]
+        ),
+        metadata=PageMetadata(page_width=600, page_height=800),
+    )
+
+
+def test_table_preprocessor_extracts_rows_from_precise_lines_with_multiline_specs():
+    raw = _image_table_page()
+    preprocessor = TablePreprocessor()
+    schema = preprocessor.build_schema(raw, source_page=1)
+
+    assert schema is not None
+
+    rows = preprocessor.extract_rows(
+        raw,
+        schema,
+        precise_text_lines=_image_table_precise_lines(),
+    )
+
+    assert [row.row_index for row in rows] == [1, 2]
+    assert rows[0].values["model_number"] == "656"
+    assert rows[0].values["product_name"] == "茶几"
+    assert rows[0].values["price"] == "1,180"
+    assert rows[0].values["remark"] == "山海白#微晶石"
+    assert rows[1].values["model_number"] == "719"
+    assert rows[1].values["product_name"] == "功夫茶几"
+    assert rows[1].values["specs"] == "1310-1600*面板宽670* 面板高545 (柜子：510*710*625) (皮凳：425*330*350)"
+    assert rows[1].values["price"] == "1,580"
+
+
+@pytest.mark.asyncio
+async def test_v2_table_image_page_extracts_all_rows_and_binds_nearest_images(monkeypatch):
+    processor = PageProcessor(allow_legacy_fallback=False)
+    raw = _image_table_page()
+
+    async def fake_extract(file_path: str, page_no: int) -> ParsedPageIR:
+        return raw
+
+    async def fake_count_pages(file_path: str) -> int:
+        return 1
+
+    async def fake_precise(file_path: str, page_no: int):
+        return [
+            EvidenceObject(
+                object_id=f"line-{index}",
+                object_type="text_block",
+                bbox=line.bbox,
+                text=line.content,
+                source="pdf_text_precise",
+                font_size=12,
+            )
+            for index, line in enumerate(_image_table_precise_lines(), start=1)
+        ]
+
+    monkeypatch.setattr(processor, "_extract_page", fake_extract)
+    monkeypatch.setattr(processor, "_count_pages", fake_count_pages)
+    monkeypatch.setattr(processor, "_extract_precise_pdf_text_objects", fake_precise)
+
+    result = await processor.process_page(
+        job_id="job-image-table",
+        file_path="/tmp/fake.pdf",
+        page_no=1,
+        file_hash="tableimg1",
+    )
+
+    assert result.status == "AI_COMPLETED"
+    assert result.page_type == "A"
+    assert result.extraction_method == "table_image_rows_v2"
+    assert [sku.attributes["model_number"] for sku in result.skus] == ["656", "719"]
+    assert [binding.image_id for binding in result.bindings] == ["img-row-1", "img-row-2"]
 
 
 @pytest.mark.asyncio

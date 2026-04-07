@@ -13,7 +13,7 @@ from PIL import Image as PILImage
 from pdf_sku.common.image_utils import flatten_for_jpeg
 from pdf_sku.pipeline.exporter.exporter import SKUIdGenerator
 from pdf_sku.pipeline.layout_detector import LayoutRegion, detect_all_regions
-from pdf_sku.pipeline.ir import BindingResult, ImageInfo, PageResult, ParsedPageIR, SKUResult
+from pdf_sku.pipeline.ir import BindingResult, ImageInfo, PageResult, ParsedPageIR, SKUResult, TextBlock
 from pdf_sku.pipeline.parser.adapter import PDFExtractor
 from pdf_sku.pipeline.parser.ocr_engine import OcrBlock, OcrEngine
 from pdf_sku.settings import settings
@@ -222,6 +222,7 @@ class PageProcessor:
         file_hash: str,
     ) -> PageResult:
         raw = context.first_page_raw if page_no == 1 and context.first_page_raw else await self._extract_page(file_path, page_no)
+        self._prepare_images(raw)
         schema = context.schema
         if schema is None:
             return PageResult(
@@ -230,7 +231,23 @@ class PageProcessor:
                 needs_review=True,
             )
 
-        rows = self._table.extract_rows(raw, schema)
+        precise_text_lines: list[TextBlock] = []
+        if not raw.tables:
+            try:
+                precise_objects = await self._extract_precise_pdf_text_objects(file_path, page_no)
+                precise_text_lines = [
+                    TextBlock(content=obj.text, bbox=obj.bbox, font_size=obj.font_size)
+                    for obj in precise_objects
+                    if (obj.text or "").strip()
+                ]
+            except Exception:
+                precise_text_lines = []
+
+        rows = self._table.extract_rows(
+            raw,
+            schema,
+            precise_text_lines=precise_text_lines,
+        )
         if not rows and self._llm:
             screenshot = None
             try:
@@ -265,6 +282,14 @@ class PageProcessor:
             page_no=page_no,
             page_height=raw.metadata.page_height or 1.0,
         )
+        bindings = self._build_table_bindings(raw, rows, skus)
+
+        extraction_method = "table_schema_v2"
+        row_sources = {row.source for row in rows}
+        if "precise_text_lines" in row_sources:
+            extraction_method = "table_image_rows_v2"
+        elif "llm_table_fallback" in row_sources:
+            extraction_method = "table_fallback_v2"
 
         logger.info(
             "pipeline_v2_table_page_processed",
@@ -279,9 +304,9 @@ class PageProcessor:
             needs_review=not bool(skus),
             skus=skus,
             images=raw.images,
-            bindings=[],
+            bindings=bindings,
             classification_confidence=1.0,
-            extraction_method="table_schema_v2",
+            extraction_method=extraction_method,
             fitz_page_class="TABLE",
         )
 
@@ -452,6 +477,54 @@ class PageProcessor:
             reverse=True,
         )
         return ranked[0] if ranked else None
+
+    @staticmethod
+    def _build_table_bindings(
+        raw: ParsedPageIR,
+        rows,
+        skus: list[SKUResult],
+    ) -> list[BindingResult]:
+        eligible_images = [
+            image
+            for image in raw.images
+            if image.search_eligible and image.image_id and image.bbox != (0, 0, 0, 0)
+        ]
+        if not eligible_images:
+            return [
+                BindingResult(
+                    sku_id=sku.sku_id,
+                    image_id=None,
+                    confidence=0.0,
+                    method="table_row_image",
+                    is_ambiguous=False,
+                    rank=1,
+                )
+                for sku in skus
+            ]
+
+        bindings: list[BindingResult] = []
+        for row, sku in zip(rows, skus, strict=False):
+            row_center_y = (row.bbox[1] + row.bbox[3]) / 2 if row.bbox != (0, 0, 0, 0) else 0.0
+            row_center_x = (row.bbox[0] + row.bbox[2]) / 2 if row.bbox != (0, 0, 0, 0) else 0.0
+            best = min(
+                eligible_images,
+                key=lambda image: (
+                    abs(((image.bbox[1] + image.bbox[3]) / 2) - row_center_y),
+                    abs(((image.bbox[0] + image.bbox[2]) / 2) - row_center_x),
+                ),
+            )
+            best.role = "product_main"
+            bindings.append(
+                BindingResult(
+                    sku_id=sku.sku_id,
+                    image_id=best.image_id,
+                    confidence=0.86,
+                    method="table_row_image",
+                    is_ambiguous=False,
+                    rank=1,
+                )
+            )
+        return bindings
 
     @staticmethod
     def _is_full_page_image(image: ImageInfo, raw: ParsedPageIR) -> bool:

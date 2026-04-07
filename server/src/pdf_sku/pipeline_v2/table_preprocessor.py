@@ -13,7 +13,7 @@ from pdf_sku.pipeline.ir import ParsedPageIR, TextBlock
 from .models import TableRowRecord, TableSchema
 
 _HEADER_ALIASES: dict[str, list[str]] = {
-    "product_name": ["商品名称/描述", "*商品名称/描述", "商品名称", "产品名称", "品名", "商品描述", "product name", "description", "name"],
+    "product_name": ["商品名称/描述", "*商品名称/描述", "商品名称", "产品名称", "名称", "品名", "商品描述", "product name", "description", "name"],
     "price": ["售价", "价格", "单价", "price"],
     "model_number": ["货号", "型号", "编号", "model", "model number", "sku"],
     "product_id": ["商品ID", "product id"],
@@ -31,7 +31,7 @@ _HEADER_ALIASES: dict[str, list[str]] = {
     "campaign_price": ["活动价", "campaign price"],
     "stock": ["库存", "stock"],
     "weight_kg": ["重量(kg)", "重量", "weight(kg)", "weight"],
-    "remark": ["备注(公开)", "备注", "remark"],
+    "remark": ["备注(公开)", "备注", "材质说明", "材质", "remark", "material"],
     "auto_unpublish_time": ["自动下架时间", "auto unpublish time"],
 }
 
@@ -64,6 +64,7 @@ _CANONICAL_HEADER_LOOKUP = {
     for alias in aliases
 }
 _parser = ResponseParser()
+_ROW_SERIAL_RE = re.compile(r"^\d{1,3}$")
 
 
 def _canonicalize(text: str) -> str:
@@ -111,6 +112,18 @@ def _raw_lines(raw_text: str) -> list[str]:
     return [line.strip() for line in (raw_text or "").splitlines() if line.strip()]
 
 
+def _block_text(block: TextBlock) -> str:
+    return (block.content or "").strip()
+
+
+def _block_center_x(block: TextBlock) -> float:
+    return (block.bbox[0] + block.bbox[2]) / 2
+
+
+def _block_center_y(block: TextBlock) -> float:
+    return (block.bbox[1] + block.bbox[3]) / 2
+
+
 def _serialize_table_text(raw: ParsedPageIR) -> list[str]:
     if raw.text_blocks:
         ordered_blocks = sorted(raw.text_blocks, key=lambda block: (block.bbox[1], block.bbox[0]))
@@ -126,7 +139,7 @@ def _pick_header_row_from_raw_text(raw: ParsedPageIR) -> list[str]:
         return []
 
     headers: list[str] = []
-    for line in lines[:8]:
+    for line in lines[:16]:
         if normalize_header(line):
             headers.append(line)
             continue
@@ -312,6 +325,141 @@ def _extract_rows_from_text_blocks(raw: ParsedPageIR, schema: TableSchema) -> li
     return records
 
 
+def _infer_column_centers_from_precise_lines(
+    raw: ParsedPageIR,
+    schema: TableSchema,
+    text_lines: list[TextBlock],
+) -> list[float]:
+    centers: list[float] = []
+    for index, (header, normalized) in enumerate(zip(schema.raw_headers, schema.normalized_headers, strict=False)):
+        if not normalized:
+            centers.append(
+                schema.column_centers[index] if index < len(schema.column_centers) else -1.0
+            )
+            continue
+        header_key = _canonicalize(header) or normalized
+        matches = [
+            _block_center_x(block)
+            for block in text_lines
+            if _canonicalize(block.content) and (
+                normalize_header(block.content) == normalized
+                or header_key in _canonicalize(block.content)
+                or _canonicalize(block.content) in header_key
+            )
+        ]
+        if matches:
+            centers.append(sum(matches) / len(matches))
+        elif index < len(schema.column_centers):
+            centers.append(schema.column_centers[index])
+        else:
+            centers.append(-1.0)
+
+    if any(center < 0 for center in centers) or any(
+        centers[i] >= centers[i + 1]
+        for i in range(len(centers) - 1)
+        if centers[i] >= 0 and centers[i + 1] >= 0
+    ):
+        return _infer_column_centers(raw, schema.raw_headers)
+    return centers
+
+
+def _extract_rows_from_precise_lines(
+    raw: ParsedPageIR,
+    schema: TableSchema,
+    text_lines: list[TextBlock],
+) -> list[TableRowRecord]:
+    if not text_lines:
+        return []
+
+    ordered = sorted(text_lines, key=lambda block: (_block_center_y(block), block.bbox[0]))
+    header_bottom = max(
+        (block.bbox[3] for block in ordered if normalize_header(block.content)),
+        default=0.0,
+    )
+    page_width = max(1.0, _page_width(raw))
+    row_anchors = [
+        block
+        for block in ordered
+        if _ROW_SERIAL_RE.fullmatch(_block_text(block))
+        and block.bbox[0] <= page_width * 0.08
+        and _block_center_y(block) > header_bottom + 8
+    ]
+    if len(row_anchors) < 2:
+        return []
+
+    column_centers = _infer_column_centers_from_precise_lines(raw, schema, ordered)
+    anchor_centers = [_block_center_y(block) for block in row_anchors]
+    records: list[TableRowRecord] = []
+
+    for index, anchor in enumerate(row_anchors):
+        current_center = anchor_centers[index]
+        if index == 0:
+            next_center = anchor_centers[index + 1]
+            start_y = max(header_bottom + 4.0, current_center - (next_center - current_center) * 0.55)
+        else:
+            start_y = (anchor_centers[index - 1] + current_center) / 2
+
+        if index == len(row_anchors) - 1:
+            prev_center = anchor_centers[index - 1]
+            start_y = max(start_y, current_center - (current_center - prev_center) * 0.5)
+            end_y = min(raw.metadata.page_height or current_center + 40.0, current_center + (current_center - prev_center) * 0.8)
+        else:
+            end_y = (current_center + anchor_centers[index + 1]) / 2
+
+        row_blocks = [
+            block
+            for block in ordered
+            if start_y <= _block_center_y(block) < end_y
+            and not normalize_header(block.content)
+        ]
+        if not row_blocks:
+            continue
+
+        cell_buckets: dict[int, list[TextBlock]] = defaultdict(list)
+        for block in row_blocks:
+            text = _block_text(block)
+            if not text:
+                continue
+            if _ROW_SERIAL_RE.fullmatch(text) and block.bbox[0] <= page_width * 0.08:
+                continue
+            target_index = min(
+                range(len(column_centers)),
+                key=lambda column_index: abs(column_centers[column_index] - _block_center_x(block)),
+            )
+            cell_buckets[target_index].append(block)
+
+        cells: list[str] = []
+        for column_index in range(len(schema.normalized_headers)):
+            blocks = sorted(
+                cell_buckets.get(column_index, []),
+                key=lambda block: (_block_center_y(block), block.bbox[0]),
+            )
+            parts = [_block_text(block) for block in blocks if _block_text(block)]
+            cells.append(" ".join(parts))
+
+        if not any(cells):
+            continue
+
+        values = _cells_to_values(cells, schema)
+        if not values:
+            continue
+
+        records.append(
+            TableRowRecord(
+                row_index=int(_block_text(anchor)),
+                values=values,
+                bbox=(
+                    min(block.bbox[0] for block in row_blocks),
+                    min(block.bbox[1] for block in row_blocks),
+                    max(block.bbox[2] for block in row_blocks),
+                    max(block.bbox[3] for block in row_blocks),
+                ),
+                source="precise_text_lines",
+            )
+        )
+    return records
+
+
 def _extract_rows_from_raw_text(raw: ParsedPageIR, schema: TableSchema) -> list[TableRowRecord]:
     lines = _raw_lines(raw.raw_text)
     if not lines:
@@ -345,9 +493,17 @@ def _extract_rows_from_raw_text(raw: ParsedPageIR, schema: TableSchema) -> list[
     return records
 
 
-def extract_table_rows(raw: ParsedPageIR, schema: TableSchema) -> list[TableRowRecord]:
+def extract_table_rows(
+    raw: ParsedPageIR,
+    schema: TableSchema,
+    *,
+    precise_text_lines: list[TextBlock] | None = None,
+) -> list[TableRowRecord]:
     """从当前页恢复表格行。优先结构化表格，再退化到文本块聚行。"""
     records = _extract_rows_from_tables(raw, schema)
+    if records:
+        return records
+    records = _extract_rows_from_precise_lines(raw, schema, precise_text_lines or [])
     if records:
         return records
     records = _extract_rows_from_text_blocks(raw, schema)
@@ -364,6 +520,17 @@ def row_values_to_attributes(values: dict[str, str]) -> dict[str, str]:
     seen_values: set[str] = set()
     for field in _FIELD_ORDER:
         value = str(values.get(field, "") or "").strip()
+        if not value:
+            continue
+        attributes[field] = value
+        if value not in seen_values:
+            ordered_values.append(value)
+            seen_values.add(value)
+
+    for field, raw_value in values.items():
+        if field in attributes:
+            continue
+        value = str(raw_value or "").strip()
         if not value:
             continue
         attributes[field] = value
@@ -388,8 +555,14 @@ class TablePreprocessor:
     def build_schema(self, raw: ParsedPageIR, source_page: int = 1) -> TableSchema | None:
         return build_table_schema(raw, source_page=source_page)
 
-    def extract_rows(self, raw: ParsedPageIR, schema: TableSchema) -> list[TableRowRecord]:
-        return extract_table_rows(raw, schema)
+    def extract_rows(
+        self,
+        raw: ParsedPageIR,
+        schema: TableSchema,
+        *,
+        precise_text_lines: list[TextBlock] | None = None,
+    ) -> list[TableRowRecord]:
+        return extract_table_rows(raw, schema, precise_text_lines=precise_text_lines)
 
     def row_to_attributes(self, row: TableRowRecord) -> dict[str, str]:
         return row_values_to_attributes(row.values)
