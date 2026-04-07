@@ -851,6 +851,157 @@ def test_model_anchor_extractor_cleans_numeric_prefix_from_title_fallback():
     assert skus[0].attributes["product_name"] == "九斗柜"
 
 
+def test_model_anchor_extractor_shares_primary_image_for_same_spu_models():
+    extractor = ModelAnchorExtractor()
+    evidence = PageEvidence(
+        page_no=1,
+        page_width=1600,
+        page_height=1200,
+        raw=ParsedPageIR(
+            page_no=1,
+            images=[
+                ImageInfo(
+                    image_id="img-main",
+                    bbox=(160, 120, 720, 620),
+                    width=900,
+                    height=760,
+                    short_edge=760,
+                    search_eligible=True,
+                ),
+                ImageInfo(
+                    image_id="img-detail",
+                    bbox=(900, 620, 1080, 820),
+                    width=220,
+                    height=240,
+                    short_edge=220,
+                    search_eligible=True,
+                ),
+            ],
+            metadata=PageMetadata(page_width=1600, page_height=1200),
+        ),
+        objects=[
+            EvidenceObject(
+                object_id="title",
+                object_type="ocr_block",
+                bbox=(180, 655, 360, 685),
+                text="云朵沙发",
+                source="ocr_text",
+                font_size=26,
+            ),
+            EvidenceObject(
+                object_id="m1",
+                object_type="ocr_block",
+                bbox=(180, 700, 320, 724),
+                text="型号：A01",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="m2",
+                object_type="ocr_block",
+                bbox=(360, 700, 500, 724),
+                text="型号：A02",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="color",
+                object_type="ocr_block",
+                bbox=(180, 734, 360, 756),
+                text="颜色：胡桃色",
+                source="ocr_text",
+            ),
+        ],
+    )
+
+    skus, bindings = extractor.extract(evidence)
+
+    assert len(skus) == 2
+    groups: list[list[str | None]] = []
+    current: list[str | None] = []
+    for binding in bindings:
+        if binding.rank == 1 and current:
+            groups.append(current)
+            current = []
+        current.append(binding.image_id)
+    if current:
+        groups.append(current)
+
+    assert len(groups) == 2
+    assert groups[0][0] == "img-main"
+    assert groups[1][0] == "img-main"
+
+
+def test_model_anchor_extractor_keeps_all_images_for_single_spu_page():
+    extractor = ModelAnchorExtractor()
+    evidence = PageEvidence(
+        page_no=1,
+        page_width=1600,
+        page_height=1200,
+        raw=ParsedPageIR(
+            page_no=1,
+            images=[
+                ImageInfo(image_id="img-a", bbox=(100, 80, 520, 540), width=500, height=520, short_edge=500, search_eligible=True),
+                ImageInfo(image_id="img-b", bbox=(560, 120, 860, 360), width=300, height=240, short_edge=240, search_eligible=True),
+                ImageInfo(image_id="img-c", bbox=(900, 110, 1180, 330), width=280, height=220, short_edge=220, search_eligible=True),
+            ],
+            metadata=PageMetadata(page_width=1600, page_height=1200),
+        ),
+        objects=[
+            EvidenceObject(
+                object_id="title",
+                object_type="ocr_block",
+                bbox=(120, 620, 320, 650),
+                text="名称：组合沙发",
+                source="ocr_text",
+                font_size=24,
+            ),
+        ],
+    )
+
+    skus, bindings = extractor.extract(evidence)
+
+    assert len(skus) == 1
+    assert [binding.image_id for binding in bindings if binding.image_id] == ["img-a", "img-b", "img-c"]
+
+
+def test_model_anchor_extractor_collapses_multi_model_single_scene_into_spu():
+    extractor = ModelAnchorExtractor()
+    evidence = PageEvidence(
+        page_no=1,
+        page_width=1200,
+        page_height=1500,
+        raw=ParsedPageIR(
+            page_no=1,
+            images=[
+                ImageInfo(
+                    image_id="img-main",
+                    bbox=(40, 80, 1160, 980),
+                    width=1120,
+                    height=900,
+                    short_edge=900,
+                    search_eligible=True,
+                ),
+            ],
+            metadata=PageMetadata(page_width=1200, page_height=1500),
+        ),
+        objects=[
+            EvidenceObject(object_id="m1", object_type="ocr_block", bbox=(90, 1080, 280, 1104), text="Y902#沙发", source="ocr_text"),
+            EvidenceObject(object_id="s1", object_type="ocr_block", bbox=(90, 1110, 430, 1132), text="单人位：800*930*880mm", source="ocr_text"),
+            EvidenceObject(object_id="m2", object_type="ocr_block", bbox=(470, 1080, 620, 1104), text="Y33#茶几", source="ocr_text"),
+            EvidenceObject(object_id="s2", object_type="ocr_block", bbox=(470, 1110, 710, 1132), text="1300*700*420mm", source="ocr_text"),
+            EvidenceObject(object_id="m3", object_type="ocr_block", bbox=(760, 1080, 910, 1104), text="Y35#方几", source="ocr_text"),
+            EvidenceObject(object_id="s3", object_type="ocr_block", bbox=(760, 1110, 980, 1132), text="600*600*420mm", source="ocr_text"),
+        ],
+    )
+
+    skus, bindings = extractor.extract(evidence)
+
+    assert len(skus) == 1
+    merged = skus[0]
+    assert merged.attributes["model_number"] == "Y902# / Y33# / Y35#"
+    assert merged.attributes["product_name"] == "沙发 / 茶几 / 方几"
+    assert [binding.image_id for binding in bindings if binding.image_id] == ["img-main"]
+
+
 def test_region_attribute_extractor_keeps_backpack_name_as_non_label_line():
     extractor = RegionAttributeExtractor()
     evidence = PageEvidence(
@@ -1100,6 +1251,18 @@ def _tile_page_screenshot_bytes() -> bytes:
     return buf.getvalue()
 
 
+def _wide_scene_with_small_inset_bytes() -> bytes:
+    img = PILImage.new("RGB", (1200, 800), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((60, 80, 700, 730), fill=(128, 128, 128))
+    draw.rectangle((830, 120, 1000, 280), fill=(92, 92, 92))
+    draw.rectangle((810, 320, 1160, 350), fill=(20, 20, 20))
+    draw.rectangle((810, 370, 1160, 400), fill=(20, 20, 20))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
 def _tile_page_raw() -> ParsedPageIR:
     images: list[ImageInfo] = []
 
@@ -1266,6 +1429,33 @@ def test_scene_image_splitter_keeps_inset_panel_alongside_scene_split(monkeypatc
     assert images[1].height < images[0].height
 
 
+def test_scene_image_splitter_keeps_small_related_panel_without_text_bleed():
+    splitter = SceneImageSplitter()
+    images = splitter.extract(
+        ImageInfo(
+            image_id="scene-small-inset",
+            bbox=(0, 0, 1200, 800),
+            data=_wide_scene_with_small_inset_bytes(),
+            width=1200,
+            height=800,
+            short_edge=800,
+            search_eligible=True,
+        ),
+        page_no=1,
+        page_width=1200,
+        page_height=800,
+        text_boxes=[
+            (810, 320, 1160, 350),
+            (810, 370, 1160, 400),
+        ],
+    )
+
+    assert len(images) == 2
+    widths = sorted((image.width for image in images))
+    assert widths[0] >= 140
+    assert widths[1] > widths[0]
+
+
 def test_scene_image_splitter_prefers_single_main_panel_over_detached_text(monkeypatch):
     splitter = SceneImageSplitter()
     images = splitter.extract(
@@ -1409,6 +1599,34 @@ def test_page_processor_assigns_split_scene_panels_to_multiple_skus():
     flattened = [image_id for group in groups for image_id in group]
     assert len(flattened) == len(set(flattened))
     assert flattened == ["p1_scene_0", "p1_scene_1", "p1_scene_2"]
+
+
+def test_page_processor_shares_scene_panel_for_same_spu_models():
+    skus = [
+        SKUResult(
+            source_bbox=(140, 600, 280, 670),
+            attributes={"model_number": "A01", "product_name": "云朵沙发"},
+        ),
+        SKUResult(
+            source_bbox=(320, 600, 460, 670),
+            attributes={"model_number": "A02", "product_name": "云朵沙发"},
+        ),
+    ]
+    split_images = [
+        ImageInfo(image_id="p1_scene_0", bbox=(80, 60, 680, 560), width=600, height=500, short_edge=500, search_eligible=True),
+        ImageInfo(image_id="p1_scene_1", bbox=(760, 580, 980, 760), width=220, height=180, short_edge=180, search_eligible=True),
+    ]
+
+    groups = PageProcessor._assign_scene_images_to_skus(
+        skus=skus,
+        split_images=split_images,
+        page_width=1200,
+        page_height=800,
+    )
+
+    assert groups is not None
+    assert groups[0][0] == "p1_scene_0"
+    assert groups[1][0] == "p1_scene_0"
 
 
 def _table_page_one() -> ParsedPageIR:

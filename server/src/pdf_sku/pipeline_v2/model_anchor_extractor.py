@@ -386,6 +386,34 @@ def _contains_letters(text: str) -> bool:
     return bool(re.search(r"[A-Za-z\u4e00-\u9fff]", text))
 
 
+def _dedupe_images(images: list[ImageInfo]) -> list[ImageInfo]:
+    deduped: list[ImageInfo] = []
+    seen_ids: set[str] = set()
+    for image in images:
+        if not image.image_id or image.image_id in seen_ids:
+            continue
+        seen_ids.add(image.image_id)
+        deduped.append(image)
+    return deduped
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        normalized = _normalize_text(value)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped
+
+
+def _bbox_diag(bbox: tuple[float, float, float, float]) -> float:
+    width, height = _size(bbox)
+    return math.hypot(width, height)
+
+
 def _same_row_model_siblings(
     ordered: list[EvidenceObject],
     anchor_index: int,
@@ -615,6 +643,176 @@ class ModelAnchorExtractor:
             product_name_anchors,
         )
 
+    @staticmethod
+    def _record_spu_key(record: dict) -> str | None:
+        label_titles = [
+            cleaned
+            for title in record.get("label_titles", [])
+            if (cleaned := _cleanup_product_name_candidate(title, model_number=record.get("model_number")))
+        ]
+        if label_titles:
+            return " / ".join(dict.fromkeys(label_titles)).lower()
+
+        inline_name = record.get("inline_product_name")
+        if inline_name:
+            cleaned = _cleanup_product_name_candidate(inline_name, model_number=record.get("model_number"))
+            if cleaned:
+                return cleaned.lower()
+
+        title = record.get("title")
+        if title is not None:
+            cleaned = _cleanup_product_name_candidate(title.text, model_number=record.get("model_number"))
+            if cleaned:
+                return cleaned.lower()
+        return None
+
+    @classmethod
+    def _best_image_candidate_for_record(
+        cls,
+        record: dict,
+        *,
+        images: list[ImageInfo],
+        page_width: float,
+        page_height: float,
+    ) -> ImageInfo | None:
+        if not images:
+            return None
+        return min(
+            images,
+            key=lambda image: cls._rank_image_for_anchor(
+                record["anchor"],
+                image,
+                page_width=page_width,
+                page_height=page_height,
+            ),
+        )
+
+    @classmethod
+    def _supplement_single_spu_images(
+        cls,
+        *,
+        anchor: EvidenceObject,
+        base_images: list[ImageInfo],
+        all_images: list[ImageInfo],
+        page_width: float,
+        page_height: float,
+    ) -> list[ImageInfo]:
+        kept = _dedupe_images(base_images)
+        if len(all_images) >= 6:
+            dense_candidates = [
+                image for image in all_images
+                if image.short_edge >= 150
+            ]
+            dense_candidates = _dedupe_images(dense_candidates)
+            if len(dense_candidates) >= max(len(kept), 4):
+                return cls._order_image_group(
+                    anchor=anchor,
+                    images=dense_candidates,
+                    page_width=page_width,
+                    page_height=page_height,
+                )
+        if not kept:
+            kept = _dedupe_images([
+                image for image in all_images
+                if image.short_edge >= 160 and _area_ratio(image.bbox, page_width=page_width, page_height=page_height) >= 0.01
+            ])
+        if not kept:
+            return kept
+
+        for image in all_images:
+            if not image.image_id or any(existing.image_id == image.image_id for existing in kept):
+                continue
+            if image.short_edge < 150:
+                continue
+            if _area_ratio(image.bbox, page_width=page_width, page_height=page_height) < 0.004:
+                continue
+            anchor_score = cls._rank_image_for_anchor(
+                anchor,
+                image,
+                page_width=page_width,
+                page_height=page_height,
+            )[0]
+            if anchor_score > page_width * 0.75:
+                continue
+            near_group = False
+            for kept_image in kept:
+                dx = abs(_center(kept_image.bbox)[0] - _center(image.bbox)[0])
+                dy = abs(_center(kept_image.bbox)[1] - _center(image.bbox)[1])
+                if _x_overlap_ratio(kept_image.bbox, image.bbox) >= 0.18:
+                    near_group = True
+                    break
+                if dx <= max((kept_image.bbox[2] - kept_image.bbox[0]) * 1.25, page_width * 0.16) and dy <= max((kept_image.bbox[3] - kept_image.bbox[1]) * 0.9, page_height * 0.16):
+                    near_group = True
+                    break
+                if _distance(kept_image.bbox, image.bbox) <= max(_bbox_diag(kept_image.bbox) * 1.1, page_width * 0.18):
+                    near_group = True
+                    break
+            if near_group:
+                kept.append(image)
+        return _dedupe_images(kept)
+
+    @classmethod
+    def _share_spu_image_groups(
+        cls,
+        *,
+        records: list[dict],
+        groups: list[list[ImageInfo]],
+        images: list[ImageInfo],
+        page_width: float,
+        page_height: float,
+    ) -> list[list[ImageInfo]]:
+        updated = [list(group) for group in groups]
+        image_lookup = {
+            image.image_id: image
+            for image in images
+            if image.image_id
+        }
+        cluster_map: dict[tuple[str, str], list[int]] = {}
+        for index, record in enumerate(records):
+            spu_key = str(record.get("spu_key") or "")
+            if not spu_key:
+                continue
+            best_image = cls._best_image_candidate_for_record(
+                record,
+                images=images,
+                page_width=page_width,
+                page_height=page_height,
+            )
+            best_image_id = best_image.image_id if best_image else None
+            if best_image_id is None and updated[index]:
+                best_image_id = updated[index][0].image_id
+            if not best_image_id:
+                continue
+            cluster_map.setdefault((spu_key, best_image_id), []).append(index)
+
+        for (_spu_key, best_image_id), indices in cluster_map.items():
+            if len(indices) <= 1:
+                continue
+            centers = [_center(records[index]["anchor"].bbox) for index in indices]
+            if centers:
+                x_span = max(point[0] for point in centers) - min(point[0] for point in centers)
+                y_span = max(point[1] for point in centers) - min(point[1] for point in centers)
+                if x_span > max(360.0, page_width * 0.24) or y_span > max(240.0, page_height * 0.22):
+                    continue
+            shared_candidates: list[ImageInfo] = []
+            if best_image_id in image_lookup:
+                shared_candidates.append(image_lookup[best_image_id])
+            for index in indices:
+                shared_candidates.extend(updated[index])
+            shared_images = _dedupe_images(shared_candidates)
+            for index in indices:
+                merged = _dedupe_images([*updated[index], *shared_images])
+                ordered = cls._order_image_group(
+                    anchor=records[index]["anchor"],
+                    images=merged,
+                    page_width=page_width,
+                    page_height=page_height,
+                )
+                if best_image_id:
+                    ordered.sort(key=lambda image: (0 if image.image_id == best_image_id else 1))
+                updated[index] = ordered
+        return updated
+
     def extract(
         self,
         evidence: PageEvidence,
@@ -657,14 +855,21 @@ class ModelAnchorExtractor:
         if not model_anchors and not product_name_anchors:
             return [], []
 
-        image_candidates = [
+        all_image_pool = [
+            image for image in evidence.raw.images
+            if image.image_id and image.bbox != (0, 0, 0, 0) and not image.is_fragmented
+        ]
+        all_bindable_images = [
             image for image in evidence.raw.images
             if _is_bindable_image(
                 image,
                 page_width=evidence.page_width,
                 page_height=evidence.page_height,
             )
-            and not _is_text_heavy_image(
+        ]
+        image_candidates = [
+            image for image in all_bindable_images
+            if not _is_text_heavy_image(
                 image,
                 text_objects=all_text_objects,
                 page_width=evidence.page_width,
@@ -725,6 +930,7 @@ class ModelAnchorExtractor:
                         "family_key": "/".join(dict.fromkeys(label_titles)) if label_titles else _model_family_key(model_number),
                     }
                 )
+                records[-1]["inline_product_name"] = _extract_inline_product_name(anchor.text, model_number)
                 if not attribute_lines:
                     records[-1]["attribute_lines"] = self._collect_shared_color_lines(
                         ordered,
@@ -743,13 +949,34 @@ class ModelAnchorExtractor:
                         "label_lines": [],
                         "label_titles": [product_name],
                         "spec_lines": self._collect_spec_lines(ordered, index),
+                        "attribute_lines": self._collect_attribute_lines(ordered, index),
                         "description_lines": [],
                         "family_key": product_name,
+                        "inline_product_name": product_name,
                     }
                 )
 
+        for record in records:
+            record["spu_key"] = self._record_spu_key(record)
+
+        if len(records) == 1:
+            image_candidates = self._supplement_single_spu_images(
+                anchor=records[0]["anchor"],
+                base_images=image_candidates,
+                all_images=all_image_pool,
+                page_width=evidence.page_width,
+                page_height=evidence.page_height,
+            )
+
         image_groups = self._assign_images_to_records(
             records=records,
+            images=image_candidates,
+            page_width=evidence.page_width,
+            page_height=evidence.page_height,
+        )
+        image_groups = self._share_spu_image_groups(
+            records=records,
+            groups=image_groups,
             images=image_candidates,
             page_width=evidence.page_width,
             page_height=evidence.page_height,
@@ -767,7 +994,7 @@ class ModelAnchorExtractor:
             description_lines = record["description_lines"]
             assigned_group = image_groups[record_index]
             primary_image_id = assigned_group[0].image_id if assigned_group else None
-            inline_product_name = _extract_inline_product_name(anchor.text, model_number)
+            inline_product_name = record.get("inline_product_name")
 
             component_lines = []
             if title and not label_titles:
@@ -864,7 +1091,13 @@ class ModelAnchorExtractor:
                     )
                 )
 
-        return skus, bindings
+        return self._collapse_skus_to_single_spu(
+            skus=skus,
+            bindings=bindings,
+            images=image_candidates,
+            page_width=evidence.page_width,
+            page_height=evidence.page_height,
+        )
 
     @classmethod
     def _assign_images_to_records(
@@ -877,6 +1110,17 @@ class ModelAnchorExtractor:
     ) -> list[list[ImageInfo]]:
         if not records:
             return []
+        if len(records) == 1:
+            if not images:
+                return [[]]
+            return [
+                cls._order_image_group(
+                    anchor=records[0]["anchor"],
+                    images=_dedupe_images(images),
+                    page_width=page_width,
+                    page_height=page_height,
+                )
+            ]
         family_counts: dict[str, int] = {}
         family_to_indices: dict[str, list[int]] = {}
         for record in records:
@@ -972,6 +1216,141 @@ class ModelAnchorExtractor:
             )
             for index, group in enumerate(supplemented_groups)
         ]
+
+    @classmethod
+    def _collapse_skus_to_single_spu(
+        cls,
+        *,
+        skus: list[SKUResult],
+        bindings: list[BindingResult],
+        images: list[ImageInfo],
+        page_width: float,
+        page_height: float,
+    ) -> tuple[list[SKUResult], list[BindingResult]]:
+        if len(skus) <= 1:
+            return skus, bindings
+
+        image_lookup = {
+            image.image_id: image
+            for image in images
+            if image.image_id
+        }
+        bound_image_ids = [
+            binding.image_id
+            for binding in bindings
+            if binding.image_id and binding.image_id in image_lookup
+        ]
+        unique_bound_ids = list(dict.fromkeys(bound_image_ids))
+        if not unique_bound_ids:
+            return skus, bindings
+
+        centers = [_center(sku.source_bbox) for sku in skus if sku.source_bbox != (0, 0, 0, 0)]
+        if centers:
+            x_span = max(point[0] for point in centers) - min(point[0] for point in centers)
+            y_span = max(point[1] for point in centers) - min(point[1] for point in centers)
+            if x_span > max(900.0, page_width * 0.8) or y_span > max(260.0, page_height * 0.24):
+                return skus, bindings
+            if min(point[1] for point in centers) < page_height * 0.45:
+                return skus, bindings
+
+        if len(unique_bound_ids) > 2 and not any(
+            _is_page_spanning_image(image_lookup[image_id], page_width=page_width, page_height=page_height)
+            for image_id in unique_bound_ids
+        ):
+            return skus, bindings
+
+        model_numbers = _dedupe_strings([
+            str(sku.attributes.get("model_number") or "")
+            for sku in skus
+        ])
+        product_names = _dedupe_strings([
+            str(sku.attributes.get("product_name") or "")
+            for sku in skus
+        ])
+        specs = _dedupe_strings([
+            str(sku.attributes.get("specs") or "")
+            for sku in skus
+        ])
+        colors = _dedupe_strings([
+            str(sku.attributes.get("color") or "")
+            for sku in skus
+        ])
+        descriptions = _dedupe_strings([
+            str(sku.attributes.get("raw_attribute_text") or sku.attributes.get("product_description") or "")
+            for sku in skus
+        ])
+
+        if not descriptions and not model_numbers and not product_names:
+            return skus, bindings
+
+        merged_attributes: dict[str, str] = {
+            "evidence_mode": "text_backed",
+        }
+        if descriptions:
+            merged_text = " ".join(descriptions)
+            merged_attributes["raw_attribute_text"] = merged_text
+            merged_attributes["product_description"] = merged_text
+        if model_numbers:
+            merged_attributes["model_number"] = " / ".join(model_numbers)
+        if product_names:
+            merged_attributes["product_name"] = " / ".join(product_names)
+        if specs:
+            merged_attributes["specs"] = " | ".join(specs)
+        if colors:
+            merged_attributes["color"] = " / ".join(colors)
+
+        boxes = [sku.source_bbox for sku in skus if sku.source_bbox != (0, 0, 0, 0)]
+        boxes.extend(image_lookup[image_id].bbox for image_id in unique_bound_ids if image_id in image_lookup)
+        merged_sku = SKUResult(
+            sku_id="",
+            attributes=merged_attributes,
+            source_bbox=_bbox_union(boxes) if boxes else (0, 0, 0, 0),
+            validity="valid",
+            confidence=max((sku.confidence for sku in skus), default=0.72),
+            extraction_method="model_anchor_v2",
+        )
+        anchor_proxy = EvidenceObject(
+            object_id="spu_anchor",
+            object_type="text_block",
+            bbox=merged_sku.source_bbox,
+            text=merged_attributes.get("product_name") or merged_attributes.get("model_number") or "",
+            source="spu_merge",
+        )
+        ordered_images = [
+            image_lookup[image_id]
+            for image_id in unique_bound_ids
+            if image_id in image_lookup
+        ]
+        ordered_images = cls._order_image_group(
+            anchor=anchor_proxy,
+            images=ordered_images,
+            page_width=page_width,
+            page_height=page_height,
+        )
+        merged_bindings = [
+            BindingResult(
+                sku_id="",
+                image_id=image.image_id,
+                confidence=max(0.55, 0.84 - (rank - 1) * 0.08),
+                method="model_anchor_spu_group",
+                is_ambiguous=False,
+                rank=rank,
+            )
+            for rank, image in enumerate(ordered_images, start=1)
+            if image.image_id
+        ]
+        if not merged_bindings:
+            merged_bindings = [
+                BindingResult(
+                    sku_id="",
+                    image_id=None,
+                    confidence=0.0,
+                    method="model_anchor_spu_group",
+                    is_ambiguous=False,
+                    rank=1,
+                )
+            ]
+        return [merged_sku], merged_bindings
 
     @classmethod
     def _reassign_family_companions(

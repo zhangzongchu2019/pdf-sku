@@ -793,6 +793,103 @@ class PageProcessor:
             - x_overlap_ratio * 0.25
         )
 
+    @staticmethod
+    def _normalize_spu_key(value: str | None) -> str | None:
+        if not value:
+            return None
+        normalized = " ".join(str(value).strip().split())
+        if not normalized:
+            return None
+        return normalized.lower()
+
+    @classmethod
+    def _shared_scene_primary_image_id(
+        cls,
+        *,
+        sku: SKUResult,
+        split_images: list[ImageInfo],
+        page_width: float,
+        page_height: float,
+    ) -> str | None:
+        best_image: ImageInfo | None = None
+        best_score: tuple[float, float] | None = None
+        for image in split_images:
+            if not image.image_id:
+                continue
+            area_ratio = (
+                max(0.0, image.bbox[2] - image.bbox[0]) *
+                max(0.0, image.bbox[3] - image.bbox[1])
+            ) / max(1.0, page_width * page_height)
+            score = cls._scene_image_score(
+                sku.source_bbox,
+                image.bbox,
+                page_width=page_width,
+                page_height=page_height,
+            ) - min(area_ratio, 0.35) * 0.65
+            key = (score, -image.short_edge)
+            if best_score is None or key < best_score:
+                best_score = key
+                best_image = image
+        return best_image.image_id if best_image and best_image.image_id else None
+
+    @classmethod
+    def _share_scene_images_across_spu_groups(
+        cls,
+        *,
+        skus: list[SKUResult],
+        split_images: list[ImageInfo],
+        groups: list[list[str]],
+        page_width: float,
+        page_height: float,
+    ) -> list[list[str]]:
+        updated = [list(dict.fromkeys(group)) for group in groups]
+        image_lookup = {
+            image.image_id: image
+            for image in split_images
+            if image.image_id
+        }
+        cluster_map: dict[tuple[str, str], list[int]] = {}
+        for index, sku in enumerate(skus):
+            spu_key = cls._normalize_spu_key(sku.attributes.get("product_name"))
+            if not spu_key:
+                continue
+            primary_image_id = cls._shared_scene_primary_image_id(
+                sku=sku,
+                split_images=split_images,
+                page_width=page_width,
+                page_height=page_height,
+            )
+            if not primary_image_id:
+                continue
+            cluster_map.setdefault((spu_key, primary_image_id), []).append(index)
+
+        for (_spu_key, primary_image_id), indices in cluster_map.items():
+            if len(indices) <= 1:
+                continue
+            centers = [cls._bbox_center(skus[index].source_bbox) for index in indices]
+            if centers:
+                x_span = max(point[0] for point in centers) - min(point[0] for point in centers)
+                y_span = max(point[1] for point in centers) - min(point[1] for point in centers)
+                if x_span > max(360.0, page_width * 0.24) or y_span > max(240.0, page_height * 0.22):
+                    continue
+            shared = [primary_image_id]
+            for index in indices:
+                shared.extend(updated[index])
+            shared = [image_id for image_id in dict.fromkeys(shared) if image_id in image_lookup]
+            for index in indices:
+                shared_rest = sorted(
+                    [image_id for image_id in shared if image_id != primary_image_id],
+                    key=lambda image_id: cls._scene_image_score(
+                        skus[index].source_bbox,
+                        image_lookup[image_id].bbox,
+                        page_width=page_width,
+                        page_height=page_height,
+                    ),
+                )
+                shared_sorted = [primary_image_id, *shared_rest]
+                updated[index] = shared_sorted
+        return updated
+
     @classmethod
     def _assign_scene_images_to_skus(
         cls,
@@ -850,11 +947,21 @@ class PageProcessor:
 
         if not any(groups):
             return None
-        return groups
+        return cls._share_scene_images_across_spu_groups(
+            skus=skus,
+            split_images=split_images,
+            groups=groups,
+            page_width=page_width,
+            page_height=page_height,
+        )
 
     @staticmethod
     def _bboxes_intersect(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
         return not (a[2] <= b[0] or a[0] >= b[2] or a[3] <= b[1] or a[1] >= b[3])
+
+    @staticmethod
+    def _bbox_center(bbox: tuple[float, float, float, float]) -> tuple[float, float]:
+        return ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
 
     @staticmethod
     def _screenshot_size(screenshot: bytes | None) -> tuple[int, int] | None:

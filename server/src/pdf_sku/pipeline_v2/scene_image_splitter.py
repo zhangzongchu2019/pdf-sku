@@ -114,8 +114,8 @@ def _mask_from_image(
 def _split_bbox_by_whitespace(
     mask: np.ndarray,
     *,
-    min_band_ratio: float = 0.015,
-    max_dark_ratio: float = 0.01,
+    min_band_ratio: float = 0.012,
+    max_dark_ratio: float = 0.015,
 ) -> tuple[str, int, int] | None:
     sample_h, sample_w = mask.shape
     best: tuple[int, str, int, int] | None = None
@@ -176,7 +176,7 @@ def _xy_cut_panel_bboxes(
         depth: int,
     ) -> list[tuple[int, int, int, int]]:
         sample_h, sample_w = submask.shape
-        if depth >= max_depth or sample_w < 120 or sample_h < 120:
+        if depth >= max_depth or sample_w < 96 or sample_h < 96:
             return [(offset_x, offset_y, offset_x + sample_w, offset_y + sample_h)]
         band = _split_bbox_by_whitespace(submask)
         if band is None:
@@ -221,7 +221,7 @@ def _detect_panel_bboxes(
     pil_img: PILImage.Image,
     *,
     threshold: int = 245,
-    max_edge: int = 256,
+    max_edge: int = 320,
 ) -> list[tuple[int, int, int, int]]:
     rgb = pil_img.convert("RGB")
     width, height = rgb.size
@@ -272,11 +272,11 @@ def _detect_panel_bboxes(
         box_area = max(1, box_w * box_h)
         area_ratio = area / total_pixels
         density = area / box_area
-        if area_ratio < 0.015:
+        if area_ratio < 0.008:
             continue
-        if box_w < sample_w * 0.12 or box_h < sample_h * 0.12:
+        if box_w < sample_w * 0.08 or box_h < sample_h * 0.08:
             continue
-        if density < 0.35:
+        if density < 0.24:
             continue
         filtered.append((x0, y0, x1, y1, area_ratio))
 
@@ -391,7 +391,7 @@ class SceneImageSplitter:
                 refine_img=refine_img,
             )
             crop = base_img.crop(crop_bbox)
-            if crop.width < img_width * 0.12 or crop.height < img_height * 0.12:
+            if crop.width < img_width * 0.08 or crop.height < img_height * 0.08:
                 continue
             images.append(
                 cls._build_image_info(
@@ -500,9 +500,9 @@ class SceneImageSplitter:
                 x0, y0, x1, y1 = panel_bbox
                 panel_area = max(1, (x1 - x0) * (y1 - y0))
                 img_area = max(1, img_width * img_height)
-                if panel_area / img_area >= 0.18:
+                if panel_area / img_area >= 0.12:
                     crop = base_img.crop(panel_bbox)
-                    if crop.width >= img_width * 0.12 and crop.height >= img_height * 0.12:
+                    if crop.width >= img_width * 0.08 and crop.height >= img_height * 0.08:
                         return [
                             self._build_image_info(
                                 crop,
@@ -523,7 +523,7 @@ class SceneImageSplitter:
                 return []
 
             crop = base_img.crop((x0, y0, x1, y1))
-            if crop.width < img_width * 0.12 or crop.height < img_height * 0.12:
+            if crop.width < img_width * 0.08 or crop.height < img_height * 0.08:
                 return []
             return [
                 self._build_image_info(
