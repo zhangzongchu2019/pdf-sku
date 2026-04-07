@@ -843,6 +843,45 @@ def test_model_anchor_extractor_filters_text_heavy_images():
     assert [binding.image_id for binding in bindings] == ["img-product-b", "img-product-a"]
 
 
+def test_model_anchor_source_bbox_stays_local_for_page_spanning_image():
+    extractor = ModelAnchorExtractor()
+    evidence = PageEvidence(
+        page_no=1,
+        page_width=1200,
+        page_height=800,
+        raw=ParsedPageIR(
+            page_no=1,
+            images=[
+                ImageInfo(
+                    image_id="img-full",
+                    bbox=(0, 0, 1200, 800),
+                    width=1200,
+                    height=800,
+                    search_eligible=True,
+                ),
+            ],
+            metadata=PageMetadata(page_width=1200, page_height=800),
+        ),
+        objects=[
+            EvidenceObject(
+                object_id="title-left",
+                object_type="text_block",
+                bbox=(80, 660, 260, 690),
+                text="MODEL: RT-8295",
+                source="pdf_text_precise",
+                font_size=16,
+            ),
+        ],
+    )
+
+    skus, _bindings = extractor.extract(evidence)
+
+    assert len(skus) == 1
+    x0, y0, x1, y1 = skus[0].source_bbox
+    assert x1 - x0 < 400
+    assert y1 - y0 < 120
+
+
 def _scene_image_bytes() -> bytes:
     img = PILImage.new("RGB", (900, 600), color=(255, 255, 255))
     draw = ImageDraw.Draw(img)
@@ -902,6 +941,21 @@ def _wide_scene_with_inset_and_text_bytes() -> bytes:
     draw.rectangle((1090, 700, 1270, 728), fill=(40, 40, 40))
     draw.rectangle((1090, 748, 1310, 776), fill=(65, 65, 65))
     draw.rectangle((1090, 793, 1330, 821), fill=(65, 65, 65))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
+def _triple_panel_scene_bytes() -> bytes:
+    img = PILImage.new("RGB", (1400, 900), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((40, 80, 680, 820), fill=(210, 210, 210))
+    draw.rectangle((760, 80, 1340, 420), fill=(200, 200, 200))
+    draw.rectangle((760, 500, 1340, 820), fill=(190, 190, 190))
+    draw.rectangle((120, 260, 260, 620), fill=(90, 90, 90))
+    draw.rectangle((320, 280, 560, 620), fill=(110, 110, 110))
+    draw.rectangle((860, 180, 1180, 360), fill=(90, 90, 90))
+    draw.rectangle((870, 580, 1220, 760), fill=(100, 100, 100))
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=90)
     return buf.getvalue()
@@ -1028,7 +1082,70 @@ def test_scene_image_splitter_keeps_inset_panel_when_detached_text_exists(monkey
     )
 
     assert len(images) == 2
-    assert images[0].width > images[1].width
+    widths = sorted((image.width for image in images), reverse=True)
+    assert widths[0] > widths[1]
+
+
+def test_scene_image_splitter_can_split_three_panel_montage():
+    splitter = SceneImageSplitter()
+    images = splitter.extract(
+        ImageInfo(
+            image_id="scene-three",
+            bbox=(0, 0, 1400, 900),
+            data=_triple_panel_scene_bytes(),
+            width=1400,
+            height=900,
+            short_edge=900,
+            search_eligible=True,
+        ),
+        page_no=1,
+        page_width=1400,
+        page_height=900,
+    )
+
+    assert len(images) == 3
+    widths = sorted((image.width for image in images), reverse=True)
+    assert widths[0] > widths[1] >= widths[2]
+
+
+def test_page_processor_assigns_split_scene_panels_to_multiple_skus():
+    processor = PageProcessor()
+    raw = ParsedPageIR(
+        page_no=1,
+        images=[
+            ImageInfo(
+                image_id="img-full",
+                bbox=(0, 0, 1200, 800),
+                data=_wide_scene_with_inset_and_text_bytes(),
+                width=1200,
+                height=800,
+                short_edge=800,
+                search_eligible=True,
+            ),
+        ],
+        metadata=PageMetadata(page_width=1200, page_height=800),
+    )
+    skus = [
+        SKUResult(source_bbox=(100, 610, 400, 690), attributes={"model_number": "RT-8298"}),
+        SKUResult(source_bbox=(770, 360, 1120, 430), attributes={"model_number": "RT-8299"}),
+        SKUResult(source_bbox=(780, 690, 1140, 790), attributes={"model_number": "RT-8300"}),
+    ]
+    split_images = [
+        ImageInfo(image_id="p1_scene_0", bbox=(70, 70, 640, 620), width=570, height=550, short_edge=550, search_eligible=True),
+        ImageInfo(image_id="p1_scene_1", bbox=(700, 70, 1140, 420), width=440, height=350, short_edge=350, search_eligible=True),
+        ImageInfo(image_id="p1_scene_2", bbox=(700, 470, 1140, 845), width=440, height=375, short_edge=375, search_eligible=True),
+    ]
+    processor._scene_splitter.extract = lambda *args, **kwargs: split_images  # type: ignore[method-assign]
+
+    groups = processor._scene_image_group_for_single_sku(raw, skus, page_no=1)
+
+    assert groups is not None
+    assert len(groups) == 3
+    assert all(groups)
+    assert sum(len(group) for group in groups) == 3
+    flattened = [image_id for group in groups for image_id in group]
+    assert len(flattened) == len(set(flattened))
+    assert flattened == ["p1_scene_0", "p1_scene_1", "p1_scene_2"]
 
 
 def _table_page_one() -> ParsedPageIR:

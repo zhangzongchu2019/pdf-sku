@@ -460,6 +460,21 @@ def _is_bindable_image(
     return True
 
 
+def _is_page_spanning_image(
+    image: ImageInfo,
+    *,
+    page_width: float,
+    page_height: float,
+) -> bool:
+    width = max(0.0, image.bbox[2] - image.bbox[0])
+    height = max(0.0, image.bbox[3] - image.bbox[1])
+    page_area = max(1.0, page_width * page_height)
+    area_ratio = (width * height) / page_area
+    width_ratio = width / max(1.0, page_width)
+    height_ratio = height / max(1.0, page_height)
+    return area_ratio >= 0.45 and width_ratio >= 0.55 and height_ratio >= 0.45
+
+
 class ModelAnchorExtractor:
     """页面内存在显式型号时，优先按型号拆分 SKU。"""
 
@@ -689,7 +704,11 @@ class ModelAnchorExtractor:
             boxes.extend(line.bbox for line in spec_lines)
             if primary_image_id:
                 image = next((item for item in assigned_group if item.image_id == primary_image_id), None)
-                if image is not None:
+                if image is not None and not _is_page_spanning_image(
+                    image,
+                    page_width=evidence.page_width,
+                    page_height=evidence.page_height,
+                ):
                     boxes.append(image.bbox)
 
             confidence = 0.7

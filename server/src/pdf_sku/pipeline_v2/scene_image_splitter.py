@@ -5,6 +5,7 @@ from collections import deque
 import hashlib
 import io
 import math
+from typing import Iterable
 
 import numpy as np
 from PIL import Image as PILImage
@@ -24,6 +25,133 @@ def _trim_near_white_bbox(
     if len(xs) == 0 or len(ys) == 0:
         return None
     return (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+
+
+def _mask_from_image(
+    pil_img: PILImage.Image,
+    *,
+    threshold: int = 245,
+    max_edge: int = 1024,
+) -> tuple[np.ndarray, float]:
+    rgb = pil_img.convert("RGB")
+    width, height = rgb.size
+    scale = min(1.0, max_edge / max(width, height))
+    if scale < 1.0:
+        sample = rgb.resize(
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            PILImage.Resampling.NEAREST,
+        )
+    else:
+        sample = rgb
+    arr = np.array(sample)
+    mask = np.any(arr < threshold, axis=2)
+    return mask, scale
+
+
+def _split_bbox_by_whitespace(
+    mask: np.ndarray,
+    *,
+    min_band_ratio: float = 0.015,
+    max_dark_ratio: float = 0.01,
+) -> tuple[str, int, int] | None:
+    sample_h, sample_w = mask.shape
+    best: tuple[int, str, int, int] | None = None
+    for axis in ("x", "y"):
+        values = mask.mean(axis=0 if axis == "x" else 1)
+        min_band = max(8, int(round(len(values) * min_band_ratio)))
+        start = None
+        runs: list[tuple[int, int]] = []
+        for index, value in enumerate(values):
+            if value <= max_dark_ratio:
+                if start is None:
+                    start = index
+            else:
+                if start is not None and index - start >= min_band:
+                    runs.append((start, index))
+                start = None
+        if start is not None and len(values) - start >= min_band:
+            runs.append((start, len(values)))
+
+        for band_start, band_end in runs:
+            center = (band_start + band_end) // 2
+            if center < len(values) * 0.08 or center > len(values) * 0.92:
+                continue
+            lhs = mask[:, :band_start] if axis == "x" else mask[:band_start, :]
+            rhs = mask[:, band_end:] if axis == "x" else mask[band_end:, :]
+            if lhs.size == 0 or rhs.size == 0:
+                continue
+            if lhs.mean() < 0.03 or rhs.mean() < 0.03:
+                continue
+            candidate = (band_end - band_start, axis, band_start, band_end)
+            if best is None or candidate > best:
+                best = candidate
+    if best is None:
+        return None
+    return best[1], best[2], best[3]
+
+
+def _xy_cut_panel_bboxes(
+    pil_img: PILImage.Image,
+    *,
+    threshold: int = 245,
+    max_edge: int = 1024,
+    max_depth: int = 3,
+) -> list[tuple[int, int, int, int]]:
+    width, height = pil_img.size
+    mask, scale = _mask_from_image(
+        pil_img,
+        threshold=threshold,
+        max_edge=max_edge,
+    )
+    scale = max(scale, 1e-6)
+
+    def recurse(
+        submask: np.ndarray,
+        *,
+        offset_x: int,
+        offset_y: int,
+        depth: int,
+    ) -> list[tuple[int, int, int, int]]:
+        sample_h, sample_w = submask.shape
+        if depth >= max_depth or sample_w < 120 or sample_h < 120:
+            return [(offset_x, offset_y, offset_x + sample_w, offset_y + sample_h)]
+        band = _split_bbox_by_whitespace(submask)
+        if band is None:
+            return [(offset_x, offset_y, offset_x + sample_w, offset_y + sample_h)]
+        axis, band_start, band_end = band
+        if axis == "x":
+            return recurse(
+                submask[:, :band_start],
+                offset_x=offset_x,
+                offset_y=offset_y,
+                depth=depth + 1,
+            ) + recurse(
+                submask[:, band_end:],
+                offset_x=offset_x + band_end,
+                offset_y=offset_y,
+                depth=depth + 1,
+            )
+        return recurse(
+            submask[:band_start, :],
+            offset_x=offset_x,
+            offset_y=offset_y,
+            depth=depth + 1,
+        ) + recurse(
+            submask[band_end:, :],
+            offset_x=offset_x,
+            offset_y=offset_y + band_end,
+            depth=depth + 1,
+        )
+
+    sample_boxes = recurse(mask, offset_x=0, offset_y=0, depth=0)
+    boxes: list[tuple[int, int, int, int]] = []
+    for x0, y0, x1, y1 in sample_boxes:
+        ox0 = max(0, int(math.floor(x0 / scale)))
+        oy0 = max(0, int(math.floor(y0 / scale)))
+        ox1 = min(width, int(math.ceil(x1 / scale)))
+        oy1 = min(height, int(math.ceil(y1 / scale)))
+        boxes.append((ox0, oy0, ox1, oy1))
+    return boxes
 
 
 def _detect_panel_bboxes(
@@ -156,6 +284,56 @@ class SceneImageSplitter:
         )
 
     @staticmethod
+    def _refine_crop_bbox(
+        pil_img: PILImage.Image,
+        bbox: tuple[int, int, int, int],
+    ) -> tuple[int, int, int, int]:
+        x0, y0, x1, y1 = bbox
+        crop = pil_img.crop((x0, y0, x1, y1))
+        trimmed = _trim_near_white_bbox(crop)
+        if trimmed is None:
+            return bbox
+        tx0, ty0, tx1, ty1 = trimmed
+        return (x0 + tx0, y0 + ty0, x0 + tx1, y0 + ty1)
+
+    @classmethod
+    def _build_images_from_bboxes(
+        cls,
+        *,
+        base_img: PILImage.Image,
+        panel_bboxes: Iterable[tuple[int, int, int, int]],
+        pad: int,
+        page_box: tuple[float, float, float, float],
+        img_width: int,
+        img_height: int,
+        page_no: int,
+    ) -> list[ImageInfo]:
+        images: list[ImageInfo] = []
+        for index, (x0, y0, x1, y1) in enumerate(panel_bboxes):
+            crop_bbox = cls._expand_bbox(
+                (x0, y0, x1, y1),
+                pad=pad,
+                img_width=img_width,
+                img_height=img_height,
+            )
+            crop_bbox = cls._refine_crop_bbox(base_img, crop_bbox)
+            crop = base_img.crop(crop_bbox)
+            if crop.width < img_width * 0.12 or crop.height < img_height * 0.12:
+                continue
+            images.append(
+                cls._build_image_info(
+                    crop,
+                    crop_bbox=crop_bbox,
+                    page_box=page_box,
+                    img_width=img_width,
+                    img_height=img_height,
+                    page_no=page_no,
+                    index=index,
+                )
+            )
+        return images
+
+    @staticmethod
     def _mask_text_regions(
         pil_img: PILImage.Image,
         *,
@@ -207,42 +385,39 @@ class SceneImageSplitter:
                 page_box=page_box,
                 text_boxes=text_boxes,
             )
+            pad = max(4, int(round(min(img_width, img_height) * 0.008)))
+
+            whitespace_panels = _xy_cut_panel_bboxes(panel_source)
+            if len(whitespace_panels) >= 2:
+                images = self._build_images_from_bboxes(
+                    base_img=base_img,
+                    panel_bboxes=whitespace_panels,
+                    pad=pad,
+                    page_box=page_box,
+                    img_width=img_width,
+                    img_height=img_height,
+                    page_no=page_no,
+                )
+                if len(images) >= 2:
+                    return images
 
             panel_bboxes = _detect_panel_bboxes(panel_source)
-            pad = max(4, int(round(min(img_width, img_height) * 0.008)))
             if len(panel_bboxes) >= 2:
-                images: list[ImageInfo] = []
-                for index, (x0, y0, x1, y1) in enumerate(panel_bboxes):
-                    crop_bbox = self._expand_bbox(
-                        (x0, y0, x1, y1),
-                        pad=pad,
-                        img_width=img_width,
-                        img_height=img_height,
-                    )
-                    crop = base_img.crop(crop_bbox)
-                    if crop.width < img_width * 0.12 or crop.height < img_height * 0.12:
-                        continue
-                    images.append(
-                        self._build_image_info(
-                            crop,
-                            crop_bbox=crop_bbox,
-                            page_box=page_box,
-                            img_width=img_width,
-                            img_height=img_height,
-                            page_no=page_no,
-                            index=index,
-                        )
-                    )
+                images = self._build_images_from_bboxes(
+                    base_img=base_img,
+                    panel_bboxes=panel_bboxes,
+                    pad=pad,
+                    page_box=page_box,
+                    img_width=img_width,
+                    img_height=img_height,
+                    page_no=page_no,
+                )
                 if len(images) >= 2:
                     return images
 
             if len(panel_bboxes) == 1:
-                panel_bbox = self._expand_bbox(
-                    panel_bboxes[0],
-                    pad=pad,
-                    img_width=img_width,
-                    img_height=img_height,
-                )
+                panel_bbox = self._expand_bbox(panel_bboxes[0], pad=pad, img_width=img_width, img_height=img_height)
+                panel_bbox = self._refine_crop_bbox(base_img, panel_bbox)
                 x0, y0, x1, y1 = panel_bbox
                 panel_area = max(1, (x1 - x0) * (y1 - y0))
                 img_area = max(1, img_width * img_height)

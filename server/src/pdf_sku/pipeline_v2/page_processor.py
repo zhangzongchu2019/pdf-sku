@@ -467,8 +467,9 @@ class PageProcessor:
         skus: list[SKUResult],
         *,
         page_no: int,
+        text_boxes: list[tuple[float, float, float, float]] | None = None,
     ) -> list[list[str]] | None:
-        if len(skus) != 1:
+        if not skus:
             return None
         bindable_images = [
             image for image in raw.images
@@ -490,7 +491,7 @@ class PageProcessor:
             page_width=raw.metadata.page_width,
             page_height=raw.metadata.page_height,
             raw_text=raw.raw_text,
-            text_boxes=[
+            text_boxes=text_boxes or [
                 block.bbox
                 for block in raw.text_blocks
                 if (block.content or "").strip()
@@ -502,7 +503,103 @@ class PageProcessor:
         original.role = "scene_full"
         original.search_eligible = False
         raw.images.extend(split_images)
-        return [[image.image_id for image in split_images if image.image_id]]
+        if len(skus) == 1:
+            return [[image.image_id for image in split_images if image.image_id]]
+        return self._assign_scene_images_to_skus(
+            skus=skus,
+            split_images=split_images,
+            page_width=raw.metadata.page_width,
+            page_height=raw.metadata.page_height,
+        )
+
+    @staticmethod
+    def _scene_image_score(
+        sku_bbox: tuple[float, float, float, float],
+        image_bbox: tuple[float, float, float, float],
+        *,
+        page_width: float,
+        page_height: float,
+    ) -> float:
+        sku_cx = (sku_bbox[0] + sku_bbox[2]) / 2
+        sku_cy = (sku_bbox[1] + sku_bbox[3]) / 2
+        img_cx = (image_bbox[0] + image_bbox[2]) / 2
+        img_cy = (image_bbox[1] + image_bbox[3]) / 2
+        diag = max(1.0, (page_width ** 2 + page_height ** 2) ** 0.5)
+        center_distance = ((sku_cx - img_cx) ** 2 + (sku_cy - img_cy) ** 2) ** 0.5 / diag
+        horizontal_distance = abs(sku_cx - img_cx) / max(1.0, page_width)
+        image_below_text_penalty = max(0.0, image_bbox[1] - sku_bbox[3]) / max(1.0, page_height)
+        image_above_text_gap = max(0.0, sku_bbox[1] - image_bbox[3]) / max(1.0, page_height)
+        x_overlap = max(0.0, min(sku_bbox[2], image_bbox[2]) - max(sku_bbox[0], image_bbox[0]))
+        x_overlap_ratio = x_overlap / max(
+            1.0,
+            min(max(1.0, sku_bbox[2] - sku_bbox[0]), max(1.0, image_bbox[2] - image_bbox[0])),
+        )
+        return (
+            center_distance
+            + horizontal_distance * 0.65
+            + image_below_text_penalty * 1.5
+            + image_above_text_gap * 0.35
+            - x_overlap_ratio * 0.25
+        )
+
+    @classmethod
+    def _assign_scene_images_to_skus(
+        cls,
+        *,
+        skus: list[SKUResult],
+        split_images: list[ImageInfo],
+        page_width: float,
+        page_height: float,
+    ) -> list[list[str]] | None:
+        if not skus or not split_images:
+            return None
+        groups: list[list[str]] = [[] for _ in skus]
+
+        pair_scores: list[tuple[float, int, int]] = []
+        for sku_index, sku in enumerate(skus):
+            for image_index, image in enumerate(split_images):
+                pair_scores.append(
+                    (
+                        cls._scene_image_score(
+                            sku.source_bbox,
+                            image.bbox,
+                            page_width=page_width,
+                            page_height=page_height,
+                        ),
+                        sku_index,
+                        image_index,
+                    )
+                )
+        pair_scores.sort(key=lambda item: item[0])
+
+        assigned_skus: set[int] = set()
+        assigned_images: set[int] = set()
+        for _score, sku_index, image_index in pair_scores:
+            if sku_index in assigned_skus or image_index in assigned_images:
+                continue
+            groups[sku_index].append(split_images[image_index].image_id)
+            assigned_skus.add(sku_index)
+            assigned_images.add(image_index)
+            if len(assigned_images) == min(len(skus), len(split_images)):
+                break
+
+        for image_index, image in enumerate(split_images):
+            if image_index in assigned_images:
+                continue
+            best_sku_index = min(
+                range(len(skus)),
+                key=lambda sku_index: cls._scene_image_score(
+                    skus[sku_index].source_bbox,
+                    image.bbox,
+                    page_width=page_width,
+                    page_height=page_height,
+                ),
+            )
+            groups[best_sku_index].append(image.image_id)
+
+        if not any(groups):
+            return None
+        return groups
 
     @staticmethod
     def _bboxes_intersect(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
@@ -795,6 +892,11 @@ class PageProcessor:
                 raw,
                 model_skus,
                 page_no=page_no,
+                text_boxes=[
+                    obj.bbox
+                    for obj in evidence.objects
+                    if obj.object_type in {"text_block", "ocr_block"} and (obj.text or "").strip()
+                ],
             )
             if scene_groups:
                 preferred_image_groups = scene_groups
@@ -846,6 +948,11 @@ class PageProcessor:
             raw,
             skus,
             page_no=page_no,
+            text_boxes=[
+                obj.bbox
+                for obj in evidence.objects
+                if obj.object_type in {"text_block", "ocr_block"} and (obj.text or "").strip()
+            ],
         )
 
         return self._build_regular_page_result(
