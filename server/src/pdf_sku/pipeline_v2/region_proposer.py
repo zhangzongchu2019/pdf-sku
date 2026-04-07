@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import math
+import re
 
 from pdf_sku.pipeline.ir import ImageInfo, ParsedPageIR
 from pdf_sku.pipeline.layout_detector import _FIGURE_LABELS, LayoutRegion
 from pdf_sku.pipeline.parser.ocr_engine import OcrBlock
 
 from .models import EvidenceObject, PageEvidence, RegionProposal
+
+_PAGE_MARKER_RE = re.compile(r"^(?:P|PG|PAGE|AGE)\s*[/\\-]?\s*0*\d+\s*$", re.IGNORECASE)
 
 
 def _bbox_union(boxes: list[tuple[float, float, float, float]]) -> tuple[float, float, float, float]:
@@ -33,6 +36,11 @@ def _distance(a: tuple[float, float, float, float], b: tuple[float, float, float
 
 def _is_textual_object(obj: EvidenceObject) -> bool:
     return obj.object_type in {"text_block", "ocr_block"}
+
+
+def _is_page_marker_text(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", (text or "").strip()).upper()
+    return bool(_PAGE_MARKER_RE.fullmatch(normalized))
 
 
 def _is_figure_layout(obj: EvidenceObject) -> bool:
@@ -207,7 +215,10 @@ class RegionProposer:
 
     def propose(self, evidence: PageEvidence) -> list[RegionProposal]:
         object_map = {obj.object_id: obj for obj in evidence.objects}
-        text_objects = [obj for obj in evidence.objects if _is_textual_object(obj)]
+        text_objects = [
+            obj for obj in evidence.objects
+            if _is_textual_object(obj) and not _is_page_marker_text(obj.text)
+        ]
         image_objects = [
             obj for obj in evidence.objects
             if obj.object_type == "image_block"
@@ -283,4 +294,19 @@ class RegionProposer:
                     )
                 )
 
-        return [proposal for proposal in proposals if proposal.member_object_ids]
+        has_visual_candidates = bool(image_objects or figure_layouts)
+        filtered: list[RegionProposal] = []
+        for proposal in proposals:
+            if not proposal.member_object_ids:
+                continue
+            if has_visual_candidates and not any(
+                (
+                    object_map[member].object_type == "image_block"
+                    or _is_figure_layout(object_map[member])
+                )
+                for member in proposal.member_object_ids
+                if member in object_map
+            ):
+                continue
+            filtered.append(proposal)
+        return filtered

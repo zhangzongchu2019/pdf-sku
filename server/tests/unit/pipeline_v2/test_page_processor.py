@@ -11,6 +11,7 @@ from pdf_sku.pipeline.catalog_profiler import CatalogProfile
 from pdf_sku.pipeline.layout_detector import LayoutRegion
 from pdf_sku.pipeline.ir import ImageInfo, PageMetadata, PageResult, ParsedPageIR, SKUResult, TableData, TextBlock
 from pdf_sku.pipeline.parser.ocr_engine import OcrBlock
+from pdf_sku.pipeline_v2.attribute_extractor import RegionAttributeExtractor
 from pdf_sku.pipeline_v2.document_hints import build_document_hints
 from pdf_sku.pipeline_v2.model_anchor_extractor import ModelAnchorExtractor
 from pdf_sku.pipeline_v2.models import DocumentHints, EvidenceObject, PageEvidence, RegionProposal
@@ -500,6 +501,346 @@ def test_model_anchor_extractor_recalls_local_companions_without_crossing_h_vari
         "img-rope-top-right",
     ]
     assert binding_groups["HR-WOOD5115H"] == ["img-rope-high"]
+
+
+def test_model_anchor_extractor_supports_labeled_numeric_models_from_ocr():
+    extractor = ModelAnchorExtractor()
+    evidence = PageEvidence(
+        page_no=2,
+        page_width=1303.94,
+        page_height=864.57,
+        raw=ParsedPageIR(
+            page_no=2,
+            images=[
+                ImageInfo(image_id="img-right-main", bbox=(650.9, 0.0, 1304.9, 483.1), width=1091, height=807, search_eligible=True),
+                ImageInfo(image_id="img-right-detail", bbox=(988.9, 519.2, 1303.4, 810.6), width=441, height=387, search_eligible=True),
+                ImageInfo(image_id="img-left-detail", bbox=(39.6, 61.3, 241.1, 231.4), width=336, height=284, search_eligible=True),
+                ImageInfo(image_id="img-left-inset", bbox=(243.8, 62.1, 464.3, 232.3), width=368, height=284, search_eligible=True),
+                ImageInfo(image_id="img-left-main", bbox=(-1.1, 290.4, 654.9, 865.4), width=1094, height=959, search_eligible=True),
+            ],
+            metadata=PageMetadata(page_width=1303.94, page_height=864.57),
+        ),
+        objects=[
+            EvidenceObject(object_id="ocr-title", object_type="ocr_block", bbox=(794.6, 595.2, 1013.4, 618.3), text="Perfect space utilization", source="ocr_text"),
+            EvidenceObject(object_id="ocr-right-1", object_type="ocr_block", bbox=(794.6, 690.7, 901.8, 707.4), text="茶几（TeaTable）：:201#", source="ocr_text"),
+            EvidenceObject(object_id="ocr-right-2", object_type="ocr_block", bbox=(794.6, 707.4, 927.9, 722.6), text="规格（Size）：1300x700+拖mm", source="ocr_text"),
+            EvidenceObject(object_id="ocr-right-3", object_type="ocr_block", bbox=(795.4, 721.9, 916.3, 738.5), text="电视柜（TVCabinet）：201#", source="ocr_text"),
+            EvidenceObject(object_id="ocr-right-4", object_type="ocr_block", bbox=(794.6, 736.4, 915.6, 753.7), text="规格（Size）：2800-2000mm", source="ocr_text"),
+            EvidenceObject(object_id="ocr-left-1", object_type="ocr_block", bbox=(134.7, 763.1, 260.0, 781.2), text="餐桌（DiningTable）：202", source="ocr_text"),
+            EvidenceObject(object_id="ocr-left-2", object_type="ocr_block", bbox=(134.7, 780.5, 243.4, 795.7), text="规格（Size）：中1300mm", source="ocr_text"),
+            EvidenceObject(object_id="ocr-left-3", object_type="ocr_block", bbox=(134.7, 793.6, 256.4, 813.1), text="餐椅（DiningChair）:202#", source="ocr_text"),
+        ],
+    )
+
+    skus, bindings = extractor.extract(evidence)
+
+    assert [sku.attributes["model_number"] for sku in skus] == ["201#", "202"]
+    assert skus[0].attributes["product_name"] == "茶几（TeaTable） / 电视柜（TVCabinet）"
+    assert skus[1].attributes["product_name"] == "餐桌（DiningTable） / 餐椅（DiningChair）"
+    assert skus[0].attributes["specs"] == "规格（Size）：1300x700+拖mm 规格（Size）：2800-2000mm"
+    assert skus[1].attributes["specs"] == "规格（Size）：中1300mm"
+
+    binding_groups: dict[str, list[str]] = {}
+    current_model = ""
+    model_iter = iter([sku.attributes["model_number"] for sku in skus])
+    for binding in bindings:
+        if binding.rank == 1:
+            current_model = next(model_iter)
+        binding_groups.setdefault(current_model, []).append(binding.image_id)
+
+    assert binding_groups["201#"] == ["img-right-main", "img-right-detail"]
+    assert binding_groups["202"] == ["img-left-main", "img-left-inset", "img-left-detail"]
+
+
+def test_model_anchor_extractor_ignores_page_markers_as_models():
+    extractor = ModelAnchorExtractor()
+    evidence = PageEvidence(
+        page_no=1,
+        page_width=600,
+        page_height=800,
+        raw=ParsedPageIR(
+            page_no=1,
+            images=[
+                ImageInfo(image_id="img-main", bbox=(180, 40, 520, 620), width=680, height=1160, search_eligible=True),
+            ],
+            metadata=PageMetadata(page_width=600, page_height=800),
+        ),
+        objects=[
+            EvidenceObject(
+                object_id="ocr-model",
+                object_type="ocr_block",
+                bbox=(220, 650, 360, 680),
+                text="型号：868#",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-page",
+                object_type="ocr_block",
+                bbox=(520, 760, 590, 790),
+                text="PAGE/03",
+                source="ocr_text",
+            ),
+        ],
+    )
+
+    skus, _bindings = extractor.extract(evidence)
+
+    assert len(skus) == 1
+    assert skus[0].attributes["model_number"] == "868#"
+
+
+def test_model_anchor_extractor_does_not_misclassify_pack_substring_product_label():
+    extractor = ModelAnchorExtractor()
+    evidence = PageEvidence(
+        page_no=1,
+        page_width=600,
+        page_height=800,
+        raw=ParsedPageIR(
+            page_no=1,
+            images=[
+                ImageInfo(image_id="img-main", bbox=(150, 40, 540, 620), width=780, height=1160, search_eligible=True),
+            ],
+            metadata=PageMetadata(page_width=600, page_height=800),
+        ),
+        objects=[
+            EvidenceObject(
+                object_id="ocr-labeled-model",
+                object_type="ocr_block",
+                bbox=(180, 655, 430, 690),
+                text="Backpack Lounge: ZX-204",
+                source="ocr_text",
+            ),
+        ],
+    )
+
+    skus, _bindings = extractor.extract(evidence)
+
+    assert len(skus) == 1
+    assert skus[0].attributes["model_number"] == "ZX-204"
+    assert skus[0].attributes["product_name"] == "Backpack Lounge"
+
+
+def test_model_anchor_extractor_falls_back_to_labeled_product_name_anchor():
+    extractor = ModelAnchorExtractor()
+    evidence = PageEvidence(
+        page_no=1,
+        page_width=600,
+        page_height=800,
+        raw=ParsedPageIR(
+            page_no=1,
+            images=[
+                ImageInfo(image_id="img-main", bbox=(60, 40, 560, 640), width=1000, height=1200, search_eligible=True),
+            ],
+            metadata=PageMetadata(page_width=600, page_height=800),
+        ),
+        objects=[
+            EvidenceObject(
+                object_id="ocr-product",
+                object_type="ocr_block",
+                bbox=(250, 735, 430, 768),
+                text="型号：圣日耳曼沙发",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-page",
+                object_type="ocr_block",
+                bbox=(40, 772, 120, 796),
+                text="PAGE/02",
+                source="ocr_text",
+            ),
+        ],
+    )
+
+    skus, bindings = extractor.extract(evidence)
+
+    assert len(skus) == 1
+    assert "model_number" not in skus[0].attributes
+    assert skus[0].attributes["product_name"] == "圣日耳曼沙发"
+    assert [binding.image_id for binding in bindings] == ["img-main"]
+
+
+def test_model_anchor_extractor_accepts_generic_labeled_model_without_furniture_terms():
+    extractor = ModelAnchorExtractor()
+    evidence = PageEvidence(
+        page_no=1,
+        page_width=600,
+        page_height=800,
+        raw=ParsedPageIR(
+            page_no=1,
+            images=[
+                ImageInfo(image_id="img-main", bbox=(180, 60, 520, 520), width=680, height=920, search_eligible=True),
+            ],
+            metadata=PageMetadata(page_width=600, page_height=800),
+        ),
+        objects=[
+            EvidenceObject(
+                object_id="ocr-labeled-model",
+                object_type="ocr_block",
+                bbox=(80, 620, 300, 650),
+                text="Series A：ZX-204",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-size",
+                object_type="ocr_block",
+                bbox=(80, 655, 320, 685),
+                text="Size: 1200x700mm",
+                source="ocr_text",
+            ),
+        ],
+    )
+
+    skus, bindings = extractor.extract(evidence)
+
+    assert len(skus) == 1
+    assert skus[0].attributes["model_number"] == "ZX-204"
+    assert skus[0].attributes["product_name"] == "Series A"
+    assert skus[0].attributes["specs"] == "Size: 1200x700mm"
+    assert [binding.image_id for binding in bindings] == ["img-main"]
+
+
+def test_model_anchor_extractor_accepts_generic_product_name_label_in_english():
+    extractor = ModelAnchorExtractor()
+    evidence = PageEvidence(
+        page_no=1,
+        page_width=600,
+        page_height=800,
+        raw=ParsedPageIR(
+            page_no=1,
+            images=[
+                ImageInfo(image_id="img-main", bbox=(100, 40, 560, 620), width=920, height=1160, search_eligible=True),
+            ],
+            metadata=PageMetadata(page_width=600, page_height=800),
+        ),
+        objects=[
+            EvidenceObject(
+                object_id="ocr-product",
+                object_type="ocr_block",
+                bbox=(240, 700, 500, 730),
+                text="Product Name: Aurora Modular",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-page",
+                object_type="ocr_block",
+                bbox=(40, 760, 120, 790),
+                text="PAGE/05",
+                source="ocr_text",
+            ),
+        ],
+    )
+
+    skus, bindings = extractor.extract(evidence)
+
+    assert len(skus) == 1
+    assert "model_number" not in skus[0].attributes
+    assert skus[0].attributes["product_name"] == "Aurora Modular"
+    assert [binding.image_id for binding in bindings] == ["img-main"]
+
+
+def test_region_attribute_extractor_keeps_backpack_name_as_non_label_line():
+    extractor = RegionAttributeExtractor()
+    evidence = PageEvidence(
+        page_no=1,
+        page_width=600,
+        page_height=800,
+        objects=[
+            EvidenceObject(
+                object_id="text_name",
+                object_type="text_block",
+                bbox=(60, 80, 220, 100),
+                text="Backpack Lounge",
+                source="pdf_text",
+            ),
+            EvidenceObject(
+                object_id="text_color",
+                object_type="text_block",
+                bbox=(60, 110, 220, 130),
+                text="Color: Black",
+                source="pdf_text",
+            ),
+        ],
+    )
+    region = RegionProposal(
+        region_id="region_1",
+        bbox=(50, 70, 230, 140),
+        member_object_ids=["text_name", "text_color"],
+        score=0.8,
+        reason="test",
+    )
+
+    attributes = extractor.extract(region, evidence)
+
+    assert attributes["product_name"] == "Backpack Lounge"
+
+
+def test_model_anchor_extractor_filters_text_heavy_images():
+    extractor = ModelAnchorExtractor()
+    evidence = PageEvidence(
+        page_no=3,
+        page_width=600,
+        page_height=800,
+        raw=ParsedPageIR(
+            page_no=3,
+            images=[
+                ImageInfo(image_id="img-product-a", bbox=(180, 20, 560, 360), width=760, height=680, search_eligible=True),
+                ImageInfo(image_id="img-product-b", bbox=(160, 420, 560, 720), width=800, height=600, search_eligible=True),
+                ImageInfo(image_id="img-text-title", bbox=(40, 80, 210, 145), width=340, height=130, search_eligible=True),
+                ImageInfo(image_id="img-text-copy", bbox=(40, 150, 230, 245), width=380, height=190, search_eligible=True),
+            ],
+            metadata=PageMetadata(page_width=600, page_height=800),
+        ),
+        objects=[
+            EvidenceObject(
+                object_id="ocr-name",
+                object_type="ocr_block",
+                bbox=(280, 742, 420, 772),
+                text="型号：SC-9901",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-page",
+                object_type="ocr_block",
+                bbox=(30, 770, 110, 794),
+                text="PAGE/04",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-text-title-1",
+                object_type="ocr_block",
+                bbox=(42, 82, 208, 110),
+                text="ELEGANT",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-text-title-2",
+                object_type="ocr_block",
+                bbox=(42, 112, 180, 142),
+                text="COLOR",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-text-copy-1",
+                object_type="ocr_block",
+                bbox=(42, 154, 220, 182),
+                text="The clean and elegant color and",
+                source="ocr_text",
+            ),
+            EvidenceObject(
+                object_id="ocr-text-copy-2",
+                object_type="ocr_block",
+                bbox=(42, 186, 222, 214),
+                text="structure co-locate",
+                source="ocr_text",
+            ),
+        ],
+    )
+
+    skus, bindings = extractor.extract(evidence)
+
+    assert len(skus) == 1
+    assert skus[0].attributes["model_number"] == "SC-9901"
+    assert [binding.image_id for binding in bindings] == ["img-product-b", "img-product-a"]
 
 
 def _scene_image_bytes() -> bytes:

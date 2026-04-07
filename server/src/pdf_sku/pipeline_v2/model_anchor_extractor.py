@@ -8,10 +8,46 @@ from pdf_sku.pipeline.ir import BindingResult, ImageInfo, SKUResult
 
 from .models import EvidenceObject, PageEvidence
 
-_PAGE_MARKER_RE = re.compile(r"^P\s*\d+\s*$", re.IGNORECASE)
-_MODEL_RE = re.compile(
-    r"\b(?=[A-Z0-9#/_-]{5,}\b)(?=[A-Z0-9#/_-]*[A-Z])(?=[A-Z0-9#/_-]*\d)"
-    r"[A-Z0-9#]+(?:[-_/][A-Z0-9#]+)*\b"
+_PAGE_MARKER_RE = re.compile(
+    r"^(?:P|PG|PAGE|AGE)\s*[/\\-]?\s*0*\d+\s*$",
+    re.IGNORECASE,
+)
+_GENERIC_MODEL_TOKEN_RE = re.compile(r"[A-Z0-9#]+(?:[-_/][A-Z0-9#]+)*")
+_LABELED_MODEL_RE = re.compile(
+    r"^(?P<label>.+?)(?:[:：]\s*)+(?P<model>[A-Za-z0-9#/_-]{2,})\s*$"
+)
+_LABELED_PRODUCT_RE = re.compile(
+    r"^(?P<label>.+?)(?:[:：]\s*)+(?P<value>.+?)\s*$"
+)
+_GENERIC_MODEL_VALUE_RE = re.compile(
+    r"^(?:型号|货号|编号|model(?:\s*number)?)\s*[:：]?\s*[A-Za-z0-9#/_-]+\s*$",
+    re.IGNORECASE,
+)
+_CHINESE_NON_PRODUCT_LABELS = (
+    "售价",
+    "价格",
+    "批发价",
+    "打包价",
+    "代发价",
+    "拿货价",
+    "活动价",
+    "库存",
+    "重量",
+    "自动下架时间",
+    "下架时间",
+    "颜色",
+    "规格编码",
+    "规格",
+    "尺寸",
+    "备注",
+    "来源",
+    "标签",
+    "商品ID",
+    "商品简称",
+)
+_ENGLISH_NON_PRODUCT_LABEL_RE = re.compile(
+    r"\b(?:price|wholesale(?:\s+price)?|pack(?:\s+price)?|dropship(?:\s+price)?|purchase(?:\s+price)?|campaign(?:\s+type|\s+price)?|stock|weight|color|colour|spec(?:\s+code)?|size|remark|source|tag|product\s*id|short\s*name)\b",
+    re.IGNORECASE,
 )
 _SPEC_RE = re.compile(
     r"(?:\b[HWDL]\s*\d+(?:\.\d+)?\s*(?:cm|mm|in)\b|\b\d+(?:\.\d+)?\s*(?:cm|mm|in)\b)",
@@ -23,6 +59,13 @@ def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
 
 
+def _contains_non_product_label(text: str) -> bool:
+    normalized = _normalize_text(text)
+    return any(label in normalized for label in _CHINESE_NON_PRODUCT_LABELS) or bool(
+        _ENGLISH_NON_PRODUCT_LABEL_RE.search(normalized)
+    )
+
+
 def _bbox_union(boxes: list[tuple[float, float, float, float]]) -> tuple[float, float, float, float]:
     if not boxes:
         return (0, 0, 0, 0)
@@ -32,6 +75,10 @@ def _bbox_union(boxes: list[tuple[float, float, float, float]]) -> tuple[float, 
         max(box[2] for box in boxes),
         max(box[3] for box in boxes),
     )
+
+
+def _bbox_area(bbox: tuple[float, float, float, float]) -> float:
+    return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
 
 
 def _bbox_expand(
@@ -68,6 +115,15 @@ def _bboxes_intersect(a: tuple[float, float, float, float], b: tuple[float, floa
     return not (a[2] <= b[0] or a[0] >= b[2] or a[3] <= b[1] or a[1] >= b[3])
 
 
+def _intersection_area(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> float:
+    overlap_w = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    overlap_h = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    return overlap_w * overlap_h
+
+
 def _bbox_contains_center(
     bbox: tuple[float, float, float, float],
     target: tuple[float, float, float, float],
@@ -95,7 +151,131 @@ def _size(
 
 
 def _is_page_marker(text: str) -> bool:
-    return bool(_PAGE_MARKER_RE.fullmatch(_normalize_text(text)))
+    normalized = _normalize_text(text).upper().replace(" ", "")
+    return bool(_PAGE_MARKER_RE.fullmatch(normalized))
+
+
+def _looks_like_dimension_token(token: str) -> bool:
+    compact = _normalize_text(token).upper().replace(" ", "")
+    if not compact:
+        return False
+    if any(unit in compact for unit in ("MM", "CM", "IN")):
+        return True
+    if re.search(r"\d+(?:\.\d+)?[X×*]\d+", compact):
+        return True
+    if re.search(r"\d{3,}(?:[-_/])\d{3,}", compact):
+        return True
+    return False
+
+
+def _looks_like_model_token(token: str, *, labeled: bool) -> bool:
+    compact = _normalize_text(token).upper().replace(" ", "")
+    if not compact or not re.search(r"\d", compact):
+        return False
+    if _is_page_marker(compact):
+        return False
+    if compact.startswith(("PAGE/", "AGE/", "P/")):
+        return False
+    if _looks_like_dimension_token(compact):
+        return False
+    if re.search(r"[A-Z]", compact):
+        return len(compact) >= 4
+    if labeled:
+        return bool(re.fullmatch(r"\d{2,6}#?", compact))
+    return bool(re.fullmatch(r"\d{3,6}#", compact))
+
+
+def _model_group_key(token: str) -> str:
+    normalized = _normalize_text(token).upper().replace(" ", "")
+    if re.fullmatch(r"\d{2,6}#?", normalized):
+        return normalized.rstrip("#")
+    return normalized
+
+
+def _looks_like_product_label(label: str) -> bool:
+    normalized = _normalize_text(label)
+    if not normalized:
+        return False
+    if _contains_non_product_label(normalized):
+        return False
+    if _is_generic_model_label(normalized):
+        return False
+    if not _contains_letters(normalized):
+        return False
+    if len(normalized) > 48:
+        return False
+    if re.search(r"[.!?。；;]$", normalized):
+        return False
+    word_parts = re.findall(r"[A-Za-z]+(?:[-'][A-Za-z]+)?|[\u4e00-\u9fff]+|\d+", normalized)
+    if len(word_parts) > 8:
+        return False
+    if len(word_parts) >= 6 and " " in normalized and normalized.lower() == normalized:
+        return False
+    return True
+
+
+def _is_generic_model_label(label: str) -> bool:
+    normalized = _normalize_text(label)
+    return bool(
+        re.fullmatch(r"(?:型号|货号|编号|model(?:\s*number)?)", normalized, re.IGNORECASE)
+    )
+
+
+def _is_generic_product_name_label(label: str) -> bool:
+    normalized = _normalize_text(label)
+    return bool(
+        re.fullmatch(
+            r"(?:型号|名称|品名|款式|系列|product(?:\s+name)?|item(?:\s+name)?|name|series|style)",
+            normalized,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _extract_labeled_model_parts(text: str) -> tuple[str, str] | None:
+    normalized = _normalize_text(text)
+    if not normalized or _is_page_marker(normalized) or _is_spec_line(normalized):
+        return None
+    match = _LABELED_MODEL_RE.fullmatch(normalized)
+    if not match:
+        return None
+    label = _normalize_text(match.group("label")).rstrip(":：")
+    model = _normalize_text(match.group("model")).upper()
+    if not label or not _contains_letters(label):
+        return None
+    if _is_generic_model_label(label):
+        return None
+    if not _looks_like_product_label(label):
+        return None
+    if not _looks_like_model_token(model, labeled=True):
+        return None
+    return label, model
+
+
+def _extract_labeled_product_name(text: str) -> str | None:
+    normalized = _normalize_text(text)
+    if not normalized or _is_page_marker(normalized) or _is_spec_line(normalized):
+        return None
+    match = _LABELED_PRODUCT_RE.fullmatch(normalized)
+    if not match:
+        return None
+    label = _normalize_text(match.group("label")).rstrip(":：")
+    value = _normalize_text(match.group("value")).strip()
+    if not label or not value:
+        return None
+    if _contains_non_product_label(label):
+        return None
+    if not _is_generic_product_name_label(label):
+        return None
+    if _is_page_marker(value) or _is_spec_line(value):
+        return None
+    if _extract_labeled_model_parts(normalized):
+        return None
+    if _looks_like_model_token(value, labeled=True):
+        return None
+    if not _contains_letters(value):
+        return None
+    return value.strip("：:;；,， ")
 
 
 def _extract_model_token(text: str) -> str | None:
@@ -104,7 +284,14 @@ def _extract_model_token(text: str) -> str | None:
         return None
     if _is_spec_line(normalized):
         return None
-    tokens = [token for token in _MODEL_RE.findall(normalized) if len(token) >= 5]
+    labeled = _extract_labeled_model_parts(normalized)
+    if labeled:
+        return labeled[1]
+    tokens = [
+        token
+        for token in _GENERIC_MODEL_TOKEN_RE.findall(normalized)
+        if _looks_like_model_token(token, labeled=False)
+    ]
     if not tokens:
         return None
     return max(tokens, key=len)
@@ -114,14 +301,82 @@ def _is_spec_line(text: str) -> bool:
     normalized = _normalize_text(text)
     if not normalized:
         return False
+    if re.search(r"(?:规格|尺寸|size)", normalized, re.IGNORECASE):
+        return True
     if _SPEC_RE.search(normalized):
         return True
     compact = normalized.replace(" ", "")
+    if re.search(r"\d+(?:\.\d+)?[X×*]\d+(?:\.\d+)?", compact, re.IGNORECASE):
+        return True
     return bool(re.search(r"[HWDL]\d+(?:\.\d+)?cm", compact, re.IGNORECASE))
 
 
 def _contains_letters(text: str) -> bool:
     return bool(re.search(r"[A-Za-z\u4e00-\u9fff]", text))
+
+
+def _is_text_heavy_image(
+    image: ImageInfo,
+    *,
+    text_objects: list[EvidenceObject],
+    page_width: float,
+    page_height: float,
+) -> bool:
+    image_area = _bbox_area(image.bbox)
+    if image_area <= 0:
+        return True
+    overlapped_blocks = []
+    overlap_area = 0.0
+    for obj in text_objects:
+        if obj.object_type not in {"text_block", "ocr_block"}:
+            continue
+        text = _normalize_text(obj.text)
+        if not text or not _bboxes_intersect(image.bbox, obj.bbox):
+            continue
+        area = _intersection_area(image.bbox, obj.bbox)
+        if area <= 0:
+            continue
+        overlapped_blocks.append(obj)
+        overlap_area += area
+
+    if not overlapped_blocks:
+        return False
+
+    overlap_ratio = overlap_area / image_area
+    width, height = _size(image.bbox)
+    width_ratio = width / max(1.0, page_width)
+    height_ratio = height / max(1.0, page_height)
+    short_edge = min(width, height)
+    long_edge = max(width, height)
+    aspect_ratio = long_edge / max(1.0, short_edge)
+    textish = sum(
+        1
+        for obj in overlapped_blocks
+        if (
+            len(_normalize_text(obj.text)) >= 4
+            or " " in _normalize_text(obj.text)
+            or _contains_letters(_normalize_text(obj.text))
+        )
+    )
+    return (
+        overlap_ratio >= 0.38
+        or (
+            textish >= 1
+            and overlap_ratio >= 0.22
+            and (height_ratio <= 0.12 or width_ratio <= 0.22)
+        )
+        or (
+            len(overlapped_blocks) >= 2
+            and overlap_ratio >= 0.18
+            and height_ratio <= 0.16
+        )
+        or (
+            textish >= 1
+            and short_edge <= max(page_width, page_height) * 0.12
+            and aspect_ratio >= 2.0
+            and overlap_ratio >= 0.08
+        )
+    )
 
 
 def _looks_like_ocr_title_text(text: str) -> bool:
@@ -149,14 +404,7 @@ def _looks_like_ocr_title_text(text: str) -> bool:
 
 
 def _canonical_product_name(title_text: str, model_number: str) -> str:
-    title_text = _normalize_text(title_text)
-    model_upper = (model_number or "").upper()
-    lower = title_text.lower()
-    if "WOOD" in model_upper and lower.startswith("resin "):
-        return title_text.split(" ", 1)[1].strip() if " " in title_text else title_text
-    if ("PP" in model_upper or "RESIN" in model_upper) and lower.startswith("wood "):
-        return title_text.split(" ", 1)[1].strip() if " " in title_text else title_text
-    return title_text
+    return _normalize_text(title_text)
 
 
 def _is_title_line(line: EvidenceObject, baseline_font_size: float) -> bool:
@@ -199,6 +447,10 @@ def _is_bindable_image(
     height = max(0.0, image.bbox[3] - image.bbox[1])
     if width <= 0 or height <= 0:
         return False
+    short_edge = min(width, height)
+    long_edge = max(width, height)
+    if short_edge < 90 and long_edge / max(1.0, short_edge) >= 2.0:
+        return False
     if min(width, height) < 60 and not image.search_eligible:
         return False
     width_ratio = width / max(1.0, page_width)
@@ -211,6 +463,54 @@ def _is_bindable_image(
 class ModelAnchorExtractor:
     """页面内存在显式型号时，优先按型号拆分 SKU。"""
 
+    @staticmethod
+    def _collect_anchor_candidates(
+        text_objects: list[EvidenceObject],
+    ) -> tuple[
+        list[EvidenceObject],
+        float,
+        list[EvidenceObject],
+        dict[str, int],
+        list[tuple[int, EvidenceObject, str]],
+        list[tuple[int, EvidenceObject, str]],
+    ]:
+        ordered = sorted(text_objects, key=lambda obj: (obj.bbox[1], obj.bbox[0]))
+        font_sizes = [obj.font_size for obj in ordered if obj.font_size > 0]
+        baseline_font_size = sorted(font_sizes)[len(font_sizes) // 2] if font_sizes else 0.0
+        title_candidates = [obj for obj in ordered if _is_title_line(obj, baseline_font_size)]
+        index_by_object_id = {obj.object_id: index for index, obj in enumerate(ordered)}
+
+        model_anchors: list[tuple[int, EvidenceObject, str]] = []
+        seen_model_keys: set[str] = set()
+        for index, obj in enumerate(ordered):
+            model = _extract_model_token(obj.text)
+            if not model:
+                continue
+            model_key = _model_group_key(model)
+            if model_key in seen_model_keys:
+                continue
+            seen_model_keys.add(model_key)
+            model_anchors.append((index, obj, model))
+
+        product_name_anchors: list[tuple[int, EvidenceObject, str]] = []
+        if not model_anchors:
+            seen_names: set[str] = set()
+            for index, obj in enumerate(ordered):
+                product_name = _extract_labeled_product_name(obj.text)
+                if not product_name or product_name in seen_names:
+                    continue
+                seen_names.add(product_name)
+                product_name_anchors.append((index, obj, product_name))
+
+        return (
+            ordered,
+            baseline_font_size,
+            title_candidates,
+            index_by_object_id,
+            model_anchors,
+            product_name_anchors,
+        )
+
     def extract(
         self,
         evidence: PageEvidence,
@@ -218,32 +518,39 @@ class ModelAnchorExtractor:
         if evidence.raw is None:
             return [], []
 
-        text_objects = [
+        all_text_objects = [
             obj
             for obj in evidence.objects
             if obj.object_type in {"text_block", "ocr_block"} and _normalize_text(obj.text)
         ]
-        if not text_objects:
+        if not all_text_objects:
             return [], []
 
-        if any(obj.source == "pdf_text_precise" for obj in text_objects):
-            text_objects = [obj for obj in text_objects if obj.source == "pdf_text_precise"]
-        elif any(obj.source.startswith("pdf_text") for obj in text_objects):
-            text_objects = [obj for obj in text_objects if obj.source.startswith("pdf_text")]
+        preferred_text_objects = all_text_objects
+        if any(obj.source == "pdf_text_precise" for obj in all_text_objects):
+            preferred_text_objects = [obj for obj in all_text_objects if obj.source == "pdf_text_precise"]
+        elif any(obj.source.startswith("pdf_text") for obj in all_text_objects):
+            preferred_text_objects = [obj for obj in all_text_objects if obj.source.startswith("pdf_text")]
 
-        ordered = sorted(text_objects, key=lambda obj: (obj.bbox[1], obj.bbox[0]))
-        font_sizes = [obj.font_size for obj in ordered if obj.font_size > 0]
-        baseline_font_size = sorted(font_sizes)[len(font_sizes) // 2] if font_sizes else 0.0
-        title_candidates = [obj for obj in ordered if _is_title_line(obj, baseline_font_size)]
-        model_anchors: list[tuple[int, EvidenceObject, str]] = []
-        seen_models: set[str] = set()
-        for index, obj in enumerate(ordered):
-            model = _extract_model_token(obj.text)
-            if not model or model in seen_models:
-                continue
-            seen_models.add(model)
-            model_anchors.append((index, obj, model))
-        if not model_anchors:
+        (
+            ordered,
+            baseline_font_size,
+            title_candidates,
+            index_by_object_id,
+            model_anchors,
+            product_name_anchors,
+        ) = self._collect_anchor_candidates(preferred_text_objects)
+
+        if not model_anchors and not product_name_anchors and preferred_text_objects is not all_text_objects:
+            (
+                ordered,
+                baseline_font_size,
+                title_candidates,
+                index_by_object_id,
+                model_anchors,
+                product_name_anchors,
+            ) = self._collect_anchor_candidates(all_text_objects)
+        if not model_anchors and not product_name_anchors:
             return [], []
 
         image_candidates = [
@@ -253,33 +560,76 @@ class ModelAnchorExtractor:
                 page_width=evidence.page_width,
                 page_height=evidence.page_height,
             )
+            and not _is_text_heavy_image(
+                image,
+                text_objects=all_text_objects,
+                page_width=evidence.page_width,
+                page_height=evidence.page_height,
+            )
         ]
         records = []
-        for index, anchor, model_number in model_anchors:
-            title = self._choose_title(
-                anchor,
-                title_candidates=title_candidates,
-                page_width=evidence.page_width,
-            )
-            spec_lines = self._collect_spec_lines(ordered, index)
-            description_lines = self._collect_description_lines(
-                ordered,
-                anchor=anchor,
-                title=title,
-                page_width=evidence.page_width,
-                baseline_font_size=baseline_font_size,
-            )
-            records.append(
-                {
-                    "anchor_index": index,
-                    "anchor": anchor,
-                    "model_number": model_number,
-                    "title": title,
-                    "spec_lines": spec_lines,
-                    "description_lines": description_lines,
-                    "family_key": title.object_id if title else model_number,
-                }
-            )
+        if model_anchors:
+            for index, anchor, model_number in model_anchors:
+                label_lines = self._collect_label_lines(
+                    ordered,
+                    model_number=model_number,
+                    anchor=anchor,
+                    page_width=evidence.page_width,
+                )
+                label_titles = [
+                    parts[0]
+                    for line in label_lines
+                    if (parts := _extract_labeled_model_parts(line.text))
+                ]
+                if label_lines:
+                    title = None
+                    spec_lines = self._collect_spec_lines_for_lines(
+                        ordered,
+                        line_indices=[index_by_object_id[line.object_id] for line in label_lines if line.object_id in index_by_object_id],
+                    )
+                    description_lines: list[EvidenceObject] = []
+                else:
+                    title = self._choose_title(
+                        anchor,
+                        title_candidates=title_candidates,
+                        page_width=evidence.page_width,
+                    )
+                    spec_lines = self._collect_spec_lines(ordered, index)
+                    description_lines = self._collect_description_lines(
+                        ordered,
+                        anchor=anchor,
+                        title=title,
+                        page_width=evidence.page_width,
+                        baseline_font_size=baseline_font_size,
+                    )
+                records.append(
+                    {
+                        "anchor_index": index,
+                        "anchor": anchor,
+                        "model_number": model_number,
+                        "title": title,
+                        "label_lines": label_lines,
+                        "label_titles": list(dict.fromkeys(label_titles)),
+                        "spec_lines": spec_lines,
+                        "description_lines": description_lines,
+                        "family_key": "/".join(dict.fromkeys(label_titles)) if label_titles else (title.object_id if title else model_number),
+                    }
+                )
+        else:
+            for index, anchor, product_name in product_name_anchors:
+                records.append(
+                    {
+                        "anchor_index": index,
+                        "anchor": anchor,
+                        "model_number": None,
+                        "title": None,
+                        "label_lines": [],
+                        "label_titles": [product_name],
+                        "spec_lines": self._collect_spec_lines(ordered, index),
+                        "description_lines": [],
+                        "family_key": product_name,
+                    }
+                )
 
         image_groups = self._assign_images_to_records(
             records=records,
@@ -293,16 +643,20 @@ class ModelAnchorExtractor:
             anchor = record["anchor"]
             model_number = record["model_number"]
             title = record["title"]
+            label_lines = record["label_lines"]
+            label_titles = record["label_titles"]
             spec_lines = record["spec_lines"]
             description_lines = record["description_lines"]
             assigned_group = image_groups[record_index]
             primary_image_id = assigned_group[0].image_id if assigned_group else None
 
             component_lines = []
-            if title:
+            if title and not label_titles:
                 component_lines.append(_normalize_text(title.text))
+            component_lines.extend(_normalize_text(line.text) for line in label_lines)
             component_lines.extend(_normalize_text(line.text) for line in description_lines)
-            component_lines.append(_normalize_text(anchor.text))
+            if not label_lines:
+                component_lines.append(_normalize_text(anchor.text))
             component_lines.extend(_normalize_text(line.text) for line in spec_lines)
             unique_lines = [line for line in dict.fromkeys(component_lines) if line]
             if not unique_lines:
@@ -310,18 +664,27 @@ class ModelAnchorExtractor:
 
             attributes: dict[str, str] = {
                 "evidence_mode": "text_backed",
-                "model_number": model_number,
                 "raw_attribute_text": " ".join(unique_lines),
                 "product_description": " ".join(unique_lines),
             }
-            if title:
+            if model_number:
+                attributes["model_number"] = model_number
+            if label_titles:
+                attributes["product_name"] = " / ".join(label_titles)
+            elif title:
                 attributes["product_name"] = _canonical_product_name(title.text, model_number)
             if spec_lines:
-                attributes["specs"] = " ".join(_normalize_text(line.text) for line in spec_lines)
+                attributes["specs"] = " ".join(
+                    dict.fromkeys(_normalize_text(line.text) for line in spec_lines)
+                )
+            product_name = attributes.get("product_name")
+            if product_name and _GENERIC_MODEL_VALUE_RE.fullmatch(_normalize_text(product_name)):
+                attributes.pop("product_name", None)
 
             boxes = [anchor.bbox]
             if title:
                 boxes.append(title.bbox)
+            boxes.extend(line.bbox for line in label_lines)
             boxes.extend(line.bbox for line in description_lines)
             boxes.extend(line.bbox for line in spec_lines)
             if primary_image_id:
@@ -330,7 +693,7 @@ class ModelAnchorExtractor:
                     boxes.append(image.bbox)
 
             confidence = 0.7
-            if title:
+            if title or label_titles:
                 confidence += 0.08
             if spec_lines:
                 confidence += 0.07
@@ -462,7 +825,7 @@ class ModelAnchorExtractor:
             )
             for index, group in enumerate(groups)
         ]
-        return cls._supplement_image_groups(
+        supplemented_groups = cls._supplement_image_groups(
             records=records,
             groups=pruned_groups,
             images=images,
@@ -470,6 +833,15 @@ class ModelAnchorExtractor:
             page_width=page_width,
             page_height=page_height,
         )
+        return [
+            cls._order_image_group(
+                anchor=records[index]["anchor"],
+                images=group,
+                page_width=page_width,
+                page_height=page_height,
+            )
+            for index, group in enumerate(supplemented_groups)
+        ]
 
     @classmethod
     def _reassign_family_companions(
@@ -654,7 +1026,7 @@ class ModelAnchorExtractor:
             and dx <= max(primary_width * 0.75, 118.0)
         )
         upper_band = (
-            image.bbox[3] <= primary_bbox[3] + max(primary_height * 0.16, 24.0)
+            image.bbox[3] <= primary_bbox[1] + max(primary_height * 0.16, 24.0)
             and primary_bbox[1] - image.bbox[3] <= max(primary_height * 0.72, 120.0)
             and dx <= max(primary_width * 0.72, 118.0)
         )
@@ -665,7 +1037,7 @@ class ModelAnchorExtractor:
         if family_model_count <= 1:
             accepted = inside_seed or near_primary or same_row or upper_band or vertical_stack
         else:
-            accepted = inside_seed or same_row or upper_band or vertical_stack
+            accepted = inside_seed or upper_band or vertical_stack
         if not accepted:
             return None
 
@@ -683,6 +1055,43 @@ class ModelAnchorExtractor:
         )
         combined = primary_score[0] * 0.7 + anchor_score[0] * 0.3
         return (combined, primary_score[0], anchor_score[0], -image.short_edge)
+
+    @classmethod
+    def _order_image_group(
+        cls,
+        *,
+        anchor: EvidenceObject,
+        images: list[ImageInfo],
+        page_width: float,
+        page_height: float,
+    ) -> list[ImageInfo]:
+        if len(images) <= 1:
+            return images
+
+        def primary_sort_key(image: ImageInfo) -> tuple[float, float]:
+            anchor_score = cls._rank_image_for_anchor(
+                anchor,
+                image,
+                page_width=page_width,
+                page_height=page_height,
+            )
+            area_bonus = min(
+                _area_ratio(image.bbox, page_width=page_width, page_height=page_height),
+                0.35,
+            ) * 620.0
+            return (anchor_score[0] - area_bonus, anchor_score[1])
+
+        primary = min(images, key=primary_sort_key)
+        rest = [image for image in images if image.image_id != primary.image_id]
+        rest.sort(
+            key=lambda image: cls._rank_image_for_primary(
+                primary,
+                image,
+                page_width=page_width,
+                page_height=page_height,
+            )
+        )
+        return [primary, *rest]
 
     @staticmethod
     def _choose_title(
@@ -779,6 +1188,44 @@ class ModelAnchorExtractor:
         return selected[:6]
 
     @staticmethod
+    def _collect_label_lines(
+        ordered: list[EvidenceObject],
+        *,
+        model_number: str,
+        anchor: EvidenceObject,
+        page_width: float,
+    ) -> list[EvidenceObject]:
+        anchor_half = _page_half(anchor.bbox, page_width)
+        selected: list[EvidenceObject] = []
+        for candidate in ordered:
+            parts = _extract_labeled_model_parts(candidate.text)
+            if not parts or _model_group_key(parts[1]) != _model_group_key(model_number):
+                continue
+            if _page_half(candidate.bbox, page_width) != anchor_half:
+                continue
+            if abs(candidate.bbox[1] - anchor.bbox[1]) > 180:
+                continue
+            selected.append(candidate)
+        return selected
+
+    @classmethod
+    def _collect_spec_lines_for_lines(
+        cls,
+        ordered: list[EvidenceObject],
+        *,
+        line_indices: list[int],
+    ) -> list[EvidenceObject]:
+        collected: list[EvidenceObject] = []
+        seen_ids: set[str] = set()
+        for line_index in sorted(dict.fromkeys(line_indices)):
+            for candidate in cls._collect_spec_lines(ordered, line_index):
+                if candidate.object_id in seen_ids:
+                    continue
+                seen_ids.add(candidate.object_id)
+                collected.append(candidate)
+        return collected
+
+    @staticmethod
     def _choose_image(
         anchor: EvidenceObject,
         *,
@@ -844,7 +1291,7 @@ class ModelAnchorExtractor:
             score += 40.0
         if image.bbox[3] <= anchor.bbox[1]:
             score -= 15.0
-        score -= min(_area_ratio(image.bbox, page_width=page_width, page_height=page_height), 0.08) * 120.0
+        score -= min(_area_ratio(image.bbox, page_width=page_width, page_height=page_height), 0.25) * 420.0
         return (score, -image.short_edge)
 
     @staticmethod
@@ -860,5 +1307,5 @@ class ModelAnchorExtractor:
         score = _distance(primary.bbox, image.bbox) + dx * 0.25
         if _x_overlap_ratio(primary.bbox, image.bbox) >= 0.2:
             score -= 40.0
-        score -= min(_area_ratio(image.bbox, page_width=page_width, page_height=page_height), 0.08) * 80.0
+        score -= min(_area_ratio(image.bbox, page_width=page_width, page_height=page_height), 0.25) * 180.0
         return (score, -image.short_edge)

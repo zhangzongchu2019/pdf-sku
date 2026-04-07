@@ -6,9 +6,11 @@ import hashlib
 import io
 from concurrent.futures import ProcessPoolExecutor
 
+import numpy as np
 import structlog
 from PIL import Image as PILImage
 
+from pdf_sku.common.image_utils import flatten_for_jpeg
 from pdf_sku.pipeline.exporter.exporter import SKUIdGenerator
 from pdf_sku.pipeline.layout_detector import LayoutRegion, detect_all_regions
 from pdf_sku.pipeline.ir import BindingResult, ImageInfo, PageResult, ParsedPageIR, SKUResult
@@ -369,7 +371,54 @@ class PageProcessor:
         return not raw.tables and not raw.images and not any((block.content or "").strip() for block in raw.text_blocks)
 
     @staticmethod
-    def _prepare_images(raw: ParsedPageIR) -> None:
+    def _trim_image_background(image: ImageInfo, raw: ParsedPageIR) -> None:
+        if not image.data or image.bbox == (0, 0, 0, 0):
+            return
+        try:
+            with PILImage.open(io.BytesIO(image.data)) as pil_img:
+                normalized = flatten_for_jpeg(pil_img)
+                arr = np.array(normalized.convert("RGB"))
+        except Exception:
+            return
+
+        mask = np.any(arr < 245, axis=2)
+        ys, xs = np.where(mask)
+        if len(xs) == 0 or len(ys) == 0:
+            return
+        x0 = int(xs.min())
+        y0 = int(ys.min())
+        x1 = int(xs.max()) + 1
+        y1 = int(ys.max()) + 1
+        original_width, original_height = normalized.size
+        if (
+            x0 <= max(2, int(original_width * 0.01))
+            and y0 <= max(2, int(original_height * 0.01))
+            and x1 >= original_width - max(2, int(original_width * 0.01))
+            and y1 >= original_height - max(2, int(original_height * 0.01))
+        ):
+            return
+        if x1 - x0 < original_width * 0.25 or y1 - y0 < original_height * 0.25:
+            return
+
+        cropped = normalized.crop((x0, y0, x1, y1))
+        out = io.BytesIO()
+        cropped.save(out, format="JPEG", quality=88)
+        image.data = out.getvalue()
+        image.width = cropped.width
+        image.height = cropped.height
+        image.short_edge = min(cropped.width, cropped.height)
+
+        scale_x = (image.bbox[2] - image.bbox[0]) / max(original_width, 1)
+        scale_y = (image.bbox[3] - image.bbox[1]) / max(original_height, 1)
+        image.bbox = (
+            image.bbox[0] + x0 * scale_x,
+            image.bbox[1] + y0 * scale_y,
+            image.bbox[0] + x1 * scale_x,
+            image.bbox[1] + y1 * scale_y,
+        )
+
+    @classmethod
+    def _prepare_images(cls, raw: ParsedPageIR) -> None:
         seen_image_ids: set[str] = set()
         for index, image in enumerate(raw.images):
             candidate_id = (image.image_id or "").strip() or f"image_{index}"
@@ -377,6 +426,7 @@ class PageProcessor:
                 candidate_id = f"{candidate_id}_{index}"
             image.image_id = candidate_id
             seen_image_ids.add(candidate_id)
+            cls._trim_image_background(image, raw)
             if image.short_edge <= 0 and image.width and image.height:
                 image.short_edge = min(image.width, image.height)
             if not image.search_eligible:
@@ -419,6 +469,12 @@ class PageProcessor:
         page_no: int,
     ) -> list[list[str]] | None:
         if len(skus) != 1:
+            return None
+        bindable_images = [
+            image for image in raw.images
+            if image.search_eligible and image.bbox != (0, 0, 0, 0)
+        ]
+        if len(bindable_images) != 1:
             return None
         eligible = [
             image for image in raw.images

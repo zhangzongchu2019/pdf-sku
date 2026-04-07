@@ -65,13 +65,17 @@ _LABEL_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     ),
 }
 
-_LABEL_KEYWORDS = {
-    "售价", "价格", "单价", "price", "货号", "型号", "编号", "model", "商品规格", "规格", "尺寸",
-    "spec", "size", "颜色", "color", "colour", "商品ID", "product id", "标签", "tag", "来源",
-    "source", "商品简称", "short name", "规格编码", "spec code", "批发价", "wholesale", "打包价",
-    "pack", "代发价", "dropship", "拿货价", "purchase", "活动类型", "campaign type", "活动价",
-    "campaign", "库存", "stock", "重量", "weight", "自动下架时间", "备注", "remark",
+_CHINESE_LABEL_KEYWORDS = {
+    "售价", "价格", "单价", "货号", "型号", "编号", "商品规格", "规格", "尺寸", "颜色", "商品ID",
+    "标签", "来源", "商品简称", "规格编码", "批发价", "打包价", "代发价", "拿货价", "活动类型",
+    "活动价", "库存", "重量", "自动下架时间", "备注",
 }
+_ENGLISH_LABEL_RE = re.compile(
+    r"\b(?:price|model(?:\s+number)?|spec(?:\s+code)?|size|color|colour|product\s+id|tag|source|short\s+name|wholesale(?:\s+price)?|pack(?:\s+price)?|dropship(?:\s+price)?|purchase(?:\s+price)?|campaign(?:\s+type|\s+price)?|stock|weight|remark)\b",
+    re.IGNORECASE,
+)
+
+_PAGE_MARKER_RE = re.compile(r"^(?:P|PG|PAGE|AGE)\s*[/\\-]?\s*0*\d+\s*$", re.IGNORECASE)
 
 
 def _normalize_line(line: str) -> str:
@@ -82,8 +86,13 @@ def _cleanup_value(value: str) -> str:
     return value.strip().strip("：:;；,，")
 
 
+def _is_page_marker(line: str) -> bool:
+    normalized = re.sub(r"\s+", "", (line or "").strip()).upper()
+    return bool(_PAGE_MARKER_RE.fullmatch(normalized))
+
+
 def _looks_like_label_line(line: str) -> bool:
-    return any(keyword in line for keyword in _LABEL_KEYWORDS)
+    return any(keyword in line for keyword in _CHINESE_LABEL_KEYWORDS) or bool(_ENGLISH_LABEL_RE.search(line))
 
 
 def _member_texts(region: RegionProposal, evidence: PageEvidence) -> list[str]:
@@ -94,7 +103,7 @@ def _member_texts(region: RegionProposal, evidence: PageEvidence) -> list[str]:
         if object_id in object_map and object_map[object_id].object_type in {"text_block", "ocr_block"}
         for line in (_normalize_line(part) for part in object_map[object_id].text.splitlines())
     ]
-    return [text for text in texts if text]
+    return [text for text in texts if text and not _is_page_marker(text)]
 
 
 class RegionAttributeExtractor:
@@ -123,7 +132,7 @@ class RegionAttributeExtractor:
 
         non_label_lines = [
             line for line in lines
-            if not _looks_like_label_line(line) and not re.fullmatch(r"[\d\W]+", line)
+            if not _looks_like_label_line(line) and not re.fullmatch(r"[\d\W]+", line) and not _is_page_marker(line)
         ]
         if non_label_lines:
             attributes["product_name"] = non_label_lines[0]
